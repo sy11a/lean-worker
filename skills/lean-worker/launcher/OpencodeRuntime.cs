@@ -30,7 +30,6 @@ internal sealed class OpencodeRuntime : IRuntime
             throw new LaunchException("--mcp-config is supported by the claude runtime only");
         }
 
-        string xdg = InstallPlugin(s.RunDir);
         JsonObject permission = Permissions(s);
 
         JsonObject config = new()
@@ -49,6 +48,7 @@ internal sealed class OpencodeRuntime : IRuntime
         }
 
         (bool providerFromUser, JsonObject? providerBlock) = AddProviderConfig(s, config);
+        string xdg = InstallPlugin(s.RunDir);
         Dictionary<string, string?> env = WorkerEnv(s, xdg, config);
         WriteRecordedConfig(s, config, providerFromUser, providerBlock);
 
@@ -58,14 +58,15 @@ internal sealed class OpencodeRuntime : IRuntime
             a.AddRange(["--variant", s.Variant]);
         }
 
-        return new Prepared(opencode, a, env, "opencode " + string.Join(' ', a.Select(x => Runtimes.Quote(x))));
+        return new Prepared(opencode, a, env, "opencode " + string.Join(' ', a.Select(x => Runtimes.Quote(x))), ScratchDirectory: xdg);
     }
 
-    // A clean config home: no global instructions, plugins, skills or MCP servers reach the worker.
+    // A clean config home: a unique temporary directory under the system temp path, outside the repository,
+    // removed after the run. No global instructions, plugins, skills or MCP servers reach the worker.
     // Logins stay in the data directory, which is not moved.
     private static string InstallPlugin(string runDir)
     {
-        string xdg = Path.GetFullPath(Path.Combine(runDir, "opencode-config"));
+        string xdg = Directory.CreateTempSubdirectory($"lean-worker-{Path.GetFileName(Path.GetFullPath(runDir))}-").FullName;
         string pluginDir = Path.Combine(xdg, "opencode", "plugins");
         _ = Directory.CreateDirectory(pluginDir);
         string plugin = Path.Combine(AppContext.BaseDirectory, "opencode-plugin.ts");
