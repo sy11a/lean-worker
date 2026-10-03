@@ -371,8 +371,11 @@ prices an opencode session from its database. Both use the same price book and s
 `"runtime": "opencode"` (or `--runtime opencode`) starts `opencode run --format json` instead of `claude -p`.
 The worker is kept as lean as in Claude Code:
 
-- It runs on a **clean config home** (`XDG_CONFIG_HOME` set to the run directory): no global instructions,
-  plugins, skills or MCP servers. Logins stay where they are. `OPENCODE_DISABLE_PROJECT_CONFIG` and
+- It runs on a **clean config home** (`XDG_CONFIG_HOME` set to a temporary directory
+  `lean-worker-<run>-*` under the system temp path, removed when the worker exits): no global instructions,
+  plugins, skills or MCP servers. Logins stay where they are. The home stays out of the repository because
+  opencode installs its plugin dependencies there (`node_modules`, about 200 directories per run), which
+  would pile up in the run directories and load every tool that watches the working tree. `OPENCODE_DISABLE_PROJECT_CONFIG` and
   `OPENCODE_DISABLE_CLAUDE_CODE` keep the project's AGENTS.md and CLAUDE.md out (`--keep-claude-md` keeps
   them). The worker's shell commands get your own `XDG_CONFIG_HOME` back, so git and other tools behave
   as usual.

@@ -55,15 +55,21 @@ public class ZaiSessionAffinityTests
         using FakeUserConfig cfg = new();
         RunSpec s = Spec("zai-coding-plan");
         Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject headers = Headers(p, "zai-coding-plan");
+            Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
+            Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
 
-        JsonObject headers = Headers(p, "zai-coding-plan");
-        Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
-        Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
-
-        JsonObject recordedHeaders = Recorded(s)["provider"]!["zai-coding-plan"]!["models"]!["glm-5.3"]!["headers"]!.AsObject();
-        Assert.Equal("lean-worker", recordedHeaders["x-session-affinity"]!.GetValue<string>());
-        Assert.Equal("lean-worker", recordedHeaders["X-Session-Id"]!.GetValue<string>());
-        Assert.DoesNotContain("apiKey", Recorded(s).ToJsonString(), StringComparison.Ordinal);
+            JsonObject recordedHeaders = Recorded(s)["provider"]!["zai-coding-plan"]!["models"]!["glm-5.3"]!["headers"]!.AsObject();
+            Assert.Equal("lean-worker", recordedHeaders["x-session-affinity"]!.GetValue<string>());
+            Assert.Equal("lean-worker", recordedHeaders["X-Session-Id"]!.GetValue<string>());
+            Assert.DoesNotContain("apiKey", Recorded(s).ToJsonString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 
     [Fact]
@@ -73,10 +79,16 @@ public class ZaiSessionAffinityTests
         using FakeUserConfig cfg = new(/*lang=json,strict*/ """{ "provider": { "zai-coding-plan": "x" } }""");
         RunSpec s = Spec("zai-coding-plan");
         Prepared p = new OpencodeRuntime().Prepare(s);
-
-        JsonObject headers = Headers(p, "zai-coding-plan");
-        Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
-        Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
+        try
+        {
+            JsonObject headers = Headers(p, "zai-coding-plan");
+            Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
+            Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 
     [Fact]
@@ -86,9 +98,15 @@ public class ZaiSessionAffinityTests
         using FakeUserConfig cfg = new(/*lang=json,strict*/ """{ "provider": { "anthropic": "x" } }""");
         RunSpec s = Spec("anthropic");
         Prepared p = new OpencodeRuntime().Prepare(s);
-
-        JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
-        Assert.Equal("x", config["provider"]!["anthropic"]!.GetValue<string>());
+        try
+        {
+            JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
+            Assert.Equal("x", config["provider"]!["anthropic"]!.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 
     [Fact]
@@ -107,17 +125,23 @@ public class ZaiSessionAffinityTests
             """);
         RunSpec s = Spec("zai-coding-plan");
         Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
+            JsonObject provider = config["provider"]!["zai-coding-plan"]!.AsObject();
+            Assert.Equal("super-secret-key", provider["options"]!["apiKey"]!.GetValue<string>());
+            Assert.Equal("Other", provider["models"]!["other-model"]!["name"]!.GetValue<string>());
+            JsonObject headers = Headers(p, "zai-coding-plan");
+            Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
+            Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
 
-        JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
-        JsonObject provider = config["provider"]!["zai-coding-plan"]!.AsObject();
-        Assert.Equal("super-secret-key", provider["options"]!["apiKey"]!.GetValue<string>());
-        Assert.Equal("Other", provider["models"]!["other-model"]!["name"]!.GetValue<string>());
-        JsonObject headers = Headers(p, "zai-coding-plan");
-        Assert.Equal("lean-worker", headers["x-session-affinity"]!.GetValue<string>());
-        Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
-
-        string recordedText = Recorded(s).ToJsonString();
-        Assert.DoesNotContain("super-secret-key", recordedText, StringComparison.Ordinal);
+            string recordedText = Recorded(s).ToJsonString();
+            Assert.DoesNotContain("super-secret-key", recordedText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 
     [Fact]
@@ -135,11 +159,17 @@ public class ZaiSessionAffinityTests
             """);
         RunSpec s = Spec("zai-coding-plan");
         Prepared p = new OpencodeRuntime().Prepare(s);
-
-        JsonObject headers = Headers(p, "zai-coding-plan");
-        Assert.Equal("mine", headers["X-SESSION-AFFINITY"]!.GetValue<string>());
-        Assert.False(headers.ContainsKey("x-session-affinity"));
-        Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
+        try
+        {
+            JsonObject headers = Headers(p, "zai-coding-plan");
+            Assert.Equal("mine", headers["X-SESSION-AFFINITY"]!.GetValue<string>());
+            Assert.False(headers.ContainsKey("x-session-affinity"));
+            Assert.Equal("lean-worker", headers["X-Session-Id"]!.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 
     [Fact]
@@ -149,8 +179,14 @@ public class ZaiSessionAffinityTests
         using FakeUserConfig cfg = new();
         RunSpec s = Spec("minimax-coding-plan");
         Prepared p = new OpencodeRuntime().Prepare(s);
-
-        JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
-        Assert.False(config.ContainsKey("provider"));
+        try
+        {
+            JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
+            Assert.False(config.ContainsKey("provider"));
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 }

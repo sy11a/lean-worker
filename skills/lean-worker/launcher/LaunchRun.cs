@@ -460,25 +460,36 @@ internal sealed class LaunchRun
             _mcpConfig, _runSystem, _o.ReplaceSystemPrompt, _mode, _cacheTtl, _o.KeepClaudeMd, _o.KeepMemory, _keepHooks,
             !_o.NoUserEnv, _o.ClaudeSettings, providerInfo);
         Prepared prepared = runtime.Prepare(spec);
-        await File.WriteAllTextAsync(Path.Combine(_runDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-
-        WriteScope.Snapshot? treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
+        // Locals declared before the try: needed by code after the try and the lambda inside.
         _meter = new Meter(prices, _provider, _runDir, _budget, _wrapUp ? _wrapUpAt : null, Meter.HandoffInstruction);
+        Meter meter = _meter;
         string streamPath = Path.Combine(_runDir, "stream.jsonl");
         _stderrPath = Path.Combine(_runDir, "stderr.txt");
-        Meter meter = _meter;
+        WriteScope.Snapshot? treeBefore;
         Outcome outcome = _outcome;
         string model = _model;
-        (int exitCode, bool timedOut, bool capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
+        int exitCode;
+        bool timedOut;
+        bool capKilled;
+        try
         {
-            if (Json.TryParseObject(line) is not { } obj)
+            await File.WriteAllTextAsync(Path.Combine(_runDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
+            (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
             {
-                return false;
-            }
+                if (Json.TryParseObject(line) is not { } obj)
+                {
+                    return false;
+                }
 
-            Usage? u = runtime.Parse(obj, outcome);
-            return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
-        }).ConfigureAwait(false);
+                Usage? u = runtime.Parse(obj, outcome);
+                return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            RemoveScratch(prepared.ScratchDirectory);
+        }
         _exitCode = exitCode;
         _timedOut = timedOut;
         _capKilled = capKilled;
@@ -734,4 +745,25 @@ internal sealed class LaunchRun
     }
 
     private static T NonNull<T>(T? value) where T : class => value ?? throw new InvalidOperationException("LaunchRun phase order violated");
+
+    private void RemoveScratch(string? path)
+    {
+        if (path is null || !Directory.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch (IOException ex)
+        {
+            _notes.Add($"config home not removed: {path} ({ex.Message})");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _notes.Add($"config home not removed: {path} ({ex.Message})");
+        }
+    }
 }
