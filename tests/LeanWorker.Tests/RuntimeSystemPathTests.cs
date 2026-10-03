@@ -27,6 +27,7 @@ public class RuntimeSystemPathTests
         int i = p.Args.IndexOf("--append-system-prompt-file");
         Assert.True(i >= 0 && p.Args[i + 1] is "/stable/system/abc123.md");
         Assert.DoesNotContain("--system-prompt-file", p.Args, StringComparer.Ordinal);
+        Assert.Null(p.ScratchDirectory);
     }
 
     [Fact]
@@ -37,6 +38,7 @@ public class RuntimeSystemPathTests
         int i = p.Args.IndexOf("--system-prompt-file");
         Assert.True(i >= 0 && p.Args[i + 1] is "/stable/system/abc123.md");
         Assert.DoesNotContain("--append-system-prompt-file", p.Args, StringComparer.Ordinal);
+        Assert.Null(p.ScratchDirectory);
     }
 
     [Fact]
@@ -44,7 +46,14 @@ public class RuntimeSystemPathTests
     {
         using FakeOnPath path = new("opencode");
         Prepared p = new OpencodeRuntime().Prepare(Spec("/stable/system/abc123.md"));
-        JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
-        Assert.Equal(["/stable/system/abc123.md"], config["instructions"]!.AsArray().Select(n => n!.GetValue<string>()), StringComparer.Ordinal);
+        try
+        {
+            JsonObject config = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!.AsObject();
+            Assert.Equal(["/stable/system/abc123.md"], config["instructions"]!.AsArray().Select(n => n!.GetValue<string>()), StringComparer.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
     }
 }
