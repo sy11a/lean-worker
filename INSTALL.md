@@ -2,7 +2,7 @@
 
 These instructions are for a Claude Code or opencode session that a user has asked to install this skill,
 for example: *"Install the lean-worker skill for this project, following
-https://github.com/sy11a/lean-worker/blob/main/INSTALL.md"*.
+https://github.com/sy11a/lean-worker/blob/master/INSTALL.md"*.
 
 Follow the steps in order. Each step says what to run, what counts as success, and when to stop
 and ask the user. Do not skip the questions: two steps change the user's configuration.

@@ -12,7 +12,7 @@ Install the lean-worker skill for this project.
 
 Source: https://github.com/sy11a/lean-worker
 Follow INSTALL.md from that repository step by step:
-https://github.com/sy11a/lean-worker/blob/main/INSTALL.md
+https://github.com/sy11a/lean-worker/blob/master/INSTALL.md
 
 Summary of what I expect:
 1. Clone the repo into a temp folder (not into this project). If GitHub is blocked, stop and ask me for a ZIP.
