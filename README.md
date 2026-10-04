@@ -9,7 +9,7 @@ worker can pick the task up from it.
 
 > **Quick install through your agent:** in a Claude Code or opencode session in your project, say
 > *"Install the lean-worker skill for this project, following
-> https://github.com/sy11a/lean-worker/blob/main/INSTALL.md"*.
+> https://github.com/sy11a/lean-worker/blob/master/INSTALL.md"*.
 > [INSTALL.md](INSTALL.md) walks the agent through the whole setup and tells it when to stop and ask you.
 > A fuller prompt to paste is in [AGENT-INSTALL-PROMPT.md](AGENT-INSTALL-PROMPT.md).
 
