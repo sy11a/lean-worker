@@ -136,8 +136,9 @@ internal static class Launcher
         return (timedOut ? -1 : p.ExitCode, timedOut, capKilled);
     }
 
-    private static ProcessStartInfo StartInfo(Prepared prep)
+    internal static ProcessStartInfo StartInfo(Prepared prep)
     {
+        string cwd = Directory.GetCurrentDirectory();
         ProcessStartInfo psi = new()
         {
             RedirectStandardInput = true,
@@ -147,6 +148,7 @@ internal static class Launcher
             StandardOutputEncoding = Json.Utf8,
             StandardErrorEncoding = Json.Utf8,
             FileName = prep.Executable,
+            WorkingDirectory = cwd,
         };
         foreach (string arg in prep.Args)
         {
@@ -163,6 +165,9 @@ internal static class Launcher
                 psi.Environment[k] = v;
             }
         }
+        // opencode reads its project dir from the inherited PWD env var, so pin it to the launcher's cwd
+        psi.Environment["PWD"] = cwd;
+        _ = psi.Environment.Remove("OLDPWD");
         return psi;
     }
 

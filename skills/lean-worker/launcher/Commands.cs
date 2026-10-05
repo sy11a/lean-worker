@@ -215,6 +215,9 @@ internal static partial class Commands
         {
             psi.ArgumentList.Add(a);
         }
+        // opencode reads its project dir from the inherited PWD env var, so pin it to the launcher's cwd
+        psi.Environment["PWD"] = Directory.GetCurrentDirectory();
+        _ = psi.Environment.Remove("OLDPWD");
 
         using Process p = Process.Start(psi) ?? throw new LaunchException("could not start opencode");
         string output = p.StandardOutput.ReadToEnd();
