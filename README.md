@@ -389,6 +389,23 @@ The worker is kept as lean as in Claude Code:
   `WebFetch`, `WebSearch`) to opencode permissions; every other tool is denied. `Bash` runs only the
   `allowedTools` patterns (`Bash(git diff:*)` → `git diff*`); any other command is rejected, since
   `opencode run` cannot ask.
+- A fixed **deny floor** runs under whatever the profile allows and in every permission mode: Claude receives
+  it as `--disallowedTools` after `--allowedTools` (deny beats allow); opencode receives the same three
+  patterns as bash deny rules that come after the allow entries in the `bash` object (last matching rule
+  wins), so even `bypassPermissions` keeps the floor, though under it the floor only blocks those literal
+  git invocations and the mode itself runs anything. The three patterns are `Bash(git *--output*)`
+  (which also covers git's harmless `--output-indicator-*` flags), `Bash(git *--ext-diff*)` and
+  `Bash(git *--textconv*)`; those flags write a file or run a program whatever prefix allowed the
+command. A profile can add more with `"deniedTools": [...]` (Bash patterns, applied only when
+   the tools include Bash; opencode honours only `Bash(...)` entries) (floor first, no duplicates);
+   nothing can remove the floor.
+  Edit/Write under `.git/**` and `**/.git/**` (and the plain `.git` / `**/.git` paths, for a linked
+  worktree whose `.git` is a file) is also denied, so a worker can't rewrite `.git/config` and turn a
+  later `git diff` (diff.external) or `git status` (core.fsmonitor) into a command runner. This edit
+  deny is opencode-only; Claude Code's own refusal of `.git` edits was measured under `acceptEdits`
+  only. Known gap: a shell redirect from any allowed command (e.g. `echo x >> .git/config`) is not
+  covered by the edit rules and holds for opencode in every mode and for Claude under `bypassPermissions`
+  (measured).
 - `effort` does not apply; `variant` (profile key or `--variant`) selects an opencode model variant.
 - `--mcp-config` is claude-runtime only.
 

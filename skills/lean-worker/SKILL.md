@@ -100,6 +100,21 @@ Use `--keep-hooks` or `"keepHooks": true` in a profile only when a task needs on
 An opencode worker runs on a clean opencode config: no global instructions, plugins, skills or MCP.
 Its Bash runs only the `allowedTools` patterns; any other command is denied and the worker gets a tool
 error. opencode checks every segment of a pipeline or chain (`jq … | head`), so each segment must match.
+A fixed **deny list** runs under whatever the profile allows and in every permission mode: Claude receives
+it as `--disallowedTools` after `--allowedTools` (deny beats allow); opencode receives the same three
+patterns as bash deny rules that come after the allow entries in the `bash` object (last matching rule
+wins), so even `bypassPermissions` keeps the floor, though under it the floor only blocks those literal
+git invocations and the mode itself runs anything. The three patterns are `Bash(git *--output*)`
+(which also covers git's harmless `--output-indicator-*` flags), `Bash(git *--ext-diff*)` and
+`Bash(git *--textconv*)`, because those flags write a file or run a program whatever prefix allowed
+the command. A profile can add more with `"deniedTools": [...]` (Bash patterns, applied only when the tools
+include Bash; opencode honours only `Bash(...)` entries). opencode also refuses Edit/Write
+under `.git/**` and `**/.git/**` (plus the plain `.git` / `**/.git` paths for a linked worktree, whose
+`.git` is a file), so a worker can't rewrite `.git/config` and turn a later `git diff` or `git status`
+into a command runner; Claude Code's own refusal of those edits was measured under `acceptEdits`
+only, so the `.git` edit deny is opencode-only. Known gap: a shell redirect from any allowed command
+(e.g. `echo x >> .git/config`) is not covered by the edit rules and holds for opencode in every mode
+and for Claude under `bypassPermissions` (measured).
 
 A profile's `model` may be a **chain**, e.g. `["zai-coding-plan/glm-5.3", "deepseek/deepseek-v4-flash",
 "claude-sonnet-5-5"]`. The launcher takes the first model with headroom: a subscription model while

@@ -27,6 +27,7 @@ internal sealed class LaunchRun
     private string? _variant;
     private List<string> _tools = [];
     private List<string> _allowed = [];
+    private List<string> _denied = [];
     private List<string>? _writeScope;
     private decimal _budget;
     private decimal _wrapUpAt;
@@ -189,6 +190,18 @@ internal sealed class LaunchRun
         _variant = _o.Variant ?? Json.Str(_profile, "variant");
         _tools = _o.Tools ?? Json.StrList(_profile, "tools") ?? ["Read", "Edit", "Write", "Glob", "Grep", "Bash"];
         _allowed = _o.AllowedTools.Count > 0 ? _o.AllowedTools : Json.StrList(_profile, "allowedTools") ?? [];
+        // The deny floor + the profile's optional deniedTools (no duplicates, floor first); nothing removes the floor.
+        if (_tools.Contains("Bash", StringComparer.OrdinalIgnoreCase))
+        {
+            _denied = [.. Launcher.DeniedFloor];
+            foreach (string entry in Json.StrList(_profile, "deniedTools") ?? [])
+            {
+                if (!_denied.Contains(entry, StringComparer.Ordinal))
+                {
+                    _denied.Add(entry);
+                }
+            }
+        }
         // The paths the task may write; a continuation keeps its original run's scope.
         _writeScope = _o.WriteScope.Count > 0 ? _o.WriteScope
             : Json.StrList(_profile, "writeScope") ?? Json.StrList(_prevSummary, "write_scope");
@@ -456,7 +469,7 @@ internal sealed class LaunchRun
         Provider providerInfo = NonNull(_providerInfo);
         IRuntime runtime = NonNull(_runtime);
         PriceBook prices = NonNull(_prices);
-        RunSpec spec = new(_runDir, _provider, _model, _effort, _variant, _tools, _allowed, _budget, _wrapUp, _permissionMode,
+        RunSpec spec = new(_runDir, _provider, _model, _effort, _variant, _tools, _allowed, _denied, _budget, _wrapUp, _permissionMode,
             _mcpConfig, _runSystem, _o.ReplaceSystemPrompt, _mode, _cacheTtl, _o.KeepClaudeMd, _o.KeepMemory, _keepHooks,
             !_o.NoUserEnv, _o.ClaudeSettings, providerInfo);
         Prepared prepared = runtime.Prepare(spec);

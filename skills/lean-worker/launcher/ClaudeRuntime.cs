@@ -31,6 +31,11 @@ internal sealed class ClaudeRuntime : IRuntime
             a.Add("--allowedTools");
             a.AddRange(s.Allowed);
         }
+        if (s.Denied.Count > 0)
+        {
+            a.Add("--disallowedTools");
+            a.AddRange(s.Denied);
+        }
         if (s.Mode is "lean")
         {
             AddLeanSettings(s, env, a);

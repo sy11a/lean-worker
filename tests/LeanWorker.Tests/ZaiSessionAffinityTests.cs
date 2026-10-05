@@ -13,7 +13,7 @@ public class ZaiSessionAffinityTests
     {
         return new(
         RunDir: Directory.CreateTempSubdirectory("lw-rundir").FullName, Provider: provider, Model: "glm-5.3",
-        Effort: "medium", Variant: null, Tools: ["Read"], Allowed: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
+        Effort: "medium", Variant: null, Tools: ["Read"], Allowed: [], Denied: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
         McpConfig: null, SystemFile: null, ReplaceSystemPrompt: false, Mode: "bare", CacheTtl: "5m",
         KeepClaudeMd: true, KeepMemory: true, KeepHooks: false, KeepUserEnv: false, ClaudeSettings: null,
         ProviderInfo: new Provider(provider, o: null));

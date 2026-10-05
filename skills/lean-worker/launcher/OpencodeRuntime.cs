@@ -94,17 +94,47 @@ internal sealed class OpencodeRuntime : IRuntime
                 permission[k] = "allow";
             }
         }
-        if (s.Tools.Contains("Bash", StringComparer.OrdinalIgnoreCase) && s.PermissionMode is not "bypassPermissions")
+        // Edit/Write both map to opencode's `edit`. Deny `.git/**`, `**/.git/**`, `.git` and `**/.git` so a worker
+        // cannot replace `.git/config` and turn a later `git diff` (diff.external) or `git status` (core.fsmonitor)
+        // into a command runner; the plain `.git` / `**/.git` entries cover a linked worktree, where `.git` is a
+        // file whose contents `gitdir: <dir the worker wrote>` make git read that dir's config. opencode's last
+        // matching rule wins, so the deny entries come after `*`.
+        if (s.Tools.Contains("Edit", StringComparer.OrdinalIgnoreCase) || s.Tools.Contains("Write", StringComparer.OrdinalIgnoreCase))
         {
-            // Bash runs only the pre-approved patterns. Anything else is denied, not "ask": `opencode run` auto-rejects
-            // a prompt and ends the session, while a denial comes back to the model as a tool error and the run goes on.
-            // opencode checks each segment of a pipeline or chain, so every segment must match a pattern.
-            JsonObject bash = new() { ["*"] = "deny" };
-            foreach (string pattern in s.Allowed)
+            JsonObject edit = new() { ["*"] = "allow" };
+            edit[".git/**"] = "deny";
+            edit["**/.git/**"] = "deny";
+            edit[".git"] = "deny";
+            edit["**/.git"] = "deny";
+            permission["edit"] = edit;
+        }
+        if (s.Tools.Contains("Bash", StringComparer.OrdinalIgnoreCase))
+        {
+            // The bash object is emitted in every permission mode so the deny floor holds everywhere.
+            // opencode uses last matching rule wins; the per-pattern allow entries come first, then the per-pattern
+            // deny entries so they win. In a non-bypass mode a leading `"*": "deny"` makes every unlisted command
+            // denied (an "ask" is impossible: `opencode run` auto-rejects a prompt and ends the session); in
+            // bypass mode the leading `"*": "allow"` lets the worker run anything except the deny entries.
+            JsonObject bash = new() { ["*"] = s.PermissionMode is "bypassPermissions" ? "allow" : "deny" };
+            if (s.PermissionMode is not "bypassPermissions")
+            {
+                foreach (string pattern in s.Allowed)
+                {
+                    if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
+                    {
+                        bash[pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal)] = "allow";
+                    }
+                }
+            }
+
+            foreach (string pattern in s.Denied)
             {
                 if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
                 {
-                    bash[pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal)] = "allow";
+                    // Remove-then-add so the deny moves after every allow: JsonObject keeps a key's original position on reassignment, so without this an earlier allow of the same glob would win.
+                    string key = pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal);
+                    bash.Remove(key);
+                    bash[key] = "deny";
                 }
             }
 
