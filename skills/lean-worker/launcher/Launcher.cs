@@ -22,6 +22,8 @@ internal static class Launcher
 {
     internal static readonly string[] Efforts = ["low", "medium", "high", "xhigh", "max"];
     internal static readonly string[] PermissionModes = ["acceptEdits", "dontAsk", "plan", "manual", "auto", "bypassPermissions"];
+    // git flags that write files or run programs whatever prefix allowed the command (deny beats allow).
+    internal static readonly string[] DeniedFloor = ["Bash(git *--output*)", "Bash(git *--ext-diff*)", "Bash(git *--textconv*)"];
     internal const string ContinuationHeading = "## Continuation (lean-worker)";
     public const int RunSchemaVersion = 1;
 

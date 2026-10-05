@@ -12,7 +12,7 @@ public class OpencodeRuntimePrepareScratchTests
     {
         return new(
         RunDir: runDir, Provider: "anthropic", Model: "claude-haiku-4-5",
-        Effort: "medium", Variant: null, Tools: tools, Allowed: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
+        Effort: "medium", Variant: null, Tools: tools, Allowed: [], Denied: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
         McpConfig: null, SystemFile: null, ReplaceSystemPrompt: false, Mode: "bare", CacheTtl: "5m",
         KeepClaudeMd: true, KeepMemory: true, KeepHooks: false, KeepUserEnv: false, ClaudeSettings: null,
         ProviderInfo: new Provider("anthropic", o: null));

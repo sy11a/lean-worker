@@ -13,7 +13,7 @@ public class RuntimeSystemPathTests
     {
         return new(
         RunDir: Directory.CreateTempSubdirectory("lw-rundir").FullName, Provider: "anthropic", Model: "claude-haiku-4-5",
-        Effort: "medium", Variant: null, Tools: ["Read"], Allowed: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
+        Effort: "medium", Variant: null, Tools: ["Read"], Allowed: [], Denied: [], Budget: 2m, WrapUp: false, PermissionMode: "acceptEdits",
         McpConfig: null, SystemFile: systemFile, ReplaceSystemPrompt: replace, Mode: "bare", CacheTtl: "5m",
         KeepClaudeMd: true, KeepMemory: true, KeepHooks: false, KeepUserEnv: false, ClaudeSettings: null,
         ProviderInfo: new Provider("anthropic", o: null));
