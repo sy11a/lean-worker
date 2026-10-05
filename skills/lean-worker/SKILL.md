@@ -114,7 +114,15 @@ under `.git/**` and `**/.git/**` (plus the plain `.git` / `**/.git` paths for a 
 into a command runner; Claude Code's own refusal of those edits was measured under `acceptEdits`
 only, so the `.git` edit deny is opencode-only. Known gap: a shell redirect from any allowed command
 (e.g. `echo x >> .git/config`) is not covered by the edit rules and holds for opencode in every mode
-and for Claude under `bypassPermissions` (measured).
+and for Claude under `bypassPermissions` (measured). The launcher's opencode plugin closes that gap
+for opencode: it scans every `bash` command, denies write redirects except to `/dev/null`, file
+descriptors (`2>&1`, `>&-`) and `.lean-worker/inbox/`, and tells the worker to write files with the
+edit tool. The scanner parses a small bash subset near the redirect (no comments; heredocs only as
+`<<`/`<<-` with a simple `NAME`/`'NAME'`/`"NAME"`/`\NAME` delimiter; line continuation, backticks, `${`,
+`$((`, `#`, `((`, `$[`, `case`, `$$`, and a heredoc combined with `$(` or `<(` are refused only when the
+command contains a `>`; an unterminated quote in the target is denied) and fails closed on the rest.
+Denials are appended to `redirect-denied.log` in the run directory. Other `.lean-worker/` paths stay
+off-limits.
 
 A profile's `model` may be a **chain**, e.g. `["zai-coding-plan/glm-5.3", "deepseek/deepseek-v4-flash",
 "claude-sonnet-5-5"]`. The launcher takes the first model with headroom: a subscription model while
