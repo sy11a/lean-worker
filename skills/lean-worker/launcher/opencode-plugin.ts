@@ -8,8 +8,10 @@
 // the bash command for write redirects, allows `/dev/null`, file-descriptor duplicates (`2>&1`, `>&-`) and
 // paths under `.lean-worker/inbox/`. It parses a small bash subset near the redirect, and fails closed
 // otherwise. When the command contains a `>`, it refuses line continuation, `$((`, `((`, `$[`, backtick,
-// `${`, `#` (comment), `case`, `$$` (pid), a heredoc combined with `$(` or `<(`, and heredoc delimiters
-// other than `NAME`/`'NAME'`/`"NAME"`/`\NAME`; an unterminated quote in the redirect target is denied.
+// `${`, `#` (comment), `case`, `$$` (pid), a heredoc combined with `$(` or `<(`, and a heredoc combined
+// with any `[` (e.g. `[ -f a ]`, `*.[ch]`); heredoc delimiters other than `NAME`/`'NAME'`/`"NAME"`/`\NAME`
+// are also denied. An unterminated
+// quote in the redirect target is denied.
 // Denials are appended to `<run>/redirect-denied.log` (never to `hook.log`, which the launcher counts as one
 // hook check per line via `LaunchRun.cs:587`).
 import { appendFileSync, existsSync, readFileSync } from "fs"
@@ -142,6 +144,7 @@ const scanCommand = (cmd: string, directory: string): string | null => {
   if (/\bcase\b/.test(cmd)) return "unsupported shell syntax: case"
   if (cmd.includes("$$")) return "unsupported shell syntax: pid"
   if (/(?<!<)<<(?!<)/.test(cmd) && (cmd.includes("$(") || cmd.includes("<("))) return "unsupported shell syntax: heredoc with substitution"
+  if (/(?<!<)<<(?!<)/.test(cmd) && cmd.includes("[")) return "unsupported shell syntax: heredoc with subscript"
   const n = cmd.length
   let i = 0
   const heredocs: Heredoc[] = []
