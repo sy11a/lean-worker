@@ -402,6 +402,36 @@ public sealed class RedirectGuardTests : IDisposable
         if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
     }
 
+    // Round-5 test gaps: a heredoc-operator look-alike inside an array subscript (e.g. "a[x<<y]") is denied
+    // outright once the command also contains ">" elsewhere; a real heredoc together with any "[" in a
+    // command with ">" is an accepted over-block.
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] GapCases5 =
+    [
+        ("gap5:subscript-shift-hides", "a[x<<y]=1\necho a > .git/config\ny", false, null),
+        ("gap5:subscript-shift-own-line", "a[x<<y]=1 > .lean-worker/inbox/t/f", false, null),
+        ("gap5:heredoc-bracket-overblock", "[ -f a ] && cat <<EOF > .lean-worker/inbox/t/f\nb\nEOF", false, null),
+        ("gap5:heredoc-glued-redirect-ok", "cat<<EOF > .lean-worker/inbox/t/f\na\nEOF", true, null),
+        ("gap5:heredoc-after-assign-redirect-ok", "x=a<<EOF > .lean-worker/inbox/t/f\nb\nEOF", true, null),
+        ("gap5:heredoc-fd-redirect-ok", "2<<EOF > .lean-worker/inbox/t/f\nb\nEOF", true, null),
+        ("gap5:heredoc-redirect-ok", "cat <<EOF > .lean-worker/inbox/t/f\na\nEOF", true, null),
+        ("gap5:dup-pipe-tail", "dotnet test 2>&1 | tail -5", true, null),
+    ];
+
+    [Fact]
+    public async Task Round_5_gap_cases_match_expected_outcomeAsync()
+    {
+        RequireNode();
+        var cases = GapCases5.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
+
+        List<string> failures = [];
+        foreach ((string label, string command, bool ok, string? target) in GapCases5)
+        {
+            CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
+        }
+        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+    }
+
     private static void CheckCase(List<string> failures, Dictionary<string, HookResult> results, string label,
         string describedCommand, bool expectedOk, string? expectedTarget)
     {

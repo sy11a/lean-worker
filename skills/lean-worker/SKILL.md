@@ -119,8 +119,9 @@ for opencode: it scans every `bash` command, denies write redirects except to `/
 descriptors (`2>&1`, `>&-`) and `.lean-worker/inbox/`, and tells the worker to write files with the
 edit tool. The scanner parses a small bash subset near the redirect (no comments; heredocs only as
 `<<`/`<<-` with a simple `NAME`/`'NAME'`/`"NAME"`/`\NAME` delimiter; line continuation, backticks, `${`,
-`$((`, `#`, `((`, `$[`, `case`, `$$`, and a heredoc combined with `$(` or `<(` are refused only when the
-command contains a `>`; an unterminated quote in the target is denied) and fails closed on the rest.
+`$((`, `#`, `((`, `$[`, `case`, `$$`, a heredoc combined with `$(` or `<(`, and a heredoc combined
+with any `[` (e.g. `[ -f a ]`, `*.[ch]`) are refused only when the command contains a `>`; an
+unterminated quote in the target is denied) and fails closed on the rest.
 Denials are appended to `redirect-denied.log` in the run directory. Other `.lean-worker/` paths stay
 off-limits.
 
