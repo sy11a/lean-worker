@@ -358,6 +358,60 @@ public class DenyFloorTests
     }
 
     [Fact]
+    public void MiniMax_M3_pre_approves_od_but_not_cat_in_prices_json()
+    {
+        DirectoryInfo? d = new(AppContext.BaseDirectory);
+        while (d is not null && !File.Exists(Path.Combine(d.FullName, "skills", "lean-worker", "launcher", "prices.json")))
+        {
+            d = d.Parent;
+        }
+
+        JsonNode book = JsonNode.Parse(File.ReadAllText(Path.Combine(d!.FullName, "skills", "lean-worker", "launcher", "prices.json")))!;
+        JsonArray allowed = book["modelTraits"]!["MiniMax-M3"]!["allowedTools"]!.AsArray();
+        List<string> entries = [.. allowed.Select(a => a!.GetValue<string>())];
+        Assert.Contains("Bash(od:*)", entries);
+        Assert.DoesNotContain(entries, e => e.StartsWith("Bash(cat", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void MiniMax_M3_od_allow_reaches_both_runtimes()
+    {
+        DirectoryInfo? d = new(AppContext.BaseDirectory);
+        while (d is not null && !File.Exists(Path.Combine(d.FullName, "skills", "lean-worker", "launcher", "prices.json")))
+        {
+            d = d.Parent;
+        }
+
+        JsonObject doc = JsonNode.Parse(File.ReadAllText(Path.Combine(d!.FullName, "skills", "lean-worker", "launcher", "prices.json")))!.AsObject();
+        ModelTraits? traits = PriceBook.FromJson(doc).Traits("MiniMax-M3");
+        Assert.NotNull(traits);
+        List<string> allowed = [.. traits!.AllowedTools];
+        List<string> denied = [.. Launcher.DeniedFloor];
+        RunSpec s = Spec(["Read", "Bash"], allowed, denied);
+
+        using (new FakeOnPath("opencode"))
+        {
+            Prepared p = new OpencodeRuntime().Prepare(s);
+            try
+            {
+                JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
+                Assert.Equal("allow", bash["od*"]!.GetValue<string>());
+                Assert.False(bash.ContainsKey("cat*"));
+            }
+            finally
+            {
+                Directory.Delete(p.ScratchDirectory!, recursive: true);
+            }
+        }
+
+        using (new FakeOnPath("claude"))
+        {
+            Prepared p = new ClaudeRuntime().Prepare(s);
+            Assert.Contains("Bash(od:*)", p.Args);
+        }
+    }
+
+    [Fact]
     public void MiniMax_M3_deny_floor_wins_over_the_git_show_allow_in_both_runtimes()
     {
         DirectoryInfo? d = new(AppContext.BaseDirectory);
