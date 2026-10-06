@@ -7,11 +7,11 @@
 // command runner. Claude Code already denies that; opencode needs the check in the launcher. The guard scans
 // the bash command for write redirects, allows `/dev/null`, file-descriptor duplicates (`2>&1`, `>&-`) and
 // paths under `.lean-worker/inbox/`. It parses a small bash subset near the redirect, and fails closed
-// otherwise. When the command contains a `>`, it refuses line continuation, `$((`, `((`, `$[`, backtick,
-// `${`, `#` (comment), `case`, `$$` (pid), a heredoc combined with `$(` or `<(`, and a heredoc combined
-// with any `[` (e.g. `[ -f a ]`, `*.[ch]`); heredoc delimiters other than `NAME`/`'NAME'`/`"NAME"`/`\NAME`
-// are also denied. An unterminated
-// quote in the redirect target is denied.
+// otherwise. When the command contains a `>`, it refuses line continuation, `$((`, backtick, `${`, `#`
+// (comment), `((` (arithmetic command), `$[`, `case`, `$$` (pid), a heredoc combined with `$(` or `<(`, and
+// a heredoc combined with any `[` (e.g. `[ -f a ]`, `*.[ch]`); the `#`, `((` and `case` refusals apply
+// outside quotes (single, `$'..'`, double), except with a heredoc; heredoc delimiters other than
+// `NAME`/`'NAME'`/`"NAME"`/`\NAME` are also denied. An unterminated quote in the redirect target is denied.
 // Denials are appended to `<run>/redirect-denied.log` (never to `hook.log`, which the launcher counts as one
 // hook check per line via `LaunchRun.cs:587`).
 import { appendFileSync, existsSync, readFileSync } from "fs"
@@ -131,17 +131,101 @@ const findSubEnd = (s: string, i: number): number => {
   return -1
 }
 
+// Returns a skeleton of `cmd` with the contents of single, ANSI-C (`$'..'`) and double-quoted regions
+// replaced by `_`; otherwise copies the character. Returns `cmd` itself (no masking) when `cmd` contains
+// `<<` (heredocs and here-strings are not tracked), when a quote is unterminated, or when a double-quoted
+// region contains `$(` or a backtick. Only the comment (`#`), arithmetic command (`((`) and case (`\bcase\b`)
+// pre-checks read the skeleton; every other pre-check and the main scanner keep reading the raw `cmd`.
+const maskQuoted = (cmd: string): string => {
+  if (cmd.includes("<<")) return cmd
+  const out: string[] = []
+  let i = 0
+  const n = cmd.length
+  while (i < n) {
+    const c = cmd[i]
+    if (c === "\\") {
+      if (i + 1 >= n) return cmd
+      out.push(c)
+      out.push(cmd[i + 1])
+      i += 2
+      continue
+    }
+    if (c === "$" && cmd[i + 1] === "$") {
+      out.push("$")
+      out.push("$")
+      i += 2
+      continue
+    }
+    if (c === "'") {
+      const j = cmd.indexOf("'", i + 1)
+      if (j === -1) return cmd
+      out.push("'")
+      for (let k = i + 1; k < j; k++) out.push("_")
+      out.push("'")
+      i = j + 1
+      continue
+    }
+    if (c === "$" && cmd[i + 1] === "'") {
+      out.push("$")
+      out.push("'")
+      let j = i + 2
+      while (j < n) {
+        if (cmd[j] === "\\" && j + 1 < n) {
+          out.push("_")
+          out.push("_")
+          j += 2
+          continue
+        }
+        if (cmd[j] === "'") break
+        out.push("_")
+        j++
+      }
+      if (j >= n) return cmd
+      out.push("'")
+      i = j + 1
+      continue
+    }
+    if (c === '"' || (c === "$" && cmd[i + 1] === '"')) {
+      const isLocale = c === "$"
+      out.push(c)
+      if (isLocale) out.push('"')
+      let j = isLocale ? i + 2 : i + 1
+      while (j < n) {
+        if (cmd[j] === "\\" && j + 1 < n) {
+          out.push("_")
+          out.push("_")
+          j += 2
+          continue
+        }
+        if (cmd[j] === "$" && cmd[j + 1] === "(") return cmd
+        if (cmd[j] === "`") return cmd
+        if (cmd[j] === '"') break
+        out.push("_")
+        j++
+      }
+      if (j >= n) return cmd
+      out.push('"')
+      i = j + 1
+      continue
+    }
+    out.push(c)
+    i++
+  }
+  return out.join("")
+}
+
 // Returns the offending target on denial, or null when the command is allowed.
 const scanCommand = (cmd: string, directory: string): string | null => {
   if (!cmd.includes(">")) return null
+  const skel = maskQuoted(cmd)
   if (cmd.includes("\\\n")) return "unsupported shell syntax: line continuation"
   if (cmd.includes("$((")) return "unsupported shell syntax: arithmetic expansion"
   if (cmd.includes("`")) return "unsupported shell syntax: backtick"
   if (cmd.includes("${")) return "unsupported shell syntax: parameter expansion"
-  if (cmd.includes("#")) return "unsupported shell syntax: comment"
-  if (cmd.includes("((")) return "unsupported shell syntax: arithmetic command"
+  if (skel.includes("#")) return "unsupported shell syntax: comment"
+  if (skel.includes("((")) return "unsupported shell syntax: arithmetic command"
   if (cmd.includes("$[")) return "unsupported shell syntax: old arithmetic"
-  if (/\bcase\b/.test(cmd)) return "unsupported shell syntax: case"
+  if (/\bcase\b/.test(skel)) return "unsupported shell syntax: case"
   if (cmd.includes("$$")) return "unsupported shell syntax: pid"
   if (/(?<!<)<<(?!<)/.test(cmd) && (cmd.includes("$(") || cmd.includes("<("))) return "unsupported shell syntax: heredoc with substitution"
   if (/(?<!<)<<(?!<)/.test(cmd) && cmd.includes("[")) return "unsupported shell syntax: heredoc with subscript"

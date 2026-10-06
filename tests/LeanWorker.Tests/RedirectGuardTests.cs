@@ -90,7 +90,7 @@ public sealed class RedirectGuardTests : IDisposable
     private static readonly Dictionary<string, string> ExpectedTargets = new()
     {
         ["denied:plain-target"] = "M",
-        ["denied:comment-then-git-config"] = "unsupported shell syntax: comment",
+        ["denied:comment-then-git-config"] = ".git/config",
         ["denied:no-space-git-config"] = ".git/config",
         ["denied:stderr-file"] = "err.log",
         ["denied:amp-out"] = "out",
@@ -373,8 +373,8 @@ public sealed class RedirectGuardTests : IDisposable
 
     // Round-4 test gaps named by the task: $$, case patterns and ${...} denied with "unsupported shell syntax"
     // on their own (no "#" involved); here-strings carrying a command substitution are allowed; extglob targets
-    // (@(...) and !(...)) that walk out of the inbox via ".." are denied; and the "#35" row documents an accepted
-    // over-block (denied only because "#" anywhere in the command is treated as an unsupported comment).
+    // (@(...) and !(...)) that walk out of the inbox via ".." are denied; and the "#35" row is allowed because the
+    // quote-aware pre-check masks the quoted "#35" before the comment check runs.
     private static readonly (string Label, string Command, bool Ok, string? Target)[] GapCases4 =
     [
         ("gap4:pid-expansion", "echo $$ > .lean-worker/inbox/t/f", false, "unsupported shell syntax"),
@@ -384,7 +384,7 @@ public sealed class RedirectGuardTests : IDisposable
         ("gap4:herestring-comsub-git-log", "grep x <<< \"$(git log)\" 2>&1", true, null),
         ("gap4:extglob-at-dotdot-escape", "echo a > .lean-worker/inbox/@(t)/../../../.git/config", false, ".lean-worker/inbox/@"),
         ("gap4:extglob-bang-dotdot-escape", "echo a > .lean-worker/inbox/!(zz)/../../../.git/config", false, ".lean-worker/inbox/!"),
-        ("gap4:accepted-overblock-hash-in-pipe", "git log --oneline 2>&1 | grep \"#35\"", false, null),
+        ("gap4:quoted-hash-in-pipe-allowed", "git log --oneline 2>&1 | grep \"#35\"", true, null),
     ];
 
     [Fact]
@@ -426,6 +426,50 @@ public sealed class RedirectGuardTests : IDisposable
 
         List<string> failures = [];
         foreach ((string label, string command, bool ok, string? target) in GapCases5)
+        {
+            CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
+        }
+        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+    }
+
+    // Quote-aware pre-check (.lean-worker/inbox/qa-spec/spec.md): maskQuoted lets the comment/arithmetic-command/
+    // case pre-checks see quoted "#", "((" and "case" as literal text, while every other pre-check and the main
+    // scanner keep reading the raw command unchanged.
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] QaSpecCases =
+    [
+        ("qa:sq-arith", "jq '(( .a ))' f > /dev/null", true, null),
+        ("qa:sq-comment", "grep -P 'x|#pragma' f 2>&1", true, null),
+        ("qa:dq-comment", "grep \"issue #19\" f 2>/dev/null", true, null),
+        ("qa:dq-case", "grep -iE \"a|case\" f 2>&1", true, null),
+        ("qa:sq-newline-comment", "echo 'a\n#pragma x' > .lean-worker/inbox/t/a.cs", true, null),
+        ("qa:dq-escaped-dollar-hash", "sh -c \"echo \\$# \\$0\" x 2>&1", true, null),
+        ("qa:ansi-c-escaped-quote", "jq $'(( .a ))\\'' f > /dev/null", true, null),
+        ("qa:sq-inside-dq-literal", "echo \"it's\" '((' 2>&1", true, null),
+        ("qa:comsub-sq", "x=$(jq '((.a))' f) 2>&1", true, null),
+        ("qa:dq-escaped-dquote", "echo \"a\\\"#\" > /dev/null", true, null),
+        ("qa:sq-arith-bad-target", "jq '((.a))' f > .git/config", false, ".git/config"),
+        ("qa:bare-arith", "(( x = 1 )); echo a > /dev/null", false, "unsupported shell syntax: arithmetic command"),
+        ("qa:bare-comment", "echo a # '>' x > /dev/null", false, "unsupported shell syntax: comment"),
+        ("qa:bare-case", "case $x in a) echo > /dev/null;; esac", false, "unsupported shell syntax: case"),
+        ("qa:escaped-sq-then-hash", "echo \\'#\\' > /dev/null", false, "unsupported shell syntax: comment"),
+        ("qa:sq-backslash-no-escape", "echo 'a\\'#' > /dev/null", false, null),
+        ("qa:dq-double-backslash", "echo \"a\\\\\"#\" > /dev/null", false, null),
+        ("qa:dq-comsub-bail", "echo \"$(echo '#')\" > /dev/null", false, null),
+        ("qa:dq-backtick-bail", "echo \"`echo`\" '#' > /dev/null", false, null),
+        ("qa:heredoc-bail", "cat <<'E' > /dev/null\n'#'\nE", false, null),
+        ("qa:unterminated-sq", "echo '# > /dev/null", false, null),
+        ("qa:pid-quoted", "echo $$'#' > /dev/null", false, "unsupported shell syntax: pid"),
+    ];
+
+    [Fact]
+    public async Task Qa_spec_cases_match_expected_outcomeAsync()
+    {
+        RequireNode();
+        var cases = QaSpecCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
+
+        List<string> failures = [];
+        foreach ((string label, string command, bool ok, string? target) in QaSpecCases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
