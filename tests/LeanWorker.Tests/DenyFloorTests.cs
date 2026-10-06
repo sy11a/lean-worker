@@ -71,7 +71,9 @@ public class DenyFloorTests
             Assert.Equal("deny", bash["*"]!.GetValue<string>());
 
             List<string> rest = [.. keys.Skip(1)];
-            Assert.Equal("allow", bash["ls*"]!.GetValue<string>());
+            Assert.Equal("allow", bash["ls"]!.GetValue<string>());
+            Assert.Equal("allow", bash["ls *"]!.GetValue<string>());
+            Assert.DoesNotContain("ls*", keys);
             Assert.Equal("allow", bash["pwd"]!.GetValue<string>());
             Assert.Equal("deny", bash["git *--output*"]!.GetValue<string>());
             Assert.Equal("deny", bash["git *--ext-diff*"]!.GetValue<string>());
@@ -79,7 +81,7 @@ public class DenyFloorTests
 
             int firstDenyIdx = rest.FindIndex(k => k is "git *--output*" or "git *--ext-diff*" or "git *--textconv*");
             Assert.True(firstDenyIdx >= 0);
-            int lastAllowIdx = rest.FindLastIndex(k => k is "ls*" or "pwd");
+            int lastAllowIdx = rest.FindLastIndex(k => k is "ls" or "ls *" or "pwd");
             Assert.True(rest.Take(firstDenyIdx).All(k => bash[k]!.GetValue<string>() == "allow"));
             Assert.True(lastAllowIdx < firstDenyIdx);
             Assert.True(rest.Skip(firstDenyIdx).All(k => bash[k]!.GetValue<string>() == "deny"));
@@ -105,9 +107,11 @@ public class DenyFloorTests
                 List<string> keys = [.. bash.Select(kv => kv.Key)];
 
                 Assert.Equal("deny", bash["git push*"]!.GetValue<string>());
+                Assert.Equal("allow", bash["git push"]!.GetValue<string>());
+                Assert.Equal("allow", bash["git push *"]!.GetValue<string>());
                 int gitPushIdx = keys.IndexOf("git push*");
-                int gitIdx = keys.IndexOf("git*");
-                Assert.True(gitPushIdx > gitIdx, $"'git push*' (index {gitPushIdx}) must come after 'git*' (index {gitIdx}) so the deny wins: {string.Join(", ", keys)}");
+                int gitIdx = keys.IndexOf("git *");
+                Assert.True(gitPushIdx > gitIdx, $"'git push*' (index {gitPushIdx}) must come after 'git *' (index {gitIdx}) so the deny wins: {string.Join(", ", keys)}");
             }
         }
         finally
@@ -395,7 +399,9 @@ public class DenyFloorTests
             try
             {
                 JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
-                Assert.Equal("allow", bash["od*"]!.GetValue<string>());
+                Assert.Equal("allow", bash["od"]!.GetValue<string>());
+                Assert.Equal("allow", bash["od *"]!.GetValue<string>());
+                Assert.False(bash.ContainsKey("od*"));
                 Assert.False(bash.ContainsKey("cat*"));
             }
             finally
@@ -435,8 +441,10 @@ public class DenyFloorTests
                 JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
                 List<string> keys = [.. bash.Select(kv => kv.Key)];
 
-                Assert.Equal("allow", bash["git show*"]!.GetValue<string>());
-                int gitShowIdx = keys.IndexOf("git show*");
+                Assert.Equal("allow", bash["git show"]!.GetValue<string>());
+                Assert.Equal("allow", bash["git show *"]!.GetValue<string>());
+                Assert.DoesNotContain("git show*", keys);
+                int gitShowIdx = keys.IndexOf("git show *");
                 Assert.True(gitShowIdx >= 0);
                 foreach (string floorKey in new[] { "git *--output*", "git *--ext-diff*", "git *--textconv*" })
                 {
@@ -463,6 +471,87 @@ public class DenyFloorTests
                 Assert.True(next > pos, $"'{entry}' not found in order in: {string.Join(" ", p.Args)}");
                 pos = next;
             }
+        }
+    }
+
+    [Fact]
+    public void Opencode_bash_allow_with_colon_star_becomes_bare_and_star_suffix_keys_never_glued()
+    {
+        using FakeOnPath path = new("opencode");
+        RunSpec s = Spec(["Read", "Bash"], ["Bash(od:*)"], []);
+        Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
+            Assert.Equal("allow", bash["od"]!.GetValue<string>());
+            Assert.Equal("allow", bash["od *"]!.GetValue<string>());
+            Assert.False(bash.ContainsKey("od*"));
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Opencode_bash_deny_with_colon_star_still_becomes_a_single_glued_star_key()
+    {
+        using FakeOnPath path = new("opencode");
+        RunSpec s = Spec(["Read", "Bash"], ["Bash(ls:*)"], [.. Launcher.DeniedFloor, "Bash(rm:*)"]);
+        Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
+            List<string> keys = [.. bash.Select(kv => kv.Key)];
+
+            Assert.Equal("deny", bash["rm*"]!.GetValue<string>());
+            int rmIdx = keys.IndexOf("rm*");
+            int lastAllowIdx = keys.FindLastIndex(k => bash[k]!.GetValue<string>() == "allow");
+            Assert.True(rmIdx > lastAllowIdx, $"'rm*' (index {rmIdx}) must come after every allow (last at {lastAllowIdx}): {string.Join(", ", keys)}");
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Opencode_bash_allow_without_colon_star_is_kept_as_is()
+    {
+        using FakeOnPath path = new("opencode");
+        RunSpec s = Spec(["Read", "Bash"], ["Bash(git status)"], []);
+        Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
+            Assert.Equal("allow", bash["git status"]!.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Opencode_bash_permission_under_bypassPermissions_never_splits_allow_entries()
+    {
+        using FakeOnPath path = new("opencode");
+        RunSpec s = Spec(["Read", "Bash"], ["Bash(od:*)"], [.. Launcher.DeniedFloor]) with { PermissionMode = "bypassPermissions" };
+        Prepared p = new OpencodeRuntime().Prepare(s);
+        try
+        {
+            JsonObject bash = JsonNode.Parse(p.Env["OPENCODE_CONFIG_CONTENT"]!)!["permission"]!["bash"]!.AsObject();
+            List<string> keys = [.. bash.Select(kv => kv.Key)];
+
+            Assert.Equal(["*", "git *--output*", "git *--ext-diff*", "git *--textconv*"], keys);
+            foreach (string k in keys.Skip(1))
+            {
+                Assert.Equal("deny", bash[k]!.GetValue<string>());
+            }
+        }
+        finally
+        {
+            Directory.Delete(p.ScratchDirectory!, recursive: true);
         }
     }
 }
