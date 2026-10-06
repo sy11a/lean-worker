@@ -9,7 +9,7 @@
 // paths under `.lean-worker/inbox/`. It parses a small bash subset near the redirect, and fails closed
 // otherwise. When the command contains a `>`, it refuses line continuation, `$((`, backtick, `${`, `#`
 // (comment), `((` (arithmetic command), `$[`, `case`, `$$` (pid), a heredoc combined with `$(` or `<(`, and
-// a heredoc combined with any `[` (e.g. `[ -f a ]`, `*.[ch]`); the `#`, `((` and `case` refusals apply
+// a heredoc combined with any `[` (e.g. `[ -f a ]`, `*.[ch]`); the `#`, backtick, `((` and `case` refusals apply
 // outside quotes (single, `$'..'`, double), except with a heredoc; heredoc delimiters other than
 // `NAME`/`'NAME'`/`"NAME"`/`\NAME` are also denied. An unterminated quote in the redirect target is denied.
 // Denials are appended to `<run>/redirect-denied.log` (never to `hook.log`, which the launcher counts as one
@@ -134,8 +134,9 @@ const findSubEnd = (s: string, i: number): number => {
 // Returns a skeleton of `cmd` with the contents of single, ANSI-C (`$'..'`) and double-quoted regions
 // replaced by `_`; otherwise copies the character. Returns `cmd` itself (no masking) when `cmd` contains
 // `<<` (heredocs and here-strings are not tracked), when a quote is unterminated, or when a double-quoted
-// region contains `$(` or a backtick. Only the comment (`#`), arithmetic command (`((`) and case (`\bcase\b`)
-// pre-checks read the skeleton; every other pre-check and the main scanner keep reading the raw `cmd`.
+// region contains `$(` or a backtick. Only the comment (`#`), backtick, arithmetic command (`((`) and case
+// (`\bcase\b`) pre-checks read the skeleton; every other pre-check and the main scanner keep reading the
+// raw `cmd`.
 const maskQuoted = (cmd: string): string => {
   if (cmd.includes("<<")) return cmd
   const out: string[] = []
@@ -220,7 +221,7 @@ const scanCommand = (cmd: string, directory: string): string | null => {
   const skel = maskQuoted(cmd)
   if (cmd.includes("\\\n")) return "unsupported shell syntax: line continuation"
   if (cmd.includes("$((")) return "unsupported shell syntax: arithmetic expansion"
-  if (cmd.includes("`")) return "unsupported shell syntax: backtick"
+  if (skel.includes("`")) return "unsupported shell syntax: backtick"
   if (cmd.includes("${")) return "unsupported shell syntax: parameter expansion"
   if (skel.includes("#")) return "unsupported shell syntax: comment"
   if (skel.includes("((")) return "unsupported shell syntax: arithmetic command"

@@ -476,6 +476,44 @@ public sealed class RedirectGuardTests : IDisposable
         if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
     }
 
+    // Backtick pre-check reads the quote-masked skeleton (.lean-worker/inbox/bt-spec/spec.md): the backtick
+    // pre-check sees maskQuoted(cmd) instead of the raw command, while every other pre-check and the main
+    // scanner keep reading the raw command unchanged.
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] BtSpecCases =
+    [
+        ("bt:dq-escaped", "grep -n \"^- \\`\" tools/probe/README.md 2>&1", true, null),
+        ("bt:dq-escaped-word", "grep -n \"^- \\`allowlist\" tools/probe/README.md 2>&1", true, null),
+        ("bt:sq", "echo 'a`b' > /dev/null", true, null),
+        ("bt:ansi-c", "echo $'a`b' > /dev/null", true, null),
+        ("bt:dq-escaped-pair", "echo \"a\\`b\\`c\" > /dev/null", true, null),
+        ("bt:comsub-sq", "x=$(echo '`') > /dev/null", true, null),
+        ("bt:sq-bad-target", "echo '`' > .git/config", false, ".git/config"),
+        ("bt:bare", "echo `id` > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:dq-unescaped", "echo \"`id`\" > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:dollar-dq-unescaped", "echo $\"`id`\" > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:bare-escaped", "echo \\` > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:dq-escaped-backslash", "echo \"a\\\\`id`\" > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:sq-then-bare", "echo '`' `id` > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:dq-unterminated", "echo \"\\` > /dev/null", false, "unsupported shell syntax: backtick"),
+        ("bt:heredoc", "cat <<'E' > /dev/null\n`\nE", false, "unsupported shell syntax: backtick"),
+        ("bt:target-quoted-backtick", "echo x > '`a'", false, null),
+    ];
+
+    [Fact]
+    public async Task Bt_spec_cases_match_expected_outcomeAsync()
+    {
+        RequireNode();
+        var cases = BtSpecCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
+
+        List<string> failures = [];
+        foreach ((string label, string command, bool ok, string? target) in BtSpecCases)
+        {
+            CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
+        }
+        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+    }
+
     private static void CheckCase(List<string> failures, Dictionary<string, HookResult> results, string label,
         string describedCommand, bool expectedOk, string? expectedTarget)
     {

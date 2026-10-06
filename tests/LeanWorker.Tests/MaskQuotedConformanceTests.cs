@@ -137,12 +137,12 @@ public sealed class MaskQuotedConformanceTests : IDisposable
         ("git-config-quoted-target", "echo \"#\" > \".git/config\"", false, ".git/config"),
         ("git-config-ansi", "echo $'#' > .git/config", false, ".git/config"),
         ("inbox-sq-hash", "echo '#' > .lean-worker/inbox/t/f", true, null),
-        // other pre-checks still read the raw command
+        // other pre-checks still read the raw command (backtick now reads the skeleton)
         ("raw-arith-exp", "echo '$(('" + DN, false, "arithmetic expansion"),
         ("raw-param", "echo '${'" + DN, false, "parameter expansion"),
         ("raw-old-arith", "echo '$['" + DN, false, "old arithmetic"),
         ("raw-pid", "echo '$$'" + DN, false, P),
-        ("raw-backtick", "echo '`'" + DN, false, "backtick"),
+        ("sq-backtick", "echo '`'" + DN, true, null),
         ("raw-heredoc-subscript", "cat <<E" + DN + "\n[\nE", false, "heredoc with subscript"),
         // no ">" -> no pre-checks
         ("no-gt-sq", "grep '#' f", true, null),
