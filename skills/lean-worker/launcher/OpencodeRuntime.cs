@@ -112,9 +112,13 @@ internal sealed class OpencodeRuntime : IRuntime
         {
             // The bash object is emitted in every permission mode so the deny floor holds everywhere.
             // opencode uses last matching rule wins; the per-pattern allow entries come first, then the per-pattern
-            // deny entries so they win. In a non-bypass mode a leading `"*": "deny"` makes every unlisted command
-            // denied (an "ask" is impossible: `opencode run` auto-rejects a prompt and ends the session); in
-            // bypass mode the leading `"*": "allow"` lets the worker run anything except the deny entries.
+            // deny entries so they win. An allow entry whose inner pattern ends in `:*` (Claude Code's "or with any
+            // args") is split into two keys, the bare command and "<command> *": opencode's `*` has no word boundary,
+            // so the old `od*` would also match `odX`. Any other allow entry is emitted with `:*` replaced by `*` as
+            // before. Deny entries stay as-is (`rm*`): narrowing them to `rm` / `rm *` would let `rmdir` slip through
+            // in bypass mode. In a non-bypass mode a leading `"*": "deny"` makes every unlisted command denied (an
+            // "ask" is impossible: `opencode run` auto-rejects a prompt and ends the session); in bypass mode the
+            // leading `"*": "allow"` lets the worker run anything except the deny entries.
             JsonObject bash = new() { ["*"] = s.PermissionMode is "bypassPermissions" ? "allow" : "deny" };
             if (s.PermissionMode is not "bypassPermissions")
             {
@@ -122,7 +126,17 @@ internal sealed class OpencodeRuntime : IRuntime
                 {
                     if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
                     {
-                        bash[pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal)] = "allow";
+                        string inner = pattern[5..^1];
+                        if (inner.EndsWith(":*", StringComparison.Ordinal))
+                        {
+                            string bare = inner[..^2];
+                            bash[bare] = "allow";
+                            bash[bare + " *"] = "allow";
+                        }
+                        else
+                        {
+                            bash[inner.Replace(":*", "*", StringComparison.Ordinal)] = "allow";
+                        }
                     }
                 }
             }
