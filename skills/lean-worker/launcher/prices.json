@@ -46,7 +46,8 @@
     "_comment": "What a worker needs because of the model, whichever provider serves it. Keys are model ids without the provider; a model id matches the longest key it starts with. allowedTools are added to a Bash profile's; note is printed in the result. Detail: ../models.md.",
     "MiniMax-M3": {
       "allowedTools": ["Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(grep:*)", "Bash(jq:*)", "Bash(echo:*)",
-                       "Bash(ls:*)", "Bash(pwd)", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)"],
+                       "Bash(ls:*)", "Bash(pwd)", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)",
+                       "Bash(git show:*)"],
       "note": "chains shell commands and has edited files outside its task's scope: give code tasks --write-scope; sed is not pre-approved: read line ranges with Read (offset/limit)"
     }
   }
