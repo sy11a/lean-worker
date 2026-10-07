@@ -1,7 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Xunit;
 
 namespace LeanWorker.Tests;
@@ -21,7 +21,10 @@ public sealed class RedirectGuardTests : IDisposable
         Directory.Delete(_root, recursive: true);
         foreach (string dir in _runDirs)
         {
-            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            if (Directory.Exists(dir))
+            {
+                Directory.Delete(dir, recursive: true);
+            }
         }
     }
 
@@ -32,12 +35,12 @@ public sealed class RedirectGuardTests : IDisposable
         return dir;
     }
 
-    private static readonly string PluginPath = Path.Combine(AppContext.BaseDirectory, "opencode-plugin.ts");
+    private static readonly string _pluginPath = Path.Combine(AppContext.BaseDirectory, "opencode-plugin.ts");
 
     // (label, tool, command, expectedOk) -- top table of spec.md, with the two v2 flips applied:
     // "grep -c x f # > note" is now denied (comments are no longer special), and the unterminated heredoc with
     // no ">" anywhere is now allowed by the v2 fast path.
-    private static readonly (string Label, string Tool, string Command, bool Ok)[] SpecCases =
+    private static readonly (string Label, string Tool, string Command, bool Ok)[] _specCases =
     [
         ("allowed:dotnet-build", "bash", "dotnet build 2>&1", true),
         ("allowed:ls-devnull", "bash", "ls 2>/dev/null", true),
@@ -87,7 +90,7 @@ public sealed class RedirectGuardTests : IDisposable
 
     // Cases whose spec.md target is unambiguous from the "(target)" annotation; others (fail-closed cases with
     // no annotated target) only assert the throw, the message prefix, and the edit-tool/inbox pointer.
-    private static readonly Dictionary<string, string> ExpectedTargets = new()
+    private static readonly Dictionary<string, string> _expectedTargets = new(StringComparer.Ordinal)
     {
         ["denied:plain-target"] = "M",
         ["denied:comment-then-git-config"] = ".git/config",
@@ -115,7 +118,7 @@ public sealed class RedirectGuardTests : IDisposable
     // v2 section of spec.md: only cont-in-dup, cont-in-heredoc-op, hash-comment and double-slash flip to deny;
     // every other row keeps the table's original expectation (including arith-shift and delim-backslash-common,
     // which the spec calls out as staying "allow").
-    private static readonly (string Label, string Command, bool Ok)[] ConformanceCases =
+    private static readonly (string Label, string Command, bool Ok)[] _conformanceCases =
     [
         ("ansic-escaped-quote", "echo $'\\'' >.git/config #'", false),
         ("ansic-plain", "echo $'a>b'", true),
@@ -194,7 +197,7 @@ public sealed class RedirectGuardTests : IDisposable
     // and adj-dup-quoted-glued are accepted over-blocks, flipped to deny; hd-in-dq-comsub was "allow" in the table
     // but contains both ">" and a heredoc operator together with "$(", which v3 denies outright, so it flips to
     // deny too. Every other row keeps the table's expectation.
-    private static readonly (string Label, string Command, bool Ok)[] V3Cases =
+    private static readonly (string Label, string Command, bool Ok)[] _v3Cases =
     [
         ("ansic-esc-backslash", "echo $'\\\\' > .git/config", false),
         ("ansic-esc-quote-allowed", "echo $'it\\'s' > .lean-worker/inbox/t/f", true),
@@ -294,7 +297,7 @@ public sealed class RedirectGuardTests : IDisposable
 
     // Round-1 test gaps named by the task: &>>, <<- with a tab-indented closing delimiter, <<"EOF", <&,
     // redirects after ||, |, inside ( ) and $( ), and [[ a > b ]].
-    private static readonly (string Label, string Command, bool Ok, string? Target)[] GapCases =
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] _gapCases =
     [
         ("gap:amp-gtgt-allowed", "cmd &>> .lean-worker/inbox/t/f", true, null),
         ("gap:amp-gtgt-denied", "cmd &>> /tmp/x", false, "/tmp/x"),
@@ -312,70 +315,86 @@ public sealed class RedirectGuardTests : IDisposable
     public async Task Every_spec_case_matches_its_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = SpecCases.Select(c => (c.Label, c.Tool, c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _specCases.Select(c => (c.Label, c.Tool, c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string tool, string command, bool ok) in SpecCases)
+        foreach ((string label, string tool, string command, bool ok) in _specCases)
         {
             CheckCase(failures, results, label, $"{tool} {command.ReplaceLineEndings("\\n")}", ok,
-                ExpectedTargets.GetValueOrDefault(label));
+                _expectedTargets.GetValueOrDefault(label));
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     [Fact]
     public async Task Every_conformance_case_matches_its_v2_expected_outcomeAsync()
     {
         RequireNode();
-        Assert.Equal(68, ConformanceCases.Length);
-        var cases = ConformanceCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        Assert.Equal(68, _conformanceCases.Length);
+        (string Label, string Tool, string Command)[] cases = [.. _conformanceCases.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok) in ConformanceCases)
+        foreach ((string label, string command, bool ok) in _conformanceCases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, expectedTarget: null);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     [Fact]
     public async Task Every_v3_case_matches_its_expected_outcomeAsync()
     {
         RequireNode();
-        Assert.Equal(94, V3Cases.Length);
-        var cases = V3Cases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        Assert.Equal(94, _v3Cases.Length);
+        (string Label, string Tool, string Command)[] cases = [.. _v3Cases.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok) in V3Cases)
+        foreach ((string label, string command, bool ok) in _v3Cases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, expectedTarget: null);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     [Fact]
     public async Task Round_1_gap_cases_match_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = GapCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _gapCases.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? target) in GapCases)
+        foreach ((string label, string command, bool ok, string? target) in _gapCases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     // Round-4 test gaps named by the task: $$, case patterns and ${...} denied with "unsupported shell syntax"
     // on their own (no "#" involved); here-strings carrying a command substitution are allowed; extglob targets
     // (@(...) and !(...)) that walk out of the inbox via ".." are denied; and the "#35" row is allowed because the
     // quote-aware pre-check masks the quoted "#35" before the comment check runs.
-    private static readonly (string Label, string Command, bool Ok, string? Target)[] GapCases4 =
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] _gapCases4 =
     [
         ("gap4:pid-expansion", "echo $$ > .lean-worker/inbox/t/f", false, "unsupported shell syntax"),
         ("gap4:case-pattern", "case x in a) echo a > f;; esac", false, "unsupported shell syntax"),
@@ -391,21 +410,25 @@ public sealed class RedirectGuardTests : IDisposable
     public async Task Round_4_gap_cases_match_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = GapCases4.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _gapCases4.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? target) in GapCases4)
+        foreach ((string label, string command, bool ok, string? target) in _gapCases4)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     // Round-5 test gaps: a heredoc-operator look-alike inside an array subscript (e.g. "a[x<<y]") is denied
     // outright once the command also contains ">" elsewhere; a real heredoc together with any "[" in a
     // command with ">" is an accepted over-block.
-    private static readonly (string Label, string Command, bool Ok, string? Target)[] GapCases5 =
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] _gapCases5 =
     [
         ("gap5:subscript-shift-hides", "a[x<<y]=1\necho a > .git/config\ny", false, null),
         ("gap5:subscript-shift-own-line", "a[x<<y]=1 > .lean-worker/inbox/t/f", false, null),
@@ -421,21 +444,25 @@ public sealed class RedirectGuardTests : IDisposable
     public async Task Round_5_gap_cases_match_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = GapCases5.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _gapCases5.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? target) in GapCases5)
+        foreach ((string label, string command, bool ok, string? target) in _gapCases5)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     // Quote-aware pre-check (.lean-worker/inbox/qa-spec/spec.md): maskQuoted lets the comment/arithmetic-command/
     // case pre-checks see quoted "#", "((" and "case" as literal text, while every other pre-check and the main
     // scanner keep reading the raw command unchanged.
-    private static readonly (string Label, string Command, bool Ok, string? Target)[] QaSpecCases =
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] _qaSpecCases =
     [
         ("qa:sq-arith", "jq '(( .a ))' f > /dev/null", true, null),
         ("qa:sq-comment", "grep -P 'x|#pragma' f 2>&1", true, null),
@@ -465,21 +492,25 @@ public sealed class RedirectGuardTests : IDisposable
     public async Task Qa_spec_cases_match_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = QaSpecCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _qaSpecCases.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? target) in QaSpecCases)
+        foreach ((string label, string command, bool ok, string? target) in _qaSpecCases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     // Backtick pre-check reads the quote-masked skeleton (.lean-worker/inbox/bt-spec/spec.md): the backtick
     // pre-check sees maskQuoted(cmd) instead of the raw command, while every other pre-check and the main
     // scanner keep reading the raw command unchanged.
-    private static readonly (string Label, string Command, bool Ok, string? Target)[] BtSpecCases =
+    private static readonly (string Label, string Command, bool Ok, string? Target)[] _btSpecCases =
     [
         ("bt:dq-escaped", "grep -n \"^- \\`\" tools/probe/README.md 2>&1", true, null),
         ("bt:dq-escaped-word", "grep -n \"^- \\`allowlist\" tools/probe/README.md 2>&1", true, null),
@@ -503,15 +534,19 @@ public sealed class RedirectGuardTests : IDisposable
     public async Task Bt_spec_cases_match_expected_outcomeAsync()
     {
         RequireNode();
-        var cases = BtSpecCases.Select(c => (c.Label, "bash", c.Command)).ToArray();
+        (string Label, string Tool, string Command)[] cases = [.. _btSpecCases.Select(c => (c.Label, "bash", c.Command))];
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildCasesScript(cases));
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? target) in BtSpecCases)
+        foreach ((string label, string command, bool ok, string? target) in _btSpecCases)
         {
             CheckCase(failures, results, label, command.ReplaceLineEndings("\\n"), ok, target);
         }
-        if (failures.Count > 0) Assert.Fail(string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail(string.Join('\n', failures));
     }
 
     private static void CheckCase(List<string> failures, Dictionary<string, HookResult> results, string label,
@@ -524,7 +559,10 @@ public sealed class RedirectGuardTests : IDisposable
         }
         if (expectedOk)
         {
-            if (!r.Ok) failures.Add($"{label} ({describedCommand}): expected allow but denied: {r.Message}");
+            if (!r.Ok)
+            {
+                failures.Add($"{label} ({describedCommand}): expected allow but denied: {r.Message}");
+            }
             return;
         }
         if (r.Ok)
@@ -541,10 +579,11 @@ public sealed class RedirectGuardTests : IDisposable
         {
             failures.Add($"{label} ({describedCommand}): message doesn't point to the edit tool or .lean-worker/inbox/: {r.Message}");
         }
-        if (expectedTarget != null && !r.Message.Contains(expectedTarget, StringComparison.Ordinal))
+        if (expectedTarget is null || r.Message.Contains(expectedTarget, StringComparison.Ordinal))
         {
-            failures.Add($"{label} ({describedCommand}): message missing target '{expectedTarget}': {r.Message}");
+            return;
         }
+        failures.Add($"{label} ({describedCommand}): message missing target '{expectedTarget}': {r.Message}");
     }
 
     [Fact]
@@ -553,7 +592,7 @@ public sealed class RedirectGuardTests : IDisposable
         RequireNode();
         string runDir = CreateRunDir();
         string script = $$"""
-            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)}});
+            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)}});
             process.env.LEAN_WORKER_RUN_DIR = {{JsonSerializer.Serialize(runDir)}};
             process.env.LEAN_WORKER_WRAPUP = "1";
             const ctx = await LeanWorkerWrapUp({ directory: {{JsonSerializer.Serialize(_root)}}, worktree: {{JsonSerializer.Serialize(_root)}} });
@@ -564,24 +603,24 @@ public sealed class RedirectGuardTests : IDisposable
               console.log(JSON.stringify({ name: "case", ok: false, message: e.message }));
             }
             """;
-        await RunHarnessAsync(script);
+        _ = await RunHarnessAsync(script);
 
         string redirectLogPath = Path.Combine(runDir, "redirect-denied.log");
         Assert.True(File.Exists(redirectLogPath), $"expected {redirectLogPath} to exist");
         string redirectLog = await File.ReadAllTextAsync(redirectLogPath, TestContext.Current.CancellationToken);
         string[] redirectLines = redirectLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.Single(redirectLines);
+        string redirectLine = Assert.Single(redirectLines);
         Assert.Matches(
             @"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z redirect-denied \S+$",
-            redirectLines[0]);
-        Assert.Contains("/tmp/x", redirectLines[0], StringComparison.Ordinal);
+            redirectLine);
+        Assert.Contains("/tmp/x", redirectLine, StringComparison.Ordinal);
 
         string hookLogPath = Path.Combine(runDir, "hook.log");
         Assert.True(File.Exists(hookLogPath), $"expected {hookLogPath} to exist");
         string hookLog = await File.ReadAllTextAsync(hookLogPath, TestContext.Current.CancellationToken);
         string[] hookLines = hookLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.Single(hookLines);
-        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z bash$", hookLines[0]);
+        string hookLine = Assert.Single(hookLines);
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z bash$", hookLine);
     }
 
     [Fact]
@@ -591,7 +630,7 @@ public sealed class RedirectGuardTests : IDisposable
         string runDir = CreateRunDir();
         await File.WriteAllTextAsync(Path.Combine(runDir, "wrapup.json"), """{"reason":"budget spent"}""", TestContext.Current.CancellationToken);
         string script = $$"""
-            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)}});
+            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)}});
             process.env.LEAN_WORKER_RUN_DIR = {{JsonSerializer.Serialize(runDir)}};
             process.env.LEAN_WORKER_WRAPUP = "1";
             const ctx = await LeanWorkerWrapUp({ directory: {{JsonSerializer.Serialize(_root)}}, worktree: {{JsonSerializer.Serialize(_root)}} });
@@ -613,7 +652,7 @@ public sealed class RedirectGuardTests : IDisposable
     {
         RequireNode();
         string script = $$"""
-            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)}});
+            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)}});
             delete process.env.LEAN_WORKER_RUN_DIR;
             process.env.LEAN_WORKER_WRAPUP = "0";
             const ctx = await LeanWorkerWrapUp({ directory: {{JsonSerializer.Serialize(_root)}}, worktree: {{JsonSerializer.Serialize(_root)}} });
@@ -630,7 +669,7 @@ public sealed class RedirectGuardTests : IDisposable
         string runDir = CreateRunDir();
         await File.WriteAllTextAsync(Path.Combine(runDir, "wrapup.json"), """{"reason":"budget spent"}""", TestContext.Current.CancellationToken);
         string script = $$"""
-            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)}});
+            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)}});
             process.env.LEAN_WORKER_RUN_DIR = {{JsonSerializer.Serialize(runDir)}};
             process.env.LEAN_WORKER_WRAPUP = "1";
             const ctx = await LeanWorkerWrapUp({ directory: {{JsonSerializer.Serialize(_root)}}, worktree: {{JsonSerializer.Serialize(_root)}} });
@@ -652,7 +691,7 @@ public sealed class RedirectGuardTests : IDisposable
         RequireNode();
         string runDir = CreateRunDir();
         string script = $$"""
-            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)}});
+            const { LeanWorkerWrapUp } = await import({{JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)}});
             process.env.LEAN_WORKER_RUN_DIR = {{JsonSerializer.Serialize(runDir)}};
             process.env.LEAN_WORKER_WRAPUP = "1";
             const ctx = await LeanWorkerWrapUp({ directory: {{JsonSerializer.Serialize(_root)}}, worktree: {{JsonSerializer.Serialize(_root)}} });
@@ -668,27 +707,27 @@ public sealed class RedirectGuardTests : IDisposable
 
         string hookLog = await File.ReadAllTextAsync(Path.Combine(runDir, "hook.log"), TestContext.Current.CancellationToken);
         string[] lines = hookLog.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        Assert.Single(lines);
-        string[] parts = lines[0].Split(' ', 2);
-        Assert.True(DateTime.TryParse(parts[0], out _), $"expected an ISO timestamp, got: {lines[0]}");
+        string line = Assert.Single(lines);
+        string[] parts = line.Split(' ', 2);
+        Assert.True(DateTime.TryParse(parts[0], CultureInfo.InvariantCulture, out _), $"expected an ISO timestamp, got: {line}");
         Assert.Equal("bash", parts[1]);
     }
 
     private string BuildCasesScript(IReadOnlyList<(string Label, string Tool, string Command)> cases)
     {
         StringBuilder sb = new();
-        sb.AppendLine($"const {{ LeanWorkerWrapUp }} = await import({JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)});");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"const {{ LeanWorkerWrapUp }} = await import({JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)});");
         sb.AppendLine("delete process.env.LEAN_WORKER_RUN_DIR;");
         sb.AppendLine("delete process.env.LEAN_WORKER_WRAPUP;");
-        sb.AppendLine($"const ctx = await LeanWorkerWrapUp({{ directory: {JsonSerializer.Serialize(_root)}, worktree: {JsonSerializer.Serialize(_root)} }});");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"const ctx = await LeanWorkerWrapUp({{ directory: {JsonSerializer.Serialize(_root)}, worktree: {JsonSerializer.Serialize(_root)} }});");
         foreach ((string label, string tool, string command) in cases)
         {
             string resolvedCommand = command.Replace("D/.lean-worker/inbox", $"{_root}/.lean-worker/inbox", StringComparison.Ordinal);
             sb.AppendLine("try {");
-            sb.AppendLine($"  await ctx[\"tool.execute.before\"]({{ tool: {JsonSerializer.Serialize(tool)}, sessionID: \"s\", callID: \"c\" }}, {{ args: {{ command: {JsonSerializer.Serialize(resolvedCommand)} }} }});");
-            sb.AppendLine($"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: true }}));");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  await ctx[\"tool.execute.before\"]({{ tool: {JsonSerializer.Serialize(tool)}, sessionID: \"s\", callID: \"c\" }}, {{ args: {{ command: {JsonSerializer.Serialize(resolvedCommand)} }} }});");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: true }}));");
             sb.AppendLine("} catch (e) {");
-            sb.AppendLine($"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: false, message: e.message }}));");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: false, message: e.message }}));");
             sb.AppendLine("}");
         }
         return sb.ToString();
@@ -712,7 +751,7 @@ public sealed class RedirectGuardTests : IDisposable
         string stdout = await p.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
         string stderr = await p.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);
         await p.WaitForExitAsync(TestContext.Current.CancellationToken);
-        Assert.True(p.ExitCode == 0, $"node harness exited {p.ExitCode}, stderr:\n{stderr}");
+        Assert.True(p.ExitCode is 0, $"node harness exited {p.ExitCode.ToString(CultureInfo.InvariantCulture)}, stderr:\n{stderr}");
 
         Dictionary<string, HookResult> results = [];
         foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -720,7 +759,7 @@ public sealed class RedirectGuardTests : IDisposable
             JsonDocument doc = JsonDocument.Parse(line);
             string name = doc.RootElement.GetProperty("name").GetString()!;
             bool ok = doc.RootElement.GetProperty("ok").GetBoolean();
-            string? message = doc.RootElement.TryGetProperty("message", out JsonElement m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
+            string? message = doc.RootElement.TryGetProperty("message", out JsonElement m) && m.ValueKind is JsonValueKind.String ? m.GetString() : null;
             results[name] = new HookResult(ok, message);
         }
         return results;

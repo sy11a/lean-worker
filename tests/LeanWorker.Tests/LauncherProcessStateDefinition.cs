@@ -1,4 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
 using Xunit;
 
 namespace LeanWorker.Tests;
@@ -8,5 +7,4 @@ namespace LeanWorker.Tests;
 /// race with another test running in parallel.
 /// </summary>
 [CollectionDefinition("launcher-process-state", DisableParallelization = true)]
-[SuppressMessage("Maintainability", "CA1515:Consider making public types internal", Justification = "xUnit requires collection definition classes to be public (xUnit1027).")]
 public sealed class LauncherProcessStateDefinition;

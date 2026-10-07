@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Nodes;
 using Xunit;
 
@@ -10,12 +11,15 @@ namespace LeanWorker.Tests;
 /// </summary>
 public class DenyFloorTests
 {
-    private static RunSpec Spec(List<string> tools, List<string> allowed, List<string> denied) => new(
-        RunDir: Directory.CreateTempSubdirectory("lw-rundir").FullName, Provider: "anthropic", Model: "claude-haiku-4-5",
-        Effort: "medium", Variant: null, Tools: tools, Allowed: allowed, Denied: denied, Budget: 2m, WrapUp: false,
-        PermissionMode: "acceptEdits", McpConfig: null, SystemFile: null, ReplaceSystemPrompt: false, Mode: "bare",
-        CacheTtl: "5m", KeepClaudeMd: true, KeepMemory: true, KeepHooks: false, KeepUserEnv: false, ClaudeSettings: null,
-        ProviderInfo: new Provider("anthropic", o: null));
+    private static RunSpec Spec(List<string> tools, List<string> allowed, List<string> denied)
+    {
+        return new(
+            RunDir: Directory.CreateTempSubdirectory("lw-rundir").FullName, Provider: "anthropic", Model: "claude-haiku-4-5",
+            Effort: "medium", Variant: null, Tools: tools, Allowed: allowed, Denied: denied, Budget: 2m, WrapUp: false,
+            PermissionMode: "acceptEdits", McpConfig: null, SystemFile: null, ReplaceSystemPrompt: false, Mode: "bare",
+            CacheTtl: "5m", KeepClaudeMd: true, KeepMemory: true, KeepHooks: false, KeepUserEnv: false, ClaudeSettings: null,
+            ProviderInfo: new Provider("anthropic", o: null));
+    }
 
     [Fact]
     public void Denied_floor_is_the_three_fixed_git_escape_patterns()
@@ -53,7 +57,7 @@ public class DenyFloorTests
         RunSpec s = Spec(["Read"], [], []);
         Prepared p = new ClaudeRuntime().Prepare(s);
 
-        Assert.DoesNotContain("--disallowedTools", p.Args);
+        Assert.DoesNotContain("--disallowedTools", p.Args, StringComparer.Ordinal);
     }
 
     [Fact]
@@ -73,7 +77,7 @@ public class DenyFloorTests
             List<string> rest = [.. keys.Skip(1)];
             Assert.Equal("allow", bash["ls"]!.GetValue<string>());
             Assert.Equal("allow", bash["ls *"]!.GetValue<string>());
-            Assert.DoesNotContain("ls*", keys);
+            Assert.DoesNotContain("ls*", keys, StringComparer.Ordinal);
             Assert.Equal("allow", bash["pwd"]!.GetValue<string>());
             Assert.Equal("deny", bash["git *--output*"]!.GetValue<string>());
             Assert.Equal("deny", bash["git *--ext-diff*"]!.GetValue<string>());
@@ -82,9 +86,9 @@ public class DenyFloorTests
             int firstDenyIdx = rest.FindIndex(k => k is "git *--output*" or "git *--ext-diff*" or "git *--textconv*");
             Assert.True(firstDenyIdx >= 0);
             int lastAllowIdx = rest.FindLastIndex(k => k is "ls" or "ls *" or "pwd");
-            Assert.True(rest.Take(firstDenyIdx).All(k => bash[k]!.GetValue<string>() == "allow"));
+            Assert.True(rest.Take(firstDenyIdx).All(k => bash[k]!.GetValue<string>() is "allow"));
             Assert.True(lastAllowIdx < firstDenyIdx);
-            Assert.True(rest.Skip(firstDenyIdx).All(k => bash[k]!.GetValue<string>() == "deny"));
+            Assert.True(rest.Skip(firstDenyIdx).All(k => bash[k]!.GetValue<string>() is "deny"));
         }
         finally
         {
@@ -111,7 +115,7 @@ public class DenyFloorTests
                 Assert.Equal("allow", bash["git push *"]!.GetValue<string>());
                 int gitPushIdx = keys.IndexOf("git push*");
                 int gitIdx = keys.IndexOf("git *");
-                Assert.True(gitPushIdx > gitIdx, $"'git push*' (index {gitPushIdx}) must come after 'git *' (index {gitIdx}) so the deny wins: {string.Join(", ", keys)}");
+                Assert.True(gitPushIdx > gitIdx, $"'git push*' (index {gitPushIdx.ToString(CultureInfo.InvariantCulture)}) must come after 'git *' (index {gitIdx.ToString(CultureInfo.InvariantCulture)}) so the deny wins: {string.Join(", ", keys)}");
             }
         }
         finally
@@ -155,7 +159,7 @@ public class DenyFloorTests
             foreach (JsonObject permission in new[] { config["permission"]!.AsObject(), config["agent"]!["lean-worker"]!["permission"]!.AsObject() })
             {
                 JsonObject edit = permission["edit"]!.AsObject();
-                Assert.Equal(["*", ".git/**", "**/.git/**", ".git", "**/.git"], edit.Select(kv => kv.Key));
+                Assert.Equal(["*", ".git/**", "**/.git/**", ".git", "**/.git"], edit.Select(kv => kv.Key), StringComparer.Ordinal);
                 Assert.Equal("allow", edit["*"]!.GetValue<string>());
                 Assert.Equal("deny", edit[".git/**"]!.GetValue<string>());
                 Assert.Equal("deny", edit["**/.git/**"]!.GetValue<string>());
@@ -182,8 +186,8 @@ public class DenyFloorTests
 
             Assert.Equal("*", keys[0]);
             Assert.Equal("allow", bash["*"]!.GetValue<string>());
-            Assert.DoesNotContain("ls*", keys);
-            Assert.Equal(["*", "git *--output*", "git *--ext-diff*", "git *--textconv*"], keys);
+            Assert.DoesNotContain("ls*", keys, StringComparer.Ordinal);
+            Assert.Equal(["*", "git *--output*", "git *--ext-diff*", "git *--textconv*"], keys, StringComparer.Ordinal);
             foreach (string k in keys.Skip(1))
             {
                 Assert.Equal("deny", bash[k]!.GetValue<string>());
@@ -239,7 +243,7 @@ public class DenyFloorTests
                 ["p1"] = new JsonObject { ["deniedTools"] = new JsonArray(Launcher.DeniedFloor[0], "Bash(curl:*)") },
             },
         };
-        File.WriteAllText(Path.Combine(root, "profiles.json"), profiles.ToJsonString());
+        await File.WriteAllTextAsync(Path.Combine(root, "profiles.json"), profiles.ToJsonString(), TestContext.Current.CancellationToken);
         (_, string stdout) = await RunAsyncGolden.RunAsync(root, "exit 0", o => o.Profile = "p1");
         string runDir = RunAsyncGolden.RunDirFrom(stdout);
         string command = await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken);
@@ -277,7 +281,7 @@ public class DenyFloorTests
                 ["p1"] = new JsonObject { ["allowedTools"] = new JsonArray("Bash(pwd)") },
             },
         };
-        File.WriteAllText(Path.Combine(root, "profiles.json"), profiles.ToJsonString());
+        await File.WriteAllTextAsync(Path.Combine(root, "profiles.json"), profiles.ToJsonString(), TestContext.Current.CancellationToken);
         (_, string stdout) = await RunAsyncGolden.RunAsync(root, "exit 0", o =>
         {
             o.Profile = "p1";
@@ -344,7 +348,7 @@ public class DenyFloorTests
 
         JsonNode book = JsonNode.Parse(File.ReadAllText(Path.Combine(d!.FullName, "skills", "lean-worker", "launcher", "prices.json")))!;
         JsonArray allowed = book["modelTraits"]!["MiniMax-M3"]!["allowedTools"]!.AsArray();
-        Assert.DoesNotContain("Bash(sed -n:*)", allowed.Select(a => a!.GetValue<string>()));
+        Assert.DoesNotContain("Bash(sed -n:*)", allowed.Select(a => a!.GetValue<string>()), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -358,7 +362,7 @@ public class DenyFloorTests
 
         JsonNode book = JsonNode.Parse(File.ReadAllText(Path.Combine(d!.FullName, "skills", "lean-worker", "launcher", "prices.json")))!;
         JsonArray allowed = book["modelTraits"]!["MiniMax-M3"]!["allowedTools"]!.AsArray();
-        Assert.Contains("Bash(git show:*)", allowed.Select(a => a!.GetValue<string>()));
+        Assert.Contains("Bash(git show:*)", allowed.Select(a => a!.GetValue<string>()), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -373,7 +377,7 @@ public class DenyFloorTests
         JsonNode book = JsonNode.Parse(File.ReadAllText(Path.Combine(d!.FullName, "skills", "lean-worker", "launcher", "prices.json")))!;
         JsonArray allowed = book["modelTraits"]!["MiniMax-M3"]!["allowedTools"]!.AsArray();
         List<string> entries = [.. allowed.Select(a => a!.GetValue<string>())];
-        Assert.Contains("Bash(od:*)", entries);
+        Assert.Contains("Bash(od:*)", entries, StringComparer.Ordinal);
         Assert.DoesNotContain(entries, e => e.StartsWith("Bash(cat", StringComparison.Ordinal));
     }
 
@@ -413,7 +417,7 @@ public class DenyFloorTests
         using (new FakeOnPath("claude"))
         {
             Prepared p = new ClaudeRuntime().Prepare(s);
-            Assert.Contains("Bash(od:*)", p.Args);
+            Assert.Contains("Bash(od:*)", p.Args, StringComparer.Ordinal);
         }
     }
 
@@ -443,13 +447,13 @@ public class DenyFloorTests
 
                 Assert.Equal("allow", bash["git show"]!.GetValue<string>());
                 Assert.Equal("allow", bash["git show *"]!.GetValue<string>());
-                Assert.DoesNotContain("git show*", keys);
+                Assert.DoesNotContain("git show*", keys, StringComparer.Ordinal);
                 int gitShowIdx = keys.IndexOf("git show *");
                 Assert.True(gitShowIdx >= 0);
                 foreach (string floorKey in new[] { "git *--output*", "git *--ext-diff*", "git *--textconv*" })
                 {
                     int floorIdx = keys.IndexOf(floorKey);
-                    Assert.True(floorIdx > gitShowIdx, $"'{floorKey}' (index {floorIdx}) must come after 'git show*' (index {gitShowIdx}) so the deny wins: {string.Join(", ", keys)}");
+                    Assert.True(floorIdx > gitShowIdx, $"'{floorKey}' (index {floorIdx.ToString(CultureInfo.InvariantCulture)}) must come after 'git show*' (index {gitShowIdx.ToString(CultureInfo.InvariantCulture)}) so the deny wins: {string.Join(", ", keys)}");
                 }
             }
             finally
@@ -461,14 +465,14 @@ public class DenyFloorTests
         using (new FakeOnPath("claude"))
         {
             Prepared p = new ClaudeRuntime().Prepare(s);
-            Assert.Contains("Bash(git show:*)", p.Args);
+            Assert.Contains("Bash(git show:*)", p.Args, StringComparer.Ordinal);
 
             int pos = p.Args.IndexOf("--disallowedTools");
             Assert.True(pos >= 0);
             foreach (string entry in Launcher.DeniedFloor)
             {
                 int next = p.Args.IndexOf(entry, pos);
-                Assert.True(next > pos, $"'{entry}' not found in order in: {string.Join(" ", p.Args)}");
+                Assert.True(next > pos, $"'{entry}' not found in order in: {string.Join(' ', p.Args)}");
                 pos = next;
             }
         }
@@ -506,8 +510,8 @@ public class DenyFloorTests
 
             Assert.Equal("deny", bash["rm*"]!.GetValue<string>());
             int rmIdx = keys.IndexOf("rm*");
-            int lastAllowIdx = keys.FindLastIndex(k => bash[k]!.GetValue<string>() == "allow");
-            Assert.True(rmIdx > lastAllowIdx, $"'rm*' (index {rmIdx}) must come after every allow (last at {lastAllowIdx}): {string.Join(", ", keys)}");
+            int lastAllowIdx = keys.FindLastIndex(k => bash[k]!.GetValue<string>() is "allow");
+            Assert.True(rmIdx > lastAllowIdx, $"'rm*' (index {rmIdx.ToString(CultureInfo.InvariantCulture)}) must come after every allow (last at {lastAllowIdx.ToString(CultureInfo.InvariantCulture)}): {string.Join(", ", keys)}");
         }
         finally
         {

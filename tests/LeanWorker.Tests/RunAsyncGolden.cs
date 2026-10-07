@@ -125,7 +125,7 @@ internal static partial class RunAsyncGolden
     {
         return
             "claude -p --bare --model claude-haiku-4-5 --effort medium --append-system-prompt-file " + SystemPath(root) +
-            " --tools Read,Edit,Write,Glob,Grep,Bash --disallowedTools " + string.Join(' ', Launcher.DeniedFloor.Select(Runtimes.Quote)) +
+            " --tools Read,Edit,Write,Glob,Grep,Bash --disallowedTools " + string.Join(' ', Launcher.DeniedFloor.Select(e => Runtimes.Quote(e))) +
             " --strict-mcp-config --permission-mode acceptEdits --max-budget-usd " + maxBudget +
             " --no-session-persistence --output-format stream-json --verbose --include-partial-messages";
     }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Xunit;
@@ -15,7 +16,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
-    private static readonly string PluginPath = Path.Combine(AppContext.BaseDirectory, "opencode-plugin.ts");
+    private static readonly string _pluginPath = Path.Combine(AppContext.BaseDirectory, "opencode-plugin.ts");
 
     private const string C = "unsupported shell syntax: comment";
     private const string A = "unsupported shell syntax: arithmetic command";
@@ -24,7 +25,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
     private const string DN = " > /dev/null";
 
     // Transcribed row-for-row from .lean-worker/inbox/qa-review2/conformance.mjs (108 rows).
-    private static readonly (string Label, string Command, bool Ok, string? Reason)[] Rows =
+    private static readonly (string Label, string Command, bool Ok, string? Reason)[] _rows =
     [
         // escapes outside quotes
         ("esc-bs-then-sq", "echo \\\\'#'" + DN, true, null),
@@ -153,10 +154,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
     ];
 
     [Fact]
-    public void Rows_has_108_entries()
-    {
-        Assert.Equal(108, Rows.Length);
-    }
+    public void Rows_has_108_entries() => Assert.Equal(108, _rows.Length);
 
     [Fact]
     public async Task MaskQuoted_conformance_table_matches_expected_outcomeAsync()
@@ -165,7 +163,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
         Dictionary<string, HookResult> results = await RunHarnessAsync(BuildScript());
 
         List<string> failures = [];
-        foreach ((string label, string command, bool ok, string? reason) in Rows)
+        foreach ((string label, string command, bool ok, string? reason) in _rows)
         {
             if (!results.TryGetValue(label, out HookResult? r))
             {
@@ -177,28 +175,32 @@ public sealed class MaskQuotedConformanceTests : IDisposable
                 failures.Add($"{label} ({command.ReplaceLineEndings("\\n")}): expected {(ok ? "allow" : $"deny({reason})")}, got {(r.Ok ? "allow" : r.Message)}");
                 continue;
             }
-            if (!ok && reason != null && (r.Message == null || !r.Message.Contains(reason, StringComparison.Ordinal)))
+            if (!ok && reason is not null && r.Message?.Contains(reason, StringComparison.Ordinal) is not true)
             {
                 failures.Add($"{label} ({command.ReplaceLineEndings("\\n")}): expected deny({reason}), got deny({r.Message})");
             }
         }
-        if (failures.Count > 0) Assert.Fail($"{failures.Count} mismatch(es):\n" + string.Join("\n", failures));
+        if (failures.Count is 0)
+        {
+            return;
+        }
+        Assert.Fail($"{failures.Count} mismatch(es):\n" + string.Join('\n', failures));
     }
 
     private string BuildScript()
     {
         StringBuilder sb = new();
-        sb.AppendLine($"const {{ LeanWorkerWrapUp }} = await import({JsonSerializer.Serialize(new Uri(PluginPath).AbsoluteUri)});");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"const {{ LeanWorkerWrapUp }} = await import({JsonSerializer.Serialize(new Uri(_pluginPath).AbsoluteUri)});");
         sb.AppendLine("delete process.env.LEAN_WORKER_RUN_DIR;");
         sb.AppendLine("delete process.env.LEAN_WORKER_WRAPUP;");
-        sb.AppendLine($"const ctx = await LeanWorkerWrapUp({{ directory: {JsonSerializer.Serialize(_root)}, worktree: {JsonSerializer.Serialize(_root)} }});");
-        foreach ((string label, string command, _, _) in Rows)
+        sb.AppendLine(CultureInfo.InvariantCulture, $"const ctx = await LeanWorkerWrapUp({{ directory: {JsonSerializer.Serialize(_root)}, worktree: {JsonSerializer.Serialize(_root)} }});");
+        foreach ((string label, string command, _, _) in _rows)
         {
             sb.AppendLine("try {");
-            sb.AppendLine($"  await ctx[\"tool.execute.before\"]({{ tool: \"bash\", sessionID: \"s\", callID: \"c\" }}, {{ args: {{ command: {JsonSerializer.Serialize(command)} }} }});");
-            sb.AppendLine($"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: true }}));");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  await ctx[\"tool.execute.before\"]({{ tool: \"bash\", sessionID: \"s\", callID: \"c\" }}, {{ args: {{ command: {JsonSerializer.Serialize(command)} }} }});");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: true }}));");
             sb.AppendLine("} catch (e) {");
-            sb.AppendLine($"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: false, message: e.message }}));");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  console.log(JSON.stringify({{ name: {JsonSerializer.Serialize(label)}, ok: false, message: e.message }}));");
             sb.AppendLine("}");
         }
         return sb.ToString();
@@ -222,7 +224,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
         string stdout = await p.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
         string stderr = await p.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);
         await p.WaitForExitAsync(TestContext.Current.CancellationToken);
-        Assert.True(p.ExitCode == 0, $"node harness exited {p.ExitCode}, stderr:\n{stderr}");
+        Assert.True(p.ExitCode is 0, $"node harness exited {p.ExitCode.ToString(CultureInfo.InvariantCulture)}, stderr:\n{stderr}");
 
         Dictionary<string, HookResult> results = [];
         foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -230,7 +232,7 @@ public sealed class MaskQuotedConformanceTests : IDisposable
             JsonDocument doc = JsonDocument.Parse(line);
             string name = doc.RootElement.GetProperty("name").GetString()!;
             bool ok = doc.RootElement.GetProperty("ok").GetBoolean();
-            string? message = doc.RootElement.TryGetProperty("message", out JsonElement m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
+            string? message = doc.RootElement.TryGetProperty("message", out JsonElement m) && m.ValueKind is JsonValueKind.String ? m.GetString() : null;
             results[name] = new HookResult(ok, message);
         }
         return results;
