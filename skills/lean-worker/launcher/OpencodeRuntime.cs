@@ -82,6 +82,34 @@ internal sealed class OpencodeRuntime : IRuntime
     private static JsonObject Permissions(RunSpec s)
     {
         JsonObject permission = new() { ["*"] = "deny" };
+        AllowTools(s, permission);
+        // Edit/Write both map to opencode's `edit`. Deny `.git/**`, `**/.git/**`, `.git` and `**/.git` so a worker
+        // cannot replace `.git/config` and turn a later `git diff` (diff.external) or `git status` (core.fsmonitor)
+        // into a command runner; the plain `.git` / `**/.git` entries cover a linked worktree, where `.git` is a
+        // file whose contents `gitdir: <dir the worker wrote>` make git read that dir's config. opencode's last
+        // matching rule wins, so the deny entries come after `*`.
+        if (s.Tools.Contains("Edit", StringComparer.OrdinalIgnoreCase) || s.Tools.Contains("Write", StringComparer.OrdinalIgnoreCase))
+        {
+            ApplyEditGuard(permission);
+        }
+        // The bash object is emitted in every permission mode so the deny floor holds everywhere.
+        // opencode uses last matching rule wins; the per-pattern allow entries come first, then the per-pattern
+        // deny entries so they win. An allow entry whose inner pattern ends in `:*` (Claude Code's "or with any
+        // args") is split into two keys, the bare command and "<command> *": opencode's `*` has no word boundary,
+        // so the old `od*` would also match `odX`. Any other allow entry is emitted with `:*` replaced by `*` as
+        // before. Deny entries stay as-is (`rm*`): narrowing them to `rm` / `rm *` would let `rmdir` slip through
+        // in bypass mode. In a non-bypass mode a leading `"*": "deny"` makes every unlisted command denied (an
+        // "ask" is impossible: `opencode run` auto-rejects a prompt and ends the session); in bypass mode the
+        // leading `"*": "allow"` lets the worker run anything except the deny entries.
+        if (s.Tools.Contains("Bash", StringComparer.OrdinalIgnoreCase))
+        {
+            ApplyBashRules(s, permission);
+        }
+        return permission;
+    }
+
+    private static void AllowTools(RunSpec s, JsonObject permission)
+    {
         foreach (string tool in s.Tools)
         {
             if (!_toolKeys.TryGetValue(tool, out string[]? keys))
@@ -94,67 +122,64 @@ internal sealed class OpencodeRuntime : IRuntime
                 permission[k] = "allow";
             }
         }
-        // Edit/Write both map to opencode's `edit`. Deny `.git/**`, `**/.git/**`, `.git` and `**/.git` so a worker
-        // cannot replace `.git/config` and turn a later `git diff` (diff.external) or `git status` (core.fsmonitor)
-        // into a command runner; the plain `.git` / `**/.git` entries cover a linked worktree, where `.git` is a
-        // file whose contents `gitdir: <dir the worker wrote>` make git read that dir's config. opencode's last
-        // matching rule wins, so the deny entries come after `*`.
-        if (s.Tools.Contains("Edit", StringComparer.OrdinalIgnoreCase) || s.Tools.Contains("Write", StringComparer.OrdinalIgnoreCase))
+    }
+
+    private static void ApplyEditGuard(JsonObject permission)
+    {
+        JsonObject edit = new() { ["*"] = "allow" };
+        edit[".git/**"] = "deny";
+        edit["**/.git/**"] = "deny";
+        edit[".git"] = "deny";
+        edit["**/.git"] = "deny";
+        permission["edit"] = edit;
+    }
+
+    private static void ApplyBashRules(RunSpec s, JsonObject permission)
+    {
+        JsonObject bash = new() { ["*"] = s.PermissionMode is "bypassPermissions" ? "allow" : "deny" };
+        if (s.PermissionMode is not "bypassPermissions")
         {
-            JsonObject edit = new() { ["*"] = "allow" };
-            edit[".git/**"] = "deny";
-            edit["**/.git/**"] = "deny";
-            edit[".git"] = "deny";
-            edit["**/.git"] = "deny";
-            permission["edit"] = edit;
+            AllowBashPatterns(s.Allowed, bash);
         }
-        if (s.Tools.Contains("Bash", StringComparer.OrdinalIgnoreCase))
+
+        DenyBashPatterns(s.Denied, bash);
+
+        permission["bash"] = bash;
+    }
+
+    private static void AllowBashPatterns(IEnumerable<string> allowed, JsonObject bash)
+    {
+        foreach (string pattern in allowed)
         {
-            // The bash object is emitted in every permission mode so the deny floor holds everywhere.
-            // opencode uses last matching rule wins; the per-pattern allow entries come first, then the per-pattern
-            // deny entries so they win. An allow entry whose inner pattern ends in `:*` (Claude Code's "or with any
-            // args") is split into two keys, the bare command and "<command> *": opencode's `*` has no word boundary,
-            // so the old `od*` would also match `odX`. Any other allow entry is emitted with `:*` replaced by `*` as
-            // before. Deny entries stay as-is (`rm*`): narrowing them to `rm` / `rm *` would let `rmdir` slip through
-            // in bypass mode. In a non-bypass mode a leading `"*": "deny"` makes every unlisted command denied (an
-            // "ask" is impossible: `opencode run` auto-rejects a prompt and ends the session); in bypass mode the
-            // leading `"*": "allow"` lets the worker run anything except the deny entries.
-            JsonObject bash = new() { ["*"] = s.PermissionMode is "bypassPermissions" ? "allow" : "deny" };
-            if (s.PermissionMode is not "bypassPermissions")
+            if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
             {
-                foreach (string pattern in s.Allowed)
+                string inner = pattern[5..^1];
+                if (inner.EndsWith(":*", StringComparison.Ordinal))
                 {
-                    if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
-                    {
-                        string inner = pattern[5..^1];
-                        if (inner.EndsWith(":*", StringComparison.Ordinal))
-                        {
-                            string bare = inner[..^2];
-                            bash[bare] = "allow";
-                            bash[bare + " *"] = "allow";
-                        }
-                        else
-                        {
-                            bash[inner.Replace(":*", "*", StringComparison.Ordinal)] = "allow";
-                        }
-                    }
+                    string bare = inner[..^2];
+                    bash[bare] = "allow";
+                    bash[bare + " *"] = "allow";
+                }
+                else
+                {
+                    bash[inner.Replace(":*", "*", StringComparison.Ordinal)] = "allow";
                 }
             }
-
-            foreach (string pattern in s.Denied)
-            {
-                if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
-                {
-                    // Remove-then-add so the deny moves after every allow: JsonObject keeps a key's original position on reassignment, so without this an earlier allow of the same glob would win.
-                    string key = pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal);
-                    bash.Remove(key);
-                    bash[key] = "deny";
-                }
-            }
-
-            permission["bash"] = bash;
         }
-        return permission;
+    }
+
+    private static void DenyBashPatterns(IEnumerable<string> denied, JsonObject bash)
+    {
+        foreach (string pattern in denied)
+        {
+            if (pattern.StartsWith("Bash(", StringComparison.Ordinal) && pattern.EndsWith(')'))
+            {
+                // Remove-then-add so the deny moves after every allow: JsonObject keeps a key's original position on reassignment, so without this an earlier allow of the same glob would win.
+                string key = pattern[5..^1].Replace(":*", "*", StringComparison.Ordinal);
+                _ = bash.Remove(key);
+                bash[key] = "deny";
+            }
+        }
     }
 
     // opencode sends x-session-affinity / X-Session-Id on every request, which z.ai routes by: a fresh worker
