@@ -47,7 +47,8 @@
     "MiniMax-M3": {
       "allowedTools": ["Bash(head:*)", "Bash(tail:*)", "Bash(od:*)", "Bash(wc:*)", "Bash(grep:*)", "Bash(jq:*)",
                        "Bash(echo:*)", "Bash(ls:*)", "Bash(pwd)", "Bash(git diff:*)", "Bash(git status:*)",
-                       "Bash(git log:*)", "Bash(git show:*)"],
+                       "Bash(git log:*)", "Bash(git show:*)", "Bash(git -C <repo> diff:*)",
+                       "Bash(git -C <repo> status:*)", "Bash(git -C <repo> log:*)", "Bash(git -C <repo> show:*)"],
       "note": "chains shell commands and has edited files outside its task's scope: give code tasks --write-scope; sed is not pre-approved: read line ranges with Read (offset/limit)"
     }
   }

@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -22,13 +21,13 @@ internal static class WriteScope
     /// </summary>
     public static async Task<Snapshot?> TakeAsync(string cwd, string? exclude = null)
     {
-        string? root = (await GitAsync(cwd, "rev-parse", "--show-toplevel").ConfigureAwait(false))?.Trim();
+        string? root = (await Git.RunAsync(cwd, "rev-parse", "--show-toplevel").ConfigureAwait(false))?.Trim();
         if (string.IsNullOrEmpty(root))
         {
             return null;
         }
 
-        string? status = await GitAsync(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
+        string? status = await Git.RunAsync(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
         if (status is null)
         {
             return null;
@@ -116,31 +115,5 @@ internal static class WriteScope
     {
         string rel = Path.GetRelativePath(root, Path.GetFullPath(path)).Replace('\\', '/');
         return rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel) ? null : rel;
-    }
-
-    private static async Task<string?> GitAsync(string dir, params string[] args)
-    {
-        ProcessStartInfo psi = new("git") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        psi.ArgumentList.Add("-C");
-        psi.ArgumentList.Add(dir);
-        foreach (string a in args)
-        {
-            psi.ArgumentList.Add(a);
-        }
-
-        try
-        {
-            using Process? p = Process.Start(psi);
-            if (p is null)
-            {
-                return null;
-            }
-
-            Task<string> output = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
-            _ = p.StandardError.ReadToEndAsync(CancellationToken.None);
-            if (!p.WaitForExit(60_000)) { try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } return null; }
-            return p.ExitCode is 0 ? await output.ConfigureAwait(false) : null;
-        }
-        catch (System.ComponentModel.Win32Exception) { return null; } // git is not installed
     }
 }

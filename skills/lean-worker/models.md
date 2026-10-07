@@ -9,7 +9,9 @@ Status: **measured** = seen in real runs (source given); **not verified** = no w
 
 **Enforced as data:** a row's commands and note that are also in the price book's `modelTraits`
 (`launcher/prices.json`, keyed by model id without the provider) are applied at launch. The launcher adds the
-commands to a Bash profile's `allowedTools` and prints the note in the result. Add a project's own traits in
+commands to a Bash profile's `allowedTools` and prints the note in the result. `<repo>` in an allowedTools or
+deniedTools entry is replaced by the working tree's root (`git rev-parse --show-toplevel`); an entry with `<repo>`
+is dropped when there is no root or the root has a shell or glob character. Add a project's own traits in
 `.lean-worker/prices.json`. The runtime follows the provider: claude where the provider has an
 Anthropic-compatible endpoint, opencode otherwise, unless the profile or `--runtime` sets one.
 
