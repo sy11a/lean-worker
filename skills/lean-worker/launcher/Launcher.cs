@@ -79,39 +79,20 @@ internal static class Launcher
     /// <summary>
     /// Runs the worker, handing every stdout line to onLine; onLine returns true to stop the worker (hard cap).
     /// </summary>
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Any metering failure must stop the worker (fail closed).")]
     internal static async Task<(int ExitCode, bool TimedOut, bool CapKilled)> RunWorkerAsync(Prepared prep, string stdin,
         string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine)
     {
         ProcessStartInfo psi = StartInfo(prep);
         using Process p = Process.Start(psi) ?? throw new LaunchException($"could not start {prep.Executable}");
+        using CancellationTokenSource cts = new();
         StreamWriter stream = new(streamPath, append: false, Json.Utf8);
         await using ConfiguredAsyncDisposable streamDisposal = stream.ConfigureAwait(false);
         StreamWriter stderr = new(stderrPath, append: false, Json.Utf8);
         await using ConfiguredAsyncDisposable stderrDisposal = stderr.ConfigureAwait(false);
-        TaskCompletionSource outDone = new();
         TaskCompletionSource errDone = new();
-        bool capKilled = false;
-        bool closed = false;
-        object gate = new();
-        p.OutputDataReceived += (_, e) =>
-        {
-            if (e.Data is null) { _ = outDone.TrySetResult(); return; }
-            bool stop;
-            try
-            {
-                stop = TryMeter(gate, ref closed, stream, record, onLine, e.Data);
-            }
-            catch (Exception ex)
-            {
-                // Metering broke: fail closed rather than let the worker spend unmetered.
-                FailClosed(gate, ref closed, stderrPath, ex);
-                stop = true;
-            }
-            if (!stop || capKilled) { return; }
-            capKilled = true;
-            KillQuietly(p);
-        };
+        MeterState state = new();
+        Task pumpTask = PumpStdoutAsync(p.StandardOutput, line => TryMeter(state, stream, record, onLine, line),
+            ex => FailClosed(state, stderrPath, ex), () => StopOnce(state, p), cts.Token);
         p.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is null)
@@ -120,20 +101,95 @@ internal static class Launcher
             }
             else
             {
-                lock (gate) { if (!closed) { stderr.WriteLine(e.Data); } }
+                lock (state.Gate) { if (!state.Closed) { stderr.WriteLine(e.Data); } }
             }
         };
-        p.BeginOutputReadLine();
         p.BeginErrorReadLine();
         await p.StandardInput.WriteAsync(stdin).ConfigureAwait(false);
         p.StandardInput.Close();
         bool timedOut = await WaitForExitAsync(p, timeoutMinutes).ConfigureAwait(false);
-        _ = await Task.WhenAny(Task.WhenAll(outDone.Task, errDone.Task), Task.Delay(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None)).ConfigureAwait(false);
-        lock (gate)
-        {
-            closed = true;
-        }
+        _ = await Task.WhenAny(Task.WhenAll(pumpTask, errDone.Task), Task.Delay(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None)).ConfigureAwait(false);
+        lock (state.Gate) { state.Closed = true; }
+        await cts.CancelAsync().ConfigureAwait(false);
+        await pumpTask.ConfigureAwait(false);
+        bool capKilled;
+        lock (state.Gate) { capKilled = state.CapKilled; }
         return (timedOut ? -1 : p.ExitCode, timedOut, capKilled);
+    }
+
+    private sealed class MeterState
+    {
+        public readonly object Gate = new();
+        public bool Closed;
+        public bool CapKilled;
+    }
+
+    private static void StopOnce(MeterState state, Process p)
+    {
+        lock (state.Gate)
+        {
+            if (!state.CapKilled)
+            {
+                state.CapKilled = true;
+                KillQuietly(p);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the worker's stdout line by line and meters every line via the supplied callback; a true return from
+    /// meter, or a caught launch-failure exception from meter, triggers stop (which sets the cap-killed flag and
+    /// kills the worker) but every subsequent line is still metered until the stream closes or cancellation ends
+    /// the loop normally. An uncaught exception calls stop from the finally and propagates to the caller.
+    /// </summary>
+    private static async Task PumpStdoutAsync(TextReader stdout, Func<string, bool> meter, Action<Exception> failClosed, Action stop, CancellationToken token)
+    {
+        bool completed = false;
+        try
+        {
+            while (true)
+            {
+                string? line;
+                try
+                {
+                    line = await stdout.ReadLineAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    break;
+                }
+                if (line is null)
+                {
+                    break;
+                }
+                bool stopLine = false;
+                try
+                {
+                    if (meter(line))
+                    {
+                        stopLine = true;
+                    }
+                }
+                catch (Exception ex) when (ex is LaunchException or System.Text.Json.JsonException or FormatException or OverflowException
+                                               or IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    failClosed(ex);
+                    stopLine = true;
+                }
+                if (stopLine)
+                {
+                    stop();
+                }
+            }
+            completed = true;
+        }
+        finally
+        {
+            if (!completed)
+            {
+                stop();
+            }
+        }
     }
 
     internal static ProcessStartInfo StartInfo(Prepared prep)
@@ -187,17 +243,17 @@ internal static class Launcher
         return timedOut;
     }
 
-    private static bool TryMeter(object gate, ref bool closed, StreamWriter stream, Func<string, bool> record, Func<string, bool> onLine, string data)
+    private static bool TryMeter(MeterState state, StreamWriter stream, Func<string, bool> record, Func<string, bool> onLine, string data)
     {
-        lock (gate) { if (closed) { return false; } if (record(data)) { stream.WriteLine(data); stream.Flush(); } }
+        lock (state.Gate) { if (state.Closed) { return false; } if (record(data)) { stream.WriteLine(data); stream.Flush(); } }
         return onLine(data);
     }
 
-    private static void FailClosed(object gate, ref bool closed, string stderrPath, Exception ex)
+    private static void FailClosed(MeterState state, string stderrPath, Exception ex)
     {
-        lock (gate)
+        lock (state.Gate)
         {
-            if (!closed)
+            if (!state.Closed)
             {
                 File.AppendAllText(stderrPath + ".launcher", $"metering failed, worker stopped: {ex}{Environment.NewLine}");
             }

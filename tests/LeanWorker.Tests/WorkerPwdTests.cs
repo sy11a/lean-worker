@@ -15,12 +15,12 @@ public class WorkerPwdTests
     {
         string cwd = Directory.GetCurrentDirectory();
         string foreignDir = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
-        Dictionary<string, string?> env = new()
+        Dictionary<string, string?> env = new(StringComparer.Ordinal)
         {
             ["PWD"] = foreignDir,
             ["OLDPWD"] = foreignDir,
         };
-        Prepared prep = new("echo", [], env, "echo", null);
+        Prepared prep = new(Executable: "echo", Args: [], Env: env, CommandText: "echo", ScratchDirectory: null);
 
         System.Diagnostics.ProcessStartInfo psi = Launcher.StartInfo(prep);
 
@@ -43,8 +43,8 @@ public class WorkerPwdTests
             UseShellExecute = false,
         };
         using System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi)!;
-        string output = await p.StandardOutput.ReadToEndAsync();
-        await p.WaitForExitAsync();
+        string output = await p.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
+        await p.WaitForExitAsync(TestContext.Current.CancellationToken);
         return output.Trim();
     }
 
@@ -73,12 +73,15 @@ public class WorkerPwdTests
         return dir;
     }
 
-    private static string Py(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+    private static string Py(string s) =>
+        "\"" + s.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
-    private static bool Python3IsOnPath() =>
-        (Environment.GetEnvironmentVariable("PATH") ?? "")
+    private static bool Python3IsOnPath()
+    {
+        return (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
             .Split(Path.PathSeparator)
             .Any(dir => dir.Length > 0 && File.Exists(Path.Combine(dir, "python3")));
+    }
 
     [Fact]
     public async Task Worker_PWD_is_the_launchers_working_directory_not_an_inherited_oneAsync()
