@@ -30,21 +30,39 @@ internal static class RepoToken
     /// expansion is dropped (first kept).
     /// </summary>
     public static List<string> Expand(IEnumerable<string> entries, string? root)
+        => ExpandCore(entries, root, static _ => null);
+
+    /// <summary>
+    /// Like <see cref="Expand"/>, but for deny lists: when <paramref name="root"/> is not usable, the first entry
+    /// that contains <see cref="Token"/> stops the launch with a <see cref="LaunchException"/> (a dropped or
+    /// broadened deny would lift a guard); entries without the token still pass through.
+    /// </summary>
+    public static List<string> ExpandDenied(IEnumerable<string> entries, string? root)
+        => ExpandCore(entries, root, entry =>
+            throw new LaunchException($"deniedTools entry {entry} needs {Token}, but the working tree has no usable root: {root ?? "none"}"));
+
+    private static List<string> ExpandCore(IEnumerable<string> entries, string? root, Func<string, string?> onUnusableRoot)
     {
         bool usable = IsUsableRoot(root);
         List<string> kept = [];
         HashSet<string> seen = new(StringComparer.Ordinal);
         foreach (string entry in entries)
         {
-            string value;
+            string? value;
             if (entry.Contains(Token, StringComparison.Ordinal))
             {
-                if (!usable)
+                if (usable)
                 {
-                    continue;
+                    value = entry.Replace(Token, root, StringComparison.Ordinal);
                 }
-
-                value = entry.Replace(Token, root, StringComparison.Ordinal);
+                else
+                {
+                    value = onUnusableRoot(entry);
+                    if (value is null)
+                    {
+                        continue;
+                    }
+                }
             }
             else
             {

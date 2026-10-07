@@ -373,7 +373,7 @@ internal sealed class LaunchRun
     {
         string? root = await RepoToken.RootAsync(Directory.GetCurrentDirectory()).ConfigureAwait(false);
         _allowed = RepoToken.Expand(_allowed, root);
-        _denied = RepoToken.Expand(_denied, root);
+        _denied = RepoToken.ExpandDenied(_denied, root);
     }
 
     private void ResolveMode()
