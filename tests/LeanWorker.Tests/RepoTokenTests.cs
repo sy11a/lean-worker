@@ -74,6 +74,79 @@ public class RepoTokenTests
     }
 
     [Fact]
+    public void ExpandDenied_matches_Expand_when_the_root_is_usable()
+    {
+        string[] entries = ["Bash(git -C <repo> push:*)", "Read", "Bash(git -C <repo> push:*)"];
+        Assert.Equal(RepoToken.Expand(entries, "/home/u/r"), RepoToken.ExpandDenied(entries, "/home/u/r"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("relative/path")]
+    [InlineData("/")]
+    [InlineData("/home/u/r/")]
+    public void ExpandDenied_throws_naming_the_entry_when_root_is_not_usable(string? root)
+    {
+        LaunchException ex = Assert.Throws<LaunchException>(() =>
+            RepoToken.ExpandDenied(["Bash(git -C <repo> push:*)", "Read"], root));
+        Assert.Equal(
+            $"deniedTools entry Bash(git -C <repo> push:*) needs <repo>, but the working tree has no usable root: {root ?? "none"}",
+            ex.Message);
+    }
+
+    [Theory]
+    [InlineData("*")]
+    [InlineData("?")]
+    [InlineData("[")]
+    [InlineData("]")]
+    [InlineData("(")]
+    [InlineData(")")]
+    [InlineData("{")]
+    [InlineData("}")]
+    [InlineData("\\")]
+    [InlineData("\"")]
+    [InlineData("'")]
+    [InlineData("$")]
+    [InlineData("`")]
+    [InlineData(" ")]
+    [InlineData("\t")]
+    [InlineData("\n")]
+    [InlineData(":")]
+    [InlineData(",")]
+    [InlineData(";")]
+    [InlineData("|")]
+    [InlineData("&")]
+    [InlineData("<")]
+    [InlineData(">")]
+    [InlineData("\r")]
+    public void ExpandDenied_throws_naming_the_entry_when_the_root_contains_a_forbidden_character(string forbidden)
+    {
+        string root = "/home/u/r" + forbidden + "x";
+        LaunchException ex = Assert.Throws<LaunchException>(() =>
+            RepoToken.ExpandDenied(["Bash(git -C <repo> push:*)", "Read"], root));
+        Assert.Equal(
+            $"deniedTools entry Bash(git -C <repo> push:*) needs <repo>, but the working tree has no usable root: {root}",
+            ex.Message);
+    }
+
+    [Fact]
+    public void ExpandDenied_names_the_first_entry_with_the_token_when_root_is_not_usable()
+    {
+        LaunchException ex = Assert.Throws<LaunchException>(() =>
+            RepoToken.ExpandDenied(["Read", "Bash(git -C <repo> push:*)", "Bash(git -C <repo> pull:*)"], null));
+        Assert.Equal(
+            "deniedTools entry Bash(git -C <repo> push:*) needs <repo>, but the working tree has no usable root: none",
+            ex.Message);
+    }
+
+    [Fact]
+    public void ExpandDenied_passes_entries_without_the_token_through_when_root_is_not_usable()
+    {
+        Assert.Equal(["Read", "Edit"], RepoToken.ExpandDenied(["Read", "Edit"], null));
+    }
+
+    [Fact]
     public async Task RootAsync_returns_the_root_of_a_freshly_initialized_repoAsync()
     {
         string dir = Directory.CreateTempSubdirectory("lw-repotoken").FullName;
@@ -213,5 +286,56 @@ public class RepoTokenTests
             Directory.Delete(repoDir, recursive: true);
             Directory.Delete(stubDir, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task LaunchRun_fails_outside_a_git_tree_when_deniedTools_has_the_tokenAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        JsonObject profiles = new()
+        {
+            ["profiles"] = new JsonObject
+            {
+                ["p1"] = new JsonObject
+                {
+                    ["deniedTools"] = new JsonArray("Bash(git -C <repo> push:*)"),
+                },
+            },
+        };
+        await File.WriteAllTextAsync(Path.Combine(root, "profiles.json"), profiles.ToJsonString(), TestContext.Current.CancellationToken);
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () =>
+            await RunAsyncGolden.RunAsync(root, "exit 0", o => o.Profile = "p1"));
+        Assert.Equal(
+            "deniedTools entry Bash(git -C <repo> push:*) needs <repo>, but the working tree has no usable root: none",
+            ex.Message);
+        Assert.False(Directory.Exists(Path.Combine(root, "runs")));
+    }
+
+    [Fact]
+    public async Task LaunchRun_launches_outside_a_git_tree_when_only_allowedTools_has_the_tokenAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        JsonObject profiles = new()
+        {
+            ["profiles"] = new JsonObject
+            {
+                ["p1"] = new JsonObject
+                {
+                    ["allowedTools"] = new JsonArray("Bash(git -C <repo> diff:*)"),
+                },
+            },
+        };
+        await File.WriteAllTextAsync(Path.Combine(root, "profiles.json"), profiles.ToJsonString(), TestContext.Current.CancellationToken);
+
+        const string successStream = """
+            printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"DONE","session_id":"s1","total_cost_usd":0.01,"num_turns":1,"permission_denials":[]}'
+            """;
+        (_, string stdout) = await RunAsyncGolden.RunAsync(root, successStream, o => o.Profile = "p1");
+        string runDir = RunAsyncGolden.RunDirFrom(stdout);
+        string command = await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain("-C", command, StringComparison.Ordinal);
+        Assert.DoesNotContain(RepoToken.Token, command, StringComparison.Ordinal);
     }
 }
