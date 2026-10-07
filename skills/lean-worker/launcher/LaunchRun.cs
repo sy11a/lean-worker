@@ -102,6 +102,7 @@ internal sealed class LaunchRun
         await ValidateInputsAsync().ConfigureAwait(false);
         PickModel();
         ApplyModelTraits();
+        await ResolveRepoTokenAsync().ConfigureAwait(false);
         ResolveMode();
         await PrepareTaskAsync().ConfigureAwait(false);
         await WriteSystemAsync().ConfigureAwait(false);
@@ -366,6 +367,13 @@ internal sealed class LaunchRun
         }
 
         _notes.Add(priceNote);
+    }
+
+    private async Task ResolveRepoTokenAsync()
+    {
+        string? root = await RepoToken.RootAsync(Directory.GetCurrentDirectory()).ConfigureAwait(false);
+        _allowed = RepoToken.Expand(_allowed, root);
+        _denied = RepoToken.Expand(_denied, root);
     }
 
     private void ResolveMode()
