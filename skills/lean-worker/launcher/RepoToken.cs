@@ -38,8 +38,10 @@ internal static class RepoToken
     /// broadened deny would lift a guard); entries without the token still pass through.
     /// </summary>
     public static List<string> ExpandDenied(IEnumerable<string> entries, string? root)
-        => ExpandCore(entries, root, entry =>
+    {
+        return ExpandCore(entries, root, entry =>
             throw new LaunchException($"deniedTools entry {entry} needs {Token}, but the working tree has no usable root: {root ?? "none"}"));
+    }
 
     private static List<string> ExpandCore(IEnumerable<string> entries, string? root, Func<string, string?> onUnusableRoot)
     {

@@ -7,22 +7,16 @@ namespace LeanWorker.Tests;
 public class RepoTokenTests
 {
     [Fact]
-    public void Expand_passes_entries_without_the_token_through_unchanged()
-    {
+    public void Expand_passes_entries_without_the_token_through_unchanged() =>
         Assert.Equal(["Bash(git diff:*)", "Read"], RepoToken.Expand(["Bash(git diff:*)", "Read"], "/home/u/r"));
-    }
 
     [Fact]
-    public void Expand_replaces_one_occurrence_of_the_token()
-    {
+    public void Expand_replaces_one_occurrence_of_the_token() =>
         Assert.Equal(["Bash(git -C /home/u/r diff:*)"], RepoToken.Expand(["Bash(git -C <repo> diff:*)"], "/home/u/r"));
-    }
 
     [Fact]
-    public void Expand_replaces_two_occurrences_of_the_token_in_one_entry()
-    {
+    public void Expand_replaces_two_occurrences_of_the_token_in_one_entry() =>
         Assert.Equal(["Read(/home/u/r) Read(/home/u/r)"], RepoToken.Expand(["Read(<repo>) Read(<repo>)"], "/home/u/r"));
-    }
 
     [Theory]
     [InlineData(null)]
@@ -30,10 +24,8 @@ public class RepoTokenTests
     [InlineData("relative/path")]
     [InlineData("/")]
     [InlineData("/home/u/r/")]
-    public void Expand_drops_token_entries_but_keeps_others_when_root_is_not_usable(string? root)
-    {
+    public void Expand_drops_token_entries_but_keeps_others_when_root_is_not_usable(string? root) =>
         Assert.Equal(["Read"], RepoToken.Expand(["Bash(git -C <repo> diff:*)", "Read"], root));
-    }
 
     [Theory]
     [InlineData("*")]
@@ -134,17 +126,15 @@ public class RepoTokenTests
     public void ExpandDenied_names_the_first_entry_with_the_token_when_root_is_not_usable()
     {
         LaunchException ex = Assert.Throws<LaunchException>(() =>
-            RepoToken.ExpandDenied(["Read", "Bash(git -C <repo> push:*)", "Bash(git -C <repo> pull:*)"], null));
+            RepoToken.ExpandDenied(["Read", "Bash(git -C <repo> push:*)", "Bash(git -C <repo> pull:*)"], root: null));
         Assert.Equal(
             "deniedTools entry Bash(git -C <repo> push:*) needs <repo>, but the working tree has no usable root: none",
             ex.Message);
     }
 
     [Fact]
-    public void ExpandDenied_passes_entries_without_the_token_through_when_root_is_not_usable()
-    {
-        Assert.Equal(["Read", "Edit"], RepoToken.ExpandDenied(["Read", "Edit"], null));
-    }
+    public void ExpandDenied_passes_entries_without_the_token_through_when_root_is_not_usable() =>
+        Assert.Equal(["Read", "Edit"], RepoToken.ExpandDenied(["Read", "Edit"], root: null));
 
     [Fact]
     public async Task RootAsync_returns_the_root_of_a_freshly_initialized_repoAsync()
@@ -222,9 +212,6 @@ public class RepoTokenTests
     {
         string repoDir = Directory.CreateTempSubdirectory("lw-repotoken-wiring").FullName;
         string stubDir = Directory.CreateTempSubdirectory("lw-repotoken-stub").FullName;
-        string? oldPath = Environment.GetEnvironmentVariable("PATH");
-        string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
-        string oldCwd = Directory.GetCurrentDirectory();
         try
         {
             RunGit(repoDir, "init", "-q");
@@ -232,6 +219,26 @@ public class RepoTokenTests
             string? expectedRoot = await RepoToken.RootAsync(sub);
             Assert.NotNull(expectedRoot);
 
+            string command = await RunLaunchWithRepoTokenAsync(sub, stubDir);
+
+            Assert.Contains(Runtimes.Quote($"Bash(git -C {expectedRoot} diff:*)"), command, StringComparison.Ordinal);
+            Assert.Contains(Runtimes.Quote($"Bash(git -C {expectedRoot} push:*)"), command, StringComparison.Ordinal);
+            Assert.DoesNotContain(RepoToken.Token, command, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(repoDir, recursive: true);
+            Directory.Delete(stubDir, recursive: true);
+        }
+    }
+
+    private static async Task<string> RunLaunchWithRepoTokenAsync(string workingDirectory, string stubDir)
+    {
+        string? oldPath = Environment.GetEnvironmentVariable("PATH");
+        string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+        string oldCwd = Directory.GetCurrentDirectory();
+        try
+        {
             string root = RunAsyncGolden.NewRoot();
             JsonObject profiles = new()
             {
@@ -247,7 +254,7 @@ public class RepoTokenTests
             await File.WriteAllTextAsync(Path.Combine(root, "profiles.json"), profiles.ToJsonString(), TestContext.Current.CancellationToken);
 
             string stubPath = Path.Combine(stubDir, "claude");
-            File.WriteAllText(stubPath, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+            await File.WriteAllTextAsync(stubPath, "#!/bin/sh\ncat >/dev/null\nexit 0\n", TestContext.Current.CancellationToken);
             if (!OperatingSystem.IsWindows())
             {
                 File.SetUnixFileMode(stubPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -255,7 +262,7 @@ public class RepoTokenTests
 
             Environment.SetEnvironmentVariable("PATH", stubDir + Path.PathSeparator + oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "dummy-test-key");
-            Directory.SetCurrentDirectory(sub);
+            Directory.SetCurrentDirectory(workingDirectory);
             await using StringWriter outWriter = new();
             TextWriter oldOut = Console.Out;
             Console.SetOut(outWriter);
@@ -263,7 +270,7 @@ public class RepoTokenTests
             try
             {
                 Options o = new() { TaskFile = Path.Combine(root, "task.md"), RunsRoot = root, Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "repo-token-wiring", Profile = "p1" };
-                await Launcher.RunAsync(o);
+                _ = await Launcher.RunAsync(o);
                 stdout = outWriter.ToString();
             }
             finally
@@ -272,19 +279,13 @@ public class RepoTokenTests
             }
 
             string runDir = RunAsyncGolden.RunDirFrom(stdout);
-            string command = await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken);
-
-            Assert.Contains(Runtimes.Quote($"Bash(git -C {expectedRoot} diff:*)"), command, StringComparison.Ordinal);
-            Assert.Contains(Runtimes.Quote($"Bash(git -C {expectedRoot} push:*)"), command, StringComparison.Ordinal);
-            Assert.DoesNotContain(RepoToken.Token, command, StringComparison.Ordinal);
+            return await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken);
         }
         finally
         {
             Directory.SetCurrentDirectory(oldCwd);
             Environment.SetEnvironmentVariable("PATH", oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", oldKey);
-            Directory.Delete(repoDir, recursive: true);
-            Directory.Delete(stubDir, recursive: true);
         }
     }
 
