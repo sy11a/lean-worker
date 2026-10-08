@@ -28,6 +28,12 @@ Never commit to `master` directly and never force-push it.
 
 ## Verify
 
+- The build references the `Sy11a.Analyzers` policy package (`Directory.Build.props`, pinned), restored by
+  `nuget.config` from the private GitHub Packages feed `https://nuget.pkg.github.com/sy11a/index.json`. Restoring
+  it needs a classic personal access token with `read:packages`, stored as credentials for the source key `github`
+  in the user NuGet config (not in the repository), e.g.
+  `NuGetPackageSourceCredentials_github="Username=<you>;Password=<token>"`. A policy finding fails the build: fix
+  it, never suppress it. Installed copies (`install.sh` copies `skills/lean-worker/` alone) build without it.
 - Unit tests: `dotnet test --project tests/LeanWorker.Tests -v q` (Microsoft Testing Platform, opted in by `global.json`).
 - Acceptance (real workers, cents of list price): `tests/acceptance.sh`. It needs GLM; while GLM is not in
   use, run `LW_OPENCODE_MODEL=minimax-coding-plan/MiniMax-M3 tests/acceptance.sh --claude-only`.
