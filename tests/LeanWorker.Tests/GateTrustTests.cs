@@ -712,6 +712,30 @@ public sealed class GateTrustTests : IDisposable
 
     [Fact]
     [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_symlink_to_dot_dot_x_under_a_symlinked_parent_records_the_realpath_as_its_final_targetAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string realB = Path.Combine(dir, "real", "b");
+        _ = Directory.CreateDirectory(realB);
+        await File.WriteAllTextAsync(Path.Combine(dir, "real", "x"), "the real target", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(dir, "x"), "a lexical decoy of another length", TestContext.Current.CancellationToken);
+        string viaLink = Path.Combine(dir, "a");
+        _ = Directory.CreateSymbolicLink(viaLink, realB);
+        _ = File.CreateSymbolicLink(Path.Combine(realB, "lw-link"), "../x");
+
+        GateTrust.PathNamesSnapshot snapshot = GateTrust.SnapshotPathNames([viaLink]);
+
+        GateTrust.PathEntry entry = snapshot.Directories[viaLink].Entries["lw-link"];
+        string? realpath = await OsRealpathAsync(Path.Combine(viaLink, "lw-link"));
+        Assert.Equal(realpath, entry.FinalTarget);
+        Assert.Equal(Path.Combine(dir, "real", "x"), entry.FinalTarget);
+        Assert.Equal("the real target".Length, entry.FinalTargetLength);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
     public async Task Canonical_restarts_from_the_root_for_a_rooted_absolute_link_targetAsync()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
