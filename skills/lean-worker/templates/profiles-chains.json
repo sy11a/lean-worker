@@ -6,7 +6,7 @@
       "model": [
         "minimax-coding-plan/MiniMax-M2.7",
         "zai-coding-plan/glm-5.3-flash",
-        "claude-haiku-4-5"
+        "haiku"
       ],
       "effort": "low",
       "tools": [
@@ -21,7 +21,7 @@
       "model": [
         "minimax-coding-plan/MiniMax-M3",
         "zai-coding-plan/glm-5.3",
-        "claude-sonnet-5"
+        "sonnet"
       ],
       "effort": "low",
       "tools": [
@@ -37,7 +37,7 @@
       "model": [
         "minimax-coding-plan/MiniMax-M3",
         "zai-coding-plan/glm-5.3",
-        "claude-sonnet-5"
+        "sonnet"
       ],
       "effort": "medium",
       "wrapUpAt": 0.9,
@@ -61,7 +61,7 @@
       "maxBudgetUsd": 2
     },
     "research": {
-      "model": "claude-sonnet-5",
+      "model": "sonnet",
       "effort": "medium",
       "tools": [
         "Read",
@@ -78,7 +78,7 @@
       "model": [
         "zai-coding-plan/glm-5.3",
         "minimax-coding-plan/MiniMax-M3",
-        "claude-opus-5-5"
+        "opus"
       ],
       "effort": "medium",
       "tools": [
