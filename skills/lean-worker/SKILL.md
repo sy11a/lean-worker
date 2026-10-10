@@ -205,6 +205,47 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   (`changed_files`, `out_of_scope`), and a `WARNING` names the files outside the scope. The status does not
   change: check those files (revert or accept them) before you accept the run. A continuation keeps the scope.
 
+## Gate (optional): the run ends when a check passes
+
+A profile can name a gate: a command the launcher runs after the worker ends with `success`. While the gate reports
+findings, the launcher starts a fresh worker with the original task plus a `## Gate report (lean-worker)` section (the
+gate's output and its report path), up to the profile's caps. The gate is not run when the worker did not succeed.
+The result block gets one `gate:` line:
+
+```
+gate:     clean after 2 round(s), findings 7→0
+gate:     STUCK after 3 round(s), findings 3→3→3 (no decrease in 2 rounds)
+gate:     ERROR: the worker changed files the gate trusts: /repo/global.json
+```
+
+Exit codes with a gate, and what to do on each:
+
+- **0**: the gate is clean. Verify the done-criterion as usual and report.
+- **1** or **3**: the worker failed or wrapped up; the gate did not run. Handle it as in section 5.
+- **4** (`gate-stuck`): the finding count did not decrease in two consecutive rounds, or `maxRounds` or `maxTotalUsd`
+  was reached. Read the last run's `report.md` and the gate report it names. Then sharpen or split the task, or take
+  it to the user. Do not raise the caps to push it through.
+- **5** (`gate-error`): the gate failed (exit 2, timeout, no readable report) or the trust check fired. The `gate:`
+  line names the cause; `gate.json` and `gate.log` in the run directory have the details. A trust violation means the
+  worker (or something running while it ran) changed a file the gate relies on. Look at that change with the user
+  before running again.
+- **2**: the launcher refused before the worker ran. That covers an invalid `gate` key and an unresolvable gate
+  executable. It also covers a gate PATH with no absolute entry, or with a directory or link inside the working tree.
+  Fix the profile or the environment the message names.
+
+What the gate may trust is fixed in round 1 for the whole chain. That covers:
+
+- the resolved gate executable and its PATH (absolute directories only);
+- every argv file;
+- `gate.trust` entries;
+- the runs root's own files and the prices file;
+- `global.json`, `nuget.config` and the dotnet tool manifests from the working directory up to the git root.
+
+These are checked again before and after each gate run. The gate gets a minimal environment: PATH, HOME, locale,
+`DOTNET_*`, `NUGET_*`, `NuGetPackageSourceCredentials_*`, `MSBUILD*`, plus `gate.env`. API keys and tokens never reach
+it. Install the tools a gate uses before launching: a change to a gate PATH directory during the chain ends the run
+with exit 5. The profile keys are in `templates/profiles.json`.
+
 ## Review run (optional)
 
 Run the `review` profile with the task "try to refute that the change meets <done-criterion>;
@@ -217,8 +258,8 @@ other commands (same `dotnet run --project "<skill-dir>/launcher" -c Release --`
 
 - `quota`: the usage windows of every subscription with a quota adapter (z.ai GLM Coding Plan, MiniMax Token Plan).
 - `cost --claude <session-id>` or `cost --opencode <session-id>`: a manual session priced with the book.
-- `stats [--since <date>] [--json]`: per profile and model, success rate (the worker's own status), wrap-ups, escalations, cost per
-  success and quota used.
+- `stats [--since <date>] [--json]`: per profile and model, success rate (the worker's own status, or the gate's
+  clean decision when a gate ran), wrap-ups, escalations, cost per success and quota used.
 - `prices`: the merged price book, with each entry's date.
 
 ## Records

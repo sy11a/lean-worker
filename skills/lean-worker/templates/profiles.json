@@ -44,7 +44,28 @@
         "Bash(cat:*)",
         "Bash(pwd)"
       ],
-      "maxBudgetUsd": 3
+      "maxBudgetUsd": 3,
+      "_gate_comment": "Optional. Rename \"_gate\" to \"gate\" to run a check after every successful run and re-run the worker with its report until it passes (SKILL.md, \"Gate\"). command is argv; reportFromLastLine finds the report path on the last stdout line; countPath points at the findings array. outputs: files the gate writes (excluded only from the after-gate check). trust: extra repo-relative paths or globs whose change by the worker is a violation. env: extra variable names or PREFIX* patterns passed to the gate (the default set is PATH, HOME, locale, DOTNET_*, NUGET_*, NuGetPackageSourceCredentials_*, MSBUILD*). Caps: maxRounds, maxTotalUsd (default 3 x maxBudgetUsd), timeoutMinutes.",
+      "_gate": {
+        "command": [
+          "{gate executable}",
+          "{gate argument}"
+        ],
+        "reportFromLastLine": "^sarif: (?<report>.+)$",
+        "countPath": "runs[0].results",
+        "outputs": [
+          "artifacts/gate/report.sarif"
+        ],
+        "trust": [
+          "Directory.Build.props",
+          "**/.editorconfig"
+        ],
+        "env": [
+          "GATE_*"
+        ],
+        "maxRounds": 5,
+        "timeoutMinutes": 30
+      }
     },
     "research": {
       "model": "sonnet",
