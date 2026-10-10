@@ -694,9 +694,15 @@ internal sealed class LaunchRun
             // Round N+1: compare against round 1's before-worker snapshot and reuse its fixed path
             // list, so whatever a tampering process left on disk when this round started cannot
             // become the new baseline. Only the walks meant to catch new files (runs root, config
-            // walk) are re-collected, inside RunGateAsync's checks.
+            // walk) are re-collected, inside RunGateAsync's checks. Round 1's gate.trust warnings
+            // ride along on the frozen spec: gate.json records them, the result block notes them.
             TrustSnapshot = GateContext.TrustSnapshot;
             TrustPaths = GateContext.TrustPaths;
+            if (_gate?.Warnings is { Count: > 0 } frozen)
+            {
+                _notes.AddRange(frozen);
+            }
+
             return;
         }
 
@@ -713,7 +719,8 @@ internal sealed class LaunchRun
     /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
     /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
     /// once, before round 1's worker, so glob matches and argv entries never pick up files the
-    /// worker or the gate create later.
+    /// worker or the gate create later. A gate.trust glob that matched no file becomes a warning on
+    /// the gate spec (recorded in gate.json) and a note in the result block.
     /// </summary>
     private async Task<List<string>> CollectFixedPathsAsync()
     {
@@ -721,7 +728,16 @@ internal sealed class LaunchRun
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
-        return GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile);
+        List<string> warnings = [];
+        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings);
+        if (warnings.Count > 0)
+        {
+            _gate = gate with { Warnings = warnings };
+            InitialGateSpec = _gate;
+            _notes.AddRange(warnings);
+        }
+
+        return paths;
     }
 
     /// <summary>
@@ -905,7 +921,7 @@ internal sealed class LaunchRun
         GateTrust.Snapshot before = NonNull(TrustSnapshot);
         List<string> paths = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
 
-        List<string> setDiff = GateTrust.SetDifferences(before, paths);
+        List<string> setDiff = GateTrust.SetDifferences(before, paths, exclusions);
         if (setDiff.Count > 0)
         {
             return $"{changedPrefix}{string.Join(", ", setDiff)}";

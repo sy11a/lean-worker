@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Warnings = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can

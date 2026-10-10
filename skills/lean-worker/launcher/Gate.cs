@@ -877,6 +877,11 @@ internal static class Gate
             ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
             ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
         };
+        if (spec.Warnings is { Count: > 0 })
+        {
+            o["warnings"] = new JsonArray([.. spec.Warnings.Select(w => (JsonNode)w)]);
+        }
+
         await Launcher.WritePlainAsync(path, o.ToJsonString(Json.Indented)).ConfigureAwait(false);
     }
 

@@ -36,6 +36,7 @@
 // Block devices may still look regular and seekable on this runtime; a normal user cannot open them
 // (the open fails → unreadable → trust violation), and the size cap bounds a read. No P/Invoke.
 
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
@@ -329,16 +330,19 @@ internal static class GateTrust
 
     /// <summary>
     /// Paths that are in one of the two sets but not the other, in ordinal order: a file that appeared
-    /// in, or vanished from, the trusted set since <paramref name="before"/> was taken. Comparing the
-    /// path sets needs no hashing (the walk only names paths), so callers run it before
+    /// in, or vanished from, the trusted set since <paramref name="before"/> was taken.
+    /// <paramref name="exclusions"/> (the report paths the gate named) is applied to both sides:
+    /// excluded paths are dropped from <paramref name="paths"/> and from the snapshot's keys before
+    /// comparing, so a gate that rewrites its own report file is not reported as having removed it.
+    /// Comparing the path sets needs no hashing (the walk only names paths), so callers run it before
     /// <see cref="FirstDiffAsync"/> and report new or missing files without paying a per-file timeout
     /// for entries that never have to be hashed.
     /// </summary>
-    public static List<string> SetDifferences(Snapshot before, IReadOnlyList<string> paths)
+    public static List<string> SetDifferences(Snapshot before, IReadOnlyList<string> paths, IReadOnlySet<string>? exclusions = null)
     {
         HashSet<string> now = new(paths, StringComparer.Ordinal);
-        IEnumerable<string> added = paths.Where(p => !before.Hashes.ContainsKey(p));
-        IEnumerable<string> removed = before.Hashes.Keys.Where(p => !now.Contains(p));
+        IEnumerable<string> added = paths.Where(p => exclusions?.Contains(p) is not true && !before.Hashes.ContainsKey(p));
+        IEnumerable<string> removed = before.Hashes.Keys.Where(p => exclusions?.Contains(p) is not true && !now.Contains(p));
         return [.. added.Concat(removed).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
     }
 
@@ -414,14 +418,16 @@ internal static class GateTrust
     /// every remaining argv entry that is an existing file path under <paramref name="gitRoot"/>
     /// (resolved against <paramref name="gateWorkingDirectory"/>), any <paramref name="extraTrust"/>
     /// paths or globs the operator pinned (literal entries included even when absent, glob matches
-    /// limited to files that exist before the worker runs), and the price book file at
+    /// limited to files that exist before the worker runs; a glob that matches no file adds
+    /// <c>gate.trust[&lt;i&gt;] '&lt;glob&gt;' matched no files</c> to <paramref name="warnings"/>
+    /// when that list is given), and the price book file at
     /// <paramref name="extraPricesFile"/> whenever one is given (even under
     /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl).
     /// </summary>
     public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
-        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null)
     {
-        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile);
+        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings);
         HashSet<string> dedupe = new(paths, StringComparer.Ordinal);
         foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot))
         {
@@ -439,10 +445,12 @@ internal static class GateTrust
     /// the existing argv file entries, and the <c>gate.trust</c> entries (literal paths and glob
     /// matches). The launcher resolves this list once, before round 1's worker runs, and reuses it
     /// for every later hash, so glob matches and argv entries never pick up files the worker or the
-    /// gate created later. The glob walk skips <c>.git</c> and the runs root.
+    /// gate created later. The glob walk skips the git root's top-level <c>.git</c> directory and
+    /// the runs root; a glob that matches no file adds a warning to <paramref name="warnings"/>
+    /// when that list is given.
     /// </summary>
     public static List<string> CollectChainPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
-        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -458,7 +466,7 @@ internal static class GateTrust
 
         AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => Add(p));
         AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => Add(p));
-        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => Add(p));
+        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => Add(p), warnings);
         AddPricesFile(extraPricesFile, p => Add(p));
         return paths;
     }
@@ -490,24 +498,29 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Options for every recursive walk the trust set builds: recurse, skip directories the walk
-    /// cannot read (a missing entry drops out of the walk and the path-set comparison reports it,
-    /// so this fails closed), and never follow reparse points (a symlinked directory must not pull
-    /// a tree outside the walked root into the trust set). Recursion is done by
-    /// <see cref="WalkFiles"/> so subtrees can also be skipped by name.
+    /// Options for the per-directory listing the trust set builds: no recursion (<see cref="WalkFiles"/>
+    /// recurses by hand so subtrees can be skipped by name or because they are symlinks), skip
+    /// directories the walk cannot read (a missing entry drops out of the walk and the path-set
+    /// comparison reports it, so this fails closed), and skip no attributes: a symlinked file stays
+    /// in the walk (it is hashed through <see cref="ResolveFinal"/>, which records the final target
+    /// in the value), while a symlinked directory is never descended into (<see cref="WalkFiles"/>
+    /// checks <see cref="FileSystemInfo.LinkTarget"/>, so a link cannot pull a tree outside the
+    /// walked root into the trust set).
     /// </summary>
     private static readonly EnumerationOptions _walkOptions = new()
     {
         RecurseSubdirectories = false,
         IgnoreInaccessible = true,
-        AttributesToSkip = FileAttributes.ReparsePoint,
+        AttributesToSkip = FileAttributes.None,
     };
 
     /// <summary>
     /// Enumerates every file under <paramref name="root"/> without throwing: unreadable directories
     /// are skipped (<see cref="EnumerationOptions.IgnoreInaccessible"/>), a directory that vanishes
-    /// mid-walk ends just that directory's listing, symlinked directories and files are skipped
-    /// (never followed), and <paramref name="skipDirectory"/> prunes subtrees by name.
+    /// mid-walk ends just that directory's listing, a symlinked directory is never descended into
+    /// (its <see cref="FileSystemInfo.LinkTarget"/> names the outside tree it would pull in),
+    /// symlinked files are enumerated (they are hashed through <see cref="ResolveFinal"/>), and
+    /// <paramref name="skipDirectory"/> prunes subtrees by name.
     /// </summary>
     private static IEnumerable<string> WalkFiles(string root, Func<string, bool>? skipDirectory)
     {
@@ -545,6 +558,14 @@ internal static class GateTrust
 
             foreach (string sub in subDirs)
             {
+                // A symlinked directory is never followed (it would pull a tree outside the walked
+                // root into the trust set); symlinked files are yielded above and hashed through
+                // ResolveFinal.
+                if (new DirectoryInfo(sub).LinkTarget is not null)
+                {
+                    continue;
+                }
+
                 if (skipDirectory?.Invoke(sub) is not true)
                 {
                     pending.Push(sub);
@@ -723,9 +744,11 @@ internal static class GateTrust
     /// Resolves the operator's <c>gate.trust</c> entries against the git root (or the gate working
     /// directory when there is no git root) and adds them to the trust set. Literal entries (no glob
     /// characters) are added as-is, even when the file does not exist; glob matches are limited to
-    /// files that exist before the worker runs (WriteScope.InScope-style matching).
+    /// files that exist before the worker runs (WriteScope.InScope-style matching). A glob entry
+    /// that matches no file adds <c>gate.trust[&lt;i&gt;] '&lt;glob&gt;' matched no files</c> to
+    /// <paramref name="warnings"/> when that list is given.
     /// </summary>
-    private static void AddExtraTrust(IReadOnlyList<string>? entries, string gitRoot, string gateWorkingDirectory, string runsRoot, Action<string> add)
+    private static void AddExtraTrust(IReadOnlyList<string>? entries, string gitRoot, string gateWorkingDirectory, string runsRoot, Action<string> add, List<string>? warnings = null)
     {
         if (entries is null || entries.Count is 0)
         {
@@ -737,55 +760,79 @@ internal static class GateTrust
         string anchor = Directory.Exists(gitRoot) ? gitRoot : gateWorkingDirectory;
         string skipRunsRoot = Path.GetFullPath(runsRoot);
 
-        foreach (string entry in entries)
+        for (int i = 0; i < entries.Count; i++)
         {
-            bool hasGlob = entry.IndexOfAny(['*', '?']) >= 0;
-            if (!hasGlob)
+            if (entries[i].IndexOfAny(['*', '?']) >= 0)
             {
-                string full;
-                try
-                {
-                    full = Path.GetFullPath(Path.Combine(anchor, entry));
-                }
-                catch (ArgumentException)
-                {
-                    continue;
-                }
-
-                add(full);
-                continue;
+                AddGlobEntry(entries[i], i, anchor, skipRunsRoot, add, warnings ?? []);
             }
-
-            // Glob: enumerate every file under <anchor> and add the ones the glob matches that exist
-            // before the worker runs (Absence here is not a violation on its own; the trust check
-            // also catches "present and later gone"). The walk skips .git and the launcher's own
-            // runs root: both are walked for names only, and a glob such as **/*.json would
-            // otherwise match files the launcher or git itself created (for example this run's
-            // gate.json) and trip every run.
-            Regex matcher;
-            try
+            else
             {
-                matcher = WriteScope.BuildGlobRegex(entry);
-            }
-            catch (ArgumentException)
-            {
-                continue;
-            }
-
-            if (!Directory.Exists(anchor))
-            {
-                continue;
-            }
-
-            foreach (string file in WalkFiles(anchor, dir => Path.GetFileName(dir) is ".git" || IsAtOrUnder(dir, skipRunsRoot)))
-            {
-                string rel = Path.GetRelativePath(anchor, file).Replace('\\', '/');
-                if (matcher.IsMatch(rel))
-                {
-                    add(file);
-                }
+                AddLiteralEntry(entries[i], anchor, add);
             }
         }
+    }
+
+    private static void AddLiteralEntry(string entry, string anchor, Action<string> add)
+    {
+        string full;
+        try
+        {
+            full = Path.GetFullPath(Path.Combine(anchor, entry));
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        add(full);
+    }
+
+    // Glob: enumerate every file under <anchor> and add the ones the glob matches that exist before
+    // the worker runs (Absence here is not a violation on its own; the trust check also catches
+    // "present and later gone"). A glob entry that ends up matching nothing is not an error, but the
+    // operator should hear about it: a warning is recorded and noted in the result block.
+    private static void AddGlobEntry(string entry, int index, string anchor, string skipRunsRoot, Action<string> add, List<string> warnings)
+    {
+        Regex matcher;
+        try
+        {
+            matcher = WriteScope.BuildGlobRegex(entry);
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        if (!Directory.Exists(anchor))
+        {
+            return;
+        }
+
+        List<string> matches = [.. WalkFiles(anchor, dir => SkipWalkedDirectory(dir, anchor, skipRunsRoot))
+            .Where(file => matcher.IsMatch(Path.GetRelativePath(anchor, file).Replace('\\', '/'))),];
+
+        foreach (string file in matches)
+        {
+            add(file);
+        }
+
+        warnings.AddRange(matches.Count is 0 ? [$"gate.trust[{index.ToString(CultureInfo.InvariantCulture)}] '{entry}' matched no files"] : []);
+    }
+
+    /// <summary>
+    /// Whether a walked subdirectory is pruned from the glob walk: the launcher's runs root (its own
+    /// bookkeeping, including this run's gate.json, must never match a trust glob), and the git
+    /// root's own top-level <c>.git</c> — the metadata store is walked for names only and a glob
+    /// such as **/*.json would otherwise match files git itself created and trip every run. A
+    /// directory named <c>.git</c> deeper in the tree is an ordinary directory and stays in the walk.
+    /// </summary>
+    private static bool SkipWalkedDirectory(string dir, string anchor, string skipRunsRoot)
+    {
+        return (Path.GetFileName(dir) is ".git"
+            && Path.GetDirectoryName(dir) is { } parent
+            && string.Equals(Path.TrimEndingDirectorySeparator(parent), Path.TrimEndingDirectorySeparator(anchor), StringComparison.Ordinal))
+            || IsAtOrUnder(dir, skipRunsRoot);
     }
 
     private static void AddPricesFile(string? pricesFile, Action<string> add)
