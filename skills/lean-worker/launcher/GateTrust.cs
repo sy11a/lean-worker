@@ -351,8 +351,8 @@ internal static class GateTrust
     /// file path under <paramref name="gitRoot"/> (resolved against <paramref name="gateWorkingDirectory"/>),
     /// any <paramref name="extraTrust"/> paths or globs the operator pinned (literal entries
     /// included even when absent, glob matches limited to files that exist before the worker runs),
-    /// and the price book file at <paramref name="extraPricesFile"/> when it lies outside
-    /// <paramref name="runsRoot"/>.
+    /// and the price book file at <paramref name="extraPricesFile"/> whenever one is given (even
+    /// under <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl).
     /// </summary>
     public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
         IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
@@ -374,7 +374,7 @@ internal static class GateTrust
         AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => Add(p));
         AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => Add(p));
         AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, p => Add(p));
-        AddPricesFile(extraPricesFile, runsRoot, p => Add(p));
+        AddPricesFile(extraPricesFile, p => Add(p));
         return paths;
     }
 
@@ -617,7 +617,7 @@ internal static class GateTrust
         }
     }
 
-    private static void AddPricesFile(string? pricesFile, string runsRoot, Action<string> add)
+    private static void AddPricesFile(string? pricesFile, Action<string> add)
     {
         if (string.IsNullOrEmpty(pricesFile))
         {
@@ -634,24 +634,9 @@ internal static class GateTrust
             return;
         }
 
-        // An explicit --prices / profile "prices" path inside the runs root is already covered by
-        // AddRunsRootFiles; only add it here when it lives somewhere the recursive walk misses.
-        string runsRootFull;
-        try
-        {
-            runsRootFull = Path.GetFullPath(runsRoot);
-        }
-        catch (ArgumentException)
-        {
-            return;
-        }
-
-        if (full.StartsWith(runsRootFull + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            || string.Equals(full, runsRootFull, StringComparison.Ordinal))
-        {
-            return;
-        }
-
+        // Always add the explicit --prices / profile "prices" path, even when it lies under the runs
+        // root: the recursive walk there skips runs/, inbox/, system/ and runs.jsonl, so a prices
+        // file in one of those places would otherwise never be hashed. CollectPaths dedupes.
         add(full);
     }
 }
