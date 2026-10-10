@@ -795,11 +795,84 @@ internal sealed class LaunchRun
         TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
         RefuseBadSnapshotValues(snapshotSources);
         // The gate PATH's directories: one listing each, frozen as the baseline the pre-gate
-        // and after-gate checks compare against (the GateTrust header's rule). FreezeRound1GateResolution
-        // set both ResolvedExecutable and GatePath (or refused the launch), so this is non-null for
-        // every round-1 gate.
+        // and after-gate checks compare against (the GateTrust header's rule), with the
+        // inside-the-working-tree refusal round 1 makes before the worker runs.
+        await FreezeGatePathNamesAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Round 1's listing of the gate PATH's directories, frozen as the baseline the pre-gate and
+    /// after-gate checks compare against (the GateTrust header's rule), plus the round-1 refusal of
+    /// a PATH that reaches into the working tree (<see cref="RefuseGatePathInsideWorkingTree"/>).
+    /// FreezeRound1GateResolution set both ResolvedExecutable and GatePath (or refused the launch),
+    /// so this is non-null for every round-1 gate. Later rounds reuse the frozen listing and never
+    /// re-run the refusal. Runs before the run directory is created, so a refusal (exit 2) leaves
+    /// no half-made run directory behind.
+    /// </summary>
+    private async Task FreezeGatePathNamesAsync()
+    {
         string? gatePath = NonNull(_gate).GatePath;
-        GatePathNames = gatePath is null ? null : GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
+        if (gatePath is null)
+        {
+            return;
+        }
+
+        GatePathNames = GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
+        string cwd = Directory.GetCurrentDirectory();
+        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
+        RefuseGatePathInsideWorkingTree(gitRoot ?? cwd, cwd);
+    }
+
+    /// <summary>
+    /// Round-1 refusal of a gate PATH that reaches into the working tree: a PATH directory at or
+    /// under the git root, the working directory or the runs root lets the worker (and anything it
+    /// spawns) write the gate's own PATH, and a symlink entry whose final target lies there lets it
+    /// rewrite what the link resolves to while the PATH directory's listing stays intact — the
+    /// listing check would only notice after a full worker run, and the restore-mtime gap can hide
+    /// it altogether. Like every other round-1 refusal this is a launch error (exit 2), thrown
+    /// before the run directory is created; the frozen listing the later rounds compare against
+    /// exists only when this check passed.
+    /// </summary>
+    private void RefuseGatePathInsideWorkingTree(string gitRoot, string workingDirectory)
+    {
+        string? gatePath = NonNull(_gate).GatePath;
+        string runsRoot = Path.GetFullPath(_runsRoot);
+        if (gatePath is not null)
+        {
+            foreach (string dir in GateTrust.SplitGatePath(gatePath))
+            {
+                if (GateTrust.IsAtOrUnder(dir, gitRoot) || GateTrust.IsAtOrUnder(dir, workingDirectory) || GateTrust.IsAtOrUnder(dir, runsRoot))
+                {
+                    throw new LaunchException($"gate PATH directory '{dir}' is inside the working tree");
+                }
+            }
+        }
+
+        if (GatePathNames is null)
+        {
+            return;
+        }
+
+        foreach (KeyValuePair<string, GateTrust.PathNameListing> listing in GatePathNames.Directories)
+        {
+            if (!listing.Value.Readable)
+            {
+                continue;
+            }
+
+            foreach (KeyValuePair<string, GateTrust.PathEntry> entry in listing.Value.Entries)
+            {
+                if (entry.Value.FinalTarget is not { } target || target is "dangling" || target.StartsWith("unreadable", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (GateTrust.IsAtOrUnder(target, gitRoot) || GateTrust.IsAtOrUnder(target, workingDirectory) || GateTrust.IsAtOrUnder(target, runsRoot))
+                {
+                    throw new LaunchException($"gate PATH entry '{Path.Combine(listing.Key, entry.Key)}' links into the working tree: {target}");
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -823,7 +896,6 @@ internal sealed class LaunchRun
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
         List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, gate.ResolvedExecutable);
-        warnings.AddRange(GatePathLocationWarnings(root, cwd));
         FixedSources = sources;
         if (warnings.Count > 0)
         {
@@ -833,45 +905,6 @@ internal sealed class LaunchRun
         }
 
         return paths;
-    }
-
-    /// <summary>
-    /// Round-1 warnings for absolute gate PATH entries that lie inside the working tree (the git
-    /// root or the working directory) or the runs root: any worker, gate or launcher write into such
-    /// a directory during the run trips the gate PATH check, so the operator should drop the entry
-    /// from PATH or rely on the check knowingly. Recorded on the gate spec (gate.json's warnings)
-    /// and in the result notes like the other round-1 warnings.
-    /// </summary>
-    private List<string> GatePathLocationWarnings(string treeRoot, string workingDirectory)
-    {
-        string? gatePath = NonNull(_gate).GatePath;
-        if (gatePath is null)
-        {
-            return [];
-        }
-
-        string runsRoot = Path.GetFullPath(_runsRoot);
-        List<string> warnings = [];
-        foreach (string dir in GateTrust.SplitGatePath(gatePath))
-        {
-            List<string> inside = [];
-            if (GateTrust.IsAtOrUnder(dir, treeRoot) || GateTrust.IsAtOrUnder(dir, workingDirectory))
-            {
-                inside.Add("the working tree");
-            }
-
-            if (GateTrust.IsAtOrUnder(dir, runsRoot))
-            {
-                inside.Add("the runs root");
-            }
-
-            if (inside.Count > 0)
-            {
-                warnings.Add($"gate PATH directory '{dir}' lies inside {string.Join(" and ", inside)}; the gate PATH check treats any write there during the run as a violation (drop it from PATH or rely on the check knowingly)");
-            }
-        }
-
-        return warnings;
     }
 
     /// <summary>

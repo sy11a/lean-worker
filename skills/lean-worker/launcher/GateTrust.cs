@@ -14,12 +14,18 @@
 // (deduped, order kept; relative entries such as "." or node_modules/.bin resolve inside the
 // worker's own tree and are dropped; a PATH with no absolute entry left is a launch error, since
 // an empty PATH would resolve bare names in the gate's current directory), frozen on the gate
-// spec, and handed to the gate as PATH in every round. Each directory on that PATH is trusted as
-// listed: at round 1 the launcher records the entries directly in each directory (no recursion, no
-// hashing) — name, length, last write time (UTC), whether the entry is a symlink and, for a
-// symlink, its link target — and the pre-gate and after-gate checks list them again. An added or
-// removed name, a changed length, mtime or link target, and any change of a directory's own state
-// (missing ↔ readable ↔ unreadable, even when the listings are empty) is a trust violation. Named,
+// spec, and handed to the gate as PATH in every round. A PATH directory at or under the git root,
+// the working directory or the runs root is refused before the worker (exit 2) — the worker could
+// write the gate's own PATH there — and so is a symlink entry whose final target lies there: the
+// worker could rewrite what the link resolves to while the PATH directory's listing stays intact.
+// Each directory on that PATH is trusted as listed: at round 1 the launcher records the entries
+// directly in each directory (no recursion, no hashing) — name, length, last write time (UTC),
+// whether the entry is a symlink and, for a symlink, its link target plus the chain's final
+// target as a full path with that target's length and last write time (`dangling` when the
+// target does not exist) — and the pre-gate and after-gate checks list them again. An added or
+// removed name, a changed length, mtime, link target or final target (with the target's own
+// length and mtime), and any change of a directory's own state (missing ↔ readable ↔ unreadable,
+// even when the listings are empty) is a trust violation. Named,
 // accepted gaps: the content of a same-named entry is not hashed, so a worker that rewrites it and
 // restores the mtime (`touch -d`) while keeping the length escapes this check (put such a tool in
 // gate.trust or call it by an absolute path in a trusted script), and nothing under a subdirectory
@@ -493,9 +499,13 @@ internal static class GateTrust
     /// One entry directly in a gate PATH directory: its name, its length (0 for a directory — a
     /// subdirectory's own size changes whenever entries are added under it, which is not a change to
     /// the PATH directory's listing), its last write time in UTC, whether it is a symlink, and for a
-    /// symlink the link target it carries.
+    /// symlink the link target it carries plus the symlink chain's final target as a full path, that
+    /// target's length (0 for a directory, same rule as <c>Length</c>) and its last write time in
+    /// UTC. <c>FinalTarget</c> records <c>dangling</c> when the final target does not exist, or
+    /// <c>unreadable: &lt;exception type&gt;</c> when resolving it failed (then the length and mtime
+    /// are null); it is null when the entry is not a symlink.
     /// </summary>
-    internal sealed record PathEntry(string Name, long Length, DateTimeOffset LastWriteTimeUtc, bool IsSymlink, string? LinkTarget);
+    internal sealed record PathEntry(string Name, long Length, DateTimeOffset LastWriteTimeUtc, bool IsSymlink, string? LinkTarget, string? FinalTarget, long? FinalTargetLength, DateTimeOffset? FinalTargetLastWriteTimeUtc);
 
     /// <summary>
     /// One listing of a gate PATH directory. A readable listing carries every direct entry's
@@ -607,21 +617,33 @@ internal static class GateTrust
         {
             Dictionary<string, PathEntry> entries = new(StringComparer.Ordinal);
             // One enumeration; the transform reads the FileSystemEntry the walk already holds (name,
-            // length, last write time, link flag) and resolves a symlink's target with one call.
-            // _pathListOptions, not _walkOptions: an unreadable directory must throw here — on Unix
-            // IgnoreInaccessible also silences the root's own open failure, which would record a
-            // directory the worker made unreadable as "readable, no entries".
+            // length, last write time, link flag), resolves a symlink's target with one call, and
+            // follows the chain to the final target with one more. _pathListOptions, not _walkOptions:
+            // an unreadable directory must throw here — on Unix IgnoreInaccessible also silences the
+            // root's own open failure, which would record a directory the worker made unreadable as
+            // "readable, no entries".
             foreach (PathEntry entry in new FileSystemEnumerable<PathEntry>(
                 dir,
                 static (ref FileSystemEntry e) =>
                 {
                     bool isSymlink = e.Attributes.HasFlag(FileAttributes.ReparsePoint);
+                    string? finalTarget = null;
+                    long? finalTargetLength = null;
+                    DateTimeOffset? finalTargetLastWriteTimeUtc = null;
+                    if (isSymlink)
+                    {
+                        (finalTarget, finalTargetLength, finalTargetLastWriteTimeUtc) = ResolveEntryFinalTarget(e.ToFileSystemInfo().FullName);
+                    }
+
                     return new PathEntry(
                         Name: e.FileName.ToString(),
                         Length: e.IsDirectory ? 0 : e.Length,
                         LastWriteTimeUtc: e.LastWriteTimeUtc,
                         IsSymlink: isSymlink,
-                        LinkTarget: isSymlink ? e.ToFileSystemInfo().LinkTarget : null);
+                        LinkTarget: isSymlink ? e.ToFileSystemInfo().LinkTarget : null,
+                        FinalTarget: finalTarget,
+                        FinalTargetLength: finalTargetLength,
+                        FinalTargetLastWriteTimeUtc: finalTargetLastWriteTimeUtc);
                 },
                 _pathListOptions))
             {
@@ -636,18 +658,55 @@ internal static class GateTrust
         }
     }
 
+    /// <summary>
+    /// Resolves a gate PATH entry's symlink chain to its final target and reads that target's length
+    /// and last write time (UTC) — the three values a symlinked <see cref="PathEntry"/> records, so
+    /// a retargeted link and a target rewritten in place are both listing changes. The target comes
+    /// back as a full path; a link whose final target does not exist records <c>dangling</c>; a
+    /// resolution that fails records <c>unreadable: &lt;exception type&gt;</c>. The target's length
+    /// follows the listing's own rule: 0 for a directory, whose size changes whenever entries are
+    /// added under it (which is not a change to what the link resolves to).
+    /// </summary>
+    private static (string FinalTarget, long? FinalTargetLength, DateTimeOffset? FinalTargetLastWriteTimeUtc) ResolveEntryFinalTarget(string path)
+    {
+        try
+        {
+            // Follows the whole chain (a link to a link to a file resolves to the file) and wraps the
+            // final target path even when nothing is there, so a dangling link is detected by the
+            // existence check rather than by an exception.
+            FileSystemInfo? final = File.ResolveLinkTarget(path, returnFinalTarget: true);
+            if (final is null || !PathExists(final.FullName))
+            {
+                return ("dangling", null, null);
+            }
+
+            string full = Path.GetFullPath(final.FullName);
+            return Directory.Exists(full)
+                ? (full, 0, Directory.GetLastWriteTimeUtc(full))
+                : (full, new FileInfo(full).Length, File.GetLastWriteTimeUtc(full));
+        }
+        catch (Exception ex) when (ex is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException)
+        {
+            return ($"unreadable: {ex.GetType().Name}", null, null);
+        }
+    }
+
     private static readonly IReadOnlyDictionary<string, PathEntry> _emptyEntries = new Dictionary<string, PathEntry>(StringComparer.Ordinal);
 
     /// <summary>
     /// The gate PATH listing violations right now, against round 1's frozen listing: a name added to
-    /// or removed from a readable directory, a name whose length, last write time, link flag or link
-    /// target changed, a readable directory that turned missing or unreadable, and a directory that
-    /// was missing or unreadable at round 1 and is readable now (the baseline never saw its entries,
-    /// so each one is an addition, and the state change itself is reported even when it is empty —
-    /// the check must not depend on how listing errors are classified). Entry changes are named as
-    /// <c>&lt;dir&gt;/&lt;name&gt;</c> with what changed, a directory state change as
-    /// <c>&lt;dir&gt; is now &lt;reason&gt;</c>, in the frozen directory order; the caller prefixes
-    /// them like the other trust messages. One enumeration per directory, no hashing.
+    /// or removed from a readable directory, a name whose length, last write time, link flag, link
+    /// target or final target (with the target's own length and mtime) changed, a readable directory
+    /// that turned missing or unreadable, and a directory that was missing or unreadable at round 1
+    /// and is readable now (the baseline never saw its entries, so each one is an addition, and the
+    /// state change itself is reported even when it is empty — the check must not depend on how
+    /// listing errors are classified). Entry changes are named as <c>&lt;dir&gt;/&lt;name&gt;</c>
+    /// with what changed, a directory state change as <c>&lt;dir&gt; is now &lt;reason&gt;</c>, in
+    /// the frozen directory order; the caller prefixes them like the other trust messages. One
+    /// enumeration per directory, no hashing.
     /// </summary>
     public static IReadOnlyList<string> PathNameViolations(PathNamesSnapshot before, IReadOnlyList<string> directories)
     {
@@ -721,8 +780,9 @@ internal static class GateTrust
 
     /// <summary>
     /// What changed between round 1's record of a surviving entry and now, or null when nothing did:
-    /// the link flag (a plain file swapped for a symlink or back), a symlink's target, the length or
-    /// the last write time.
+    /// the link flag (a plain file swapped for a symlink or back), a symlink's link target, its
+    /// final target (including <c>dangling</c> ↔ a real target), that target's length or its last
+    /// write time, and the entry's own length or last write time.
     /// </summary>
     private static string? EntryChange(PathEntry was, PathEntry now)
     {
@@ -731,9 +791,27 @@ internal static class GateTrust
         {
             changes.Add(was.IsSymlink ? "stopped being a symlink" : "became a symlink");
         }
-        else if (was.IsSymlink && !string.Equals(was.LinkTarget, now.LinkTarget, StringComparison.Ordinal))
+        else if (was.IsSymlink)
         {
-            changes.Add($"changed its link target from '{was.LinkTarget}' to '{now.LinkTarget}'");
+            if (!string.Equals(was.LinkTarget, now.LinkTarget, StringComparison.Ordinal))
+            {
+                changes.Add($"changed its link target from '{was.LinkTarget}' to '{now.LinkTarget}'");
+            }
+
+            if (!string.Equals(was.FinalTarget, now.FinalTarget, StringComparison.Ordinal))
+            {
+                changes.Add($"changed its final target from '{was.FinalTarget}' to '{now.FinalTarget}'");
+            }
+
+            if (was.FinalTargetLength != now.FinalTargetLength)
+            {
+                changes.Add(string.Create(CultureInfo.InvariantCulture, $"changed its target's length from {was.FinalTargetLength} to {now.FinalTargetLength}"));
+            }
+
+            if (was.FinalTargetLastWriteTimeUtc != now.FinalTargetLastWriteTimeUtc)
+            {
+                changes.Add(string.Create(CultureInfo.InvariantCulture, $"changed its target's mtime from {was.FinalTargetLastWriteTimeUtc:o} to {now.FinalTargetLastWriteTimeUtc:o}"));
+            }
         }
 
         if (was.Length != now.Length)
