@@ -58,6 +58,7 @@ internal static class Launcher
                 TrustSnapshot: run.TrustSnapshot ?? throw new LaunchException("gate chain has no trust snapshot"),
                 TrustPaths: run.TrustPaths ?? throw new LaunchException("gate chain has no trust paths"),
                 FixedSources: run.FixedSources ?? throw new LaunchException("gate chain has no trust path sources"),
+                GatePathNames: run.GatePathNames ?? throw new LaunchException("gate chain has no gate PATH name sets"),
                 PostGateOutputs: run.PostGateOutputs);
             run = new LaunchRun(o, gateContext: nextContext);
             code = await run.RunAsync().ConfigureAwait(false);

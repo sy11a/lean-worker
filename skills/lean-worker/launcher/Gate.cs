@@ -19,7 +19,9 @@
 // Trust boundary: the gate's environment is built from an allowlist (a default set + the profile's
 // `gate.env`), not inherited from the launcher. Names that pass the gate's filter are recorded as
 // `env_names` in gate.json (sorted, never the values) so the run's record shows exactly which
-// variables reached the gate.
+// variables reached the gate. The PATH the gate receives is not the launcher's own: it is the
+// frozen absolute-only PATH the spec carries (`GateSpec.GatePath`), whose directories' name sets
+// the trust check watches (the GateTrust header's rule).
 
 using System.Diagnostics;
 using System.Globalization;
@@ -203,6 +205,20 @@ internal static class Gate
 
             psi.Environment[key] = value;
             envNames.Add(key);
+        }
+
+        // The gate's PATH is the frozen absolute-only value (GateSpec.GatePath — built once in round 1,
+        // the GateTrust header's rule), not the launcher's own PATH: a relative entry would resolve
+        // inside the worker's tree, and a PATH re-read at gate time would let a later round pick up
+        // directories the worker created. Null only in a spec no launcher has resolved; then the
+        // allowlist's PATH (the launcher's own) is left in place.
+        if (spec.GatePath is not null)
+        {
+            psi.Environment["PATH"] = spec.GatePath;
+            if (!envNames.Contains("PATH"))
+            {
+                envNames.Add("PATH");
+            }
         }
 
         envNames.Sort(StringComparer.Ordinal);
@@ -884,6 +900,13 @@ internal static class Gate
             ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
             ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
         };
+        // The gate PATH the gate resolves command names through: the frozen absolute-only value the
+        // trust check watches (the GateTrust header's rule). Null only in a spec no launcher has
+        // resolved.
+        if (spec.GatePath is not null)
+        {
+            o["path"] = spec.GatePath;
+        }
         // The declared gate outputs, as written in the profile: the record shows which paths the
         // gate may write (they leave the after-gate trust comparison, nothing else does).
         if (spec.Outputs is { Count: > 0 })

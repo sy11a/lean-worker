@@ -111,9 +111,20 @@ internal sealed class LaunchRun
     // the trusted set are re-hashed (PostGateOutputs): the gate legitimately rewrote them after
     // round 1's baseline was taken, so the next round's baseline is round 1's snapshot with exactly
     // those keys replaced. Everything else keeps round 1's value.
+    // The gate's PATH directories get the same treatment without hashing: round 1 records the entry
+    // names directly in each (the frozen GatePath, the GateTrust header's rule) into GatePathNames,
+    // and every pre-gate and after-gate check compares the listing again — an added, removed or
+    // now-unreadable name is a trust violation.
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
     public IReadOnlyList<string>? TrustPaths { get; private set; }
     public IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources { get; private set; }
+
+    /// <summary>
+    /// Round 1's name-set listing of the gate PATH's directories, the baseline the pre-gate and
+    /// after-gate name-set checks compare against; frozen into the gate context for later rounds.
+    /// Null when no gate PATH was resolved.
+    /// </summary>
+    public GateTrust.PathNamesSnapshot? GatePathNames { get; private set; }
 
     /// <summary>
     /// The declared gate outputs that are trusted inputs, re-hashed after this round's clean
@@ -317,6 +328,18 @@ internal sealed class LaunchRun
         }
 
         _gate = spec with { MaxTotalUsd = spec.MaxTotalUsd ?? (3m * _budget) };
+        FreezeRound1GateResolution();
+        InitialGateSpec = _gate;
+        NoteGate(_gate);
+    }
+
+    /// <summary>
+    /// Round 1's one resolution of the gate's argv[0] and PATH, frozen on the spec the chain carries
+    /// into every round. Later rounds return immediately: the frozen values are reused unchanged.
+    /// </summary>
+    private void FreezeRound1GateResolution()
+    {
+        GateSpec gate = NonNull(_gate);
         // Round 1 resolves the gate's argv[0] exactly once, to the absolute path the trust check
         // hashes as TrustSource.Executable (CollectFixedPathsAsync adds exactly this string); later
         // rounds reuse the value frozen on the round-1 spec, which the chain carries in
@@ -324,13 +347,21 @@ internal sealed class LaunchRun
         // gate time — so an executable the worker plants in an earlier PATH directory after this
         // lookup can never be swapped in for a later round. An unresolvable argv[0] is a launch error
         // (exit 2) before the worker starts.
-        if (_gate.ResolvedExecutable is null)
+        //
+        // The same freeze covers the gate's PATH: built once from the launcher's PATH by keeping only
+        // the absolute entries (the GateTrust header's rule), it is what every round hands the gate
+        // as PATH and what the name-set trust check watches; a PATH re-read at gate time would let a
+        // later round pick up directories the worker created.
+        if (gate.ResolvedExecutable is not null)
         {
-            _gate = _gate with { ResolvedExecutable = GateTrust.ResolveExecutableStrict(_gate.Command, Directory.GetCurrentDirectory()) };
+            return;
         }
 
-        InitialGateSpec = _gate;
-        NoteGate(_gate);
+        _gate = gate with
+        {
+            ResolvedExecutable = GateTrust.ResolveExecutableStrict(gate.Command, Directory.GetCurrentDirectory()),
+            GatePath = GateTrust.BuildGatePath(),
+        };
     }
 
     private void NoteGate(GateSpec? spec)
@@ -732,6 +763,7 @@ internal sealed class LaunchRun
                 : MergePostGateOutputs(NonNull(GateContext.TrustSnapshot), GateContext.PostGateOutputs);
             TrustPaths = GateContext.TrustPaths;
             FixedSources = GateContext.FixedSources;
+            GatePathNames = GateContext.GatePathNames;
             if (_gate?.Warnings is { Count: > 0 } frozen)
             {
                 _notes.AddRange(frozen);
@@ -758,6 +790,11 @@ internal sealed class LaunchRun
         await ValidateDeclaredOutputsAsync(snapshotSources).ConfigureAwait(false);
         TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
         RefuseBadSnapshotValues(snapshotSources);
+        // The gate PATH's directories: one name listing each, frozen as the baseline the pre-gate
+        // and after-gate checks compare against (the GateTrust header's rule). ResolveGate set
+        // GatePath whenever it resolved the executable, so this is non-null for every round-1 gate.
+        string? gatePath = NonNull(_gate).GatePath;
+        GatePathNames = gatePath is null ? null : GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
     }
 
     /// <summary>
@@ -1089,6 +1126,8 @@ internal sealed class LaunchRun
             return ($"the trusted inputs could not be checked: {ex.Message}", null);
         }
 
+        violation ??= GatePathViolation("the worker changed a gate PATH directory: ");
+
         if (violation is not null)
         {
             return (violation, null);
@@ -1139,6 +1178,8 @@ internal sealed class LaunchRun
                     "trusted files changed while the gate ran: ").ConfigureAwait(false)
                 : null;
 
+            violation ??= GatePathViolation("a gate PATH directory changed while the gate ran: ");
+
             if (violation is null)
             {
                 PostGateOutputs = await HashPostGateOutputsAsync().ConfigureAwait(false);
@@ -1152,6 +1193,25 @@ internal sealed class LaunchRun
             // `error`, exit 5) rather than crashing the launch with exit 2.
             return $"the trusted inputs could not be checked: {ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// The name-set trust check over the gate PATH's directories against round 1's frozen listing:
+    /// one enumeration per directory, no hashing (<see cref="GateTrust.PathNameViolations"/>). Null
+    /// when there is no frozen listing or no frozen PATH (a hand-built context without the trust
+    /// fields) or nothing changed. A violation here ends the chain with <c>error</c> (exit 5) like
+    /// the hash-based checks; <paramref name="prefix"/> says which check found it.
+    /// </summary>
+    private string? GatePathViolation(string prefix)
+    {
+        string? gatePath = NonNull(_gate).GatePath;
+        if (GatePathNames is null || gatePath is null)
+        {
+            return null;
+        }
+
+        IReadOnlyList<string> diffs = GateTrust.PathNameViolations(GatePathNames, GateTrust.SplitGatePath(gatePath));
+        return diffs.Count is 0 ? null : prefix + string.Join(", ", diffs);
     }
 
     /// <summary>

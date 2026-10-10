@@ -9,6 +9,17 @@
 // before-worker snapshot ends the chain with `error` instead of running the gate against tampered
 // inputs.
 //
+// The gate's PATH: commands a gate script runs by name resolve only through the frozen absolute
+// PATH — built once in round 1 from the launcher's PATH by keeping only the absolute entries
+// (deduped, order kept; relative entries such as "." or node_modules/.bin resolve inside the
+// worker's own tree and are dropped), frozen on the gate spec, and handed to the gate as PATH in
+// every round. Each directory on that PATH has its name set trusted: at round 1 the launcher
+// records the set of entry names directly in each directory (no recursion, no hashing; a missing
+// or unreadable directory is recorded as such), and the pre-gate and after-gate checks list them
+// again — any added, removed or now-unreadable name is a trust violation. The content of the
+// binaries on those directories is not hashed: a worker able to overwrite a system binary in
+// place is out of scope.
+//
 // Snapshot keys are the trusted paths the operator configured; the value always carries the resolved
 // final target before a bar, then the SHA-256 (for regular file bytes) or a sentinel for everything
 // else. So retargeting a symlink shows up as a value change (the "target" half moves; the key stays),
@@ -473,6 +484,173 @@ internal static class GateTrust
     }
 
     /// <summary>
+    /// One gate PATH directory's listing: the entry names directly in it, or why there are none.
+    /// <paramref name="Readable"/> is false exactly when the directory itself could not be listed —
+    /// <paramref name="Reason"/> then says whether it is <c>missing</c> or
+    /// <c>unreadable: &lt;exception type&gt;</c> — which the comparison treats as a state of its own
+    /// (the GateTrust header's rule), not as an empty directory.
+    /// </summary>
+    internal sealed record PathNameListing(bool Readable, string? Reason, IReadOnlySet<string> Names);
+
+    /// <summary>
+    /// Round 1's name sets for the gate PATH's directories, keyed by the frozen absolute directory
+    /// (the GateTrust header's rule: the name-set baseline every later listing is compared against).
+    /// </summary>
+    internal sealed record PathNamesSnapshot(IReadOnlyDictionary<string, PathNameListing> Directories);
+
+    /// <summary>
+    /// The directories the gate's PATH is built from: the launcher's PATH split on the path
+    /// separator, keeping only the absolute entries (each trimmed of quotes and normalised with
+    /// <see cref="Path.GetFullPath(string)"/>, the same treatment <see cref="Launcher.FindOnPath"/>
+    /// applies), deduped, order kept. Relative entries (<c>.</c>, <c>node_modules/.bin</c>) resolve
+    /// inside the worker's own tree and are dropped — the GateTrust header's rule.
+    /// </summary>
+    public static IReadOnlyList<string> GatePathDirectories()
+    {
+        List<string> dirs = [];
+        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string dir = entry.Trim('"');
+            if (!Path.IsPathRooted(dir))
+            {
+                continue;
+            }
+
+            string full;
+            try
+            {
+                full = Path.GetFullPath(dir);
+            }
+            catch (ArgumentException)
+            {
+                // A PATH entry that cannot form a valid path is skipped, like a non-existent one.
+                continue;
+            }
+
+            if (dedupe.Add(full))
+            {
+                dirs.Add(full);
+            }
+        }
+
+        return dirs;
+    }
+
+    /// <summary>
+    /// The gate's PATH: <see cref="GatePathDirectories"/> joined with the path separator — possibly
+    /// empty, when every PATH entry is relative (then the gate runs with no PATH and its scripts
+    /// must use absolute command paths). Frozen on the gate spec in round 1 and split back by
+    /// <see cref="SplitGatePath"/>.
+    /// </summary>
+    public static string BuildGatePath() => string.Join(Path.PathSeparator, GatePathDirectories());
+
+    /// <summary>
+    /// The frozen PATH string split back into its directories — the exact list
+    /// <see cref="BuildGatePath"/> was built from.
+    /// </summary>
+    public static IReadOnlyList<string> SplitGatePath(string gatePath) =>
+        [.. gatePath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)];
+
+    /// <summary>
+    /// Lists the names directly in each directory — one
+    /// <see cref="Directory.EnumerateFileSystemEntries(string, string, EnumerationOptions)"/> per
+    /// directory over <see cref="_walkOptions"/> (no recursion, no hashing; the GateTrust header's
+    /// rule). A missing or unreadable directory is recorded as such
+    /// (<see cref="PathNameListing"/>), never silently as an empty directory.
+    /// </summary>
+    public static PathNamesSnapshot SnapshotPathNames(IReadOnlyList<string> directories)
+    {
+        Dictionary<string, PathNameListing> listings = new(StringComparer.Ordinal);
+        foreach (string dir in directories)
+        {
+            listings[dir] = ListPathDirectory(dir);
+        }
+
+        return new PathNamesSnapshot(listings);
+    }
+
+    private static PathNameListing ListPathDirectory(string dir)
+    {
+        if (!Directory.Exists(dir))
+        {
+            return new PathNameListing(Readable: false, Reason: "missing", Names: _emptyNames);
+        }
+
+        try
+        {
+            HashSet<string> names = new(StringComparer.Ordinal);
+            foreach (string entry in Directory.EnumerateFileSystemEntries(dir, "*", _walkOptions))
+            {
+                _ = names.Add(Path.GetFileName(entry));
+            }
+
+            return new PathNameListing(Readable: true, Reason: null, Names: names);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new PathNameListing(Readable: false, Reason: $"unreadable: {ex.GetType().Name}", Names: _emptyNames);
+        }
+    }
+
+    private static readonly IReadOnlySet<string> _emptyNames = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The gate PATH name-set violations right now, against round 1's frozen listing: a name added
+    /// to or removed from a readable directory, a readable directory that turned missing or
+    /// unreadable, and every name in a directory that was missing or unreadable at round 1 and is
+    /// readable now (the baseline never saw them, so each one is an addition). Name changes are
+    /// named as <c>&lt;dir&gt;/&lt;name&gt;</c> and a directory state change as
+    /// <c>&lt;dir&gt; is now &lt;reason&gt;</c>, in the frozen directory order; the caller prefixes
+    /// them like the other trust messages. One enumeration per directory, no hashing.
+    /// </summary>
+    public static IReadOnlyList<string> PathNameViolations(PathNamesSnapshot before, IReadOnlyList<string> directories)
+    {
+        List<string> violations = [];
+        foreach (string dir in directories)
+        {
+            PathNameListing was = before.Directories.TryGetValue(dir, out PathNameListing? listing)
+                ? listing
+                : new PathNameListing(Readable: false, Reason: "missing", Names: _emptyNames);
+            PathNameListing now = ListPathDirectory(dir);
+            if (!was.Readable && !now.Readable)
+            {
+                // Neither state could be listed: whatever sits there was invisible to both checks.
+                continue;
+            }
+
+            if (was.Readable)
+            {
+                if (!now.Readable)
+                {
+                    violations.Add($"{dir} is now {now.Reason}");
+                    continue;
+                }
+
+                foreach (string name in now.Names.Where(n => !was.Names.Contains(n)).Order(StringComparer.Ordinal))
+                {
+                    violations.Add(Path.Combine(dir, name));
+                }
+
+                foreach (string name in was.Names.Where(n => !now.Names.Contains(n)).Order(StringComparer.Ordinal))
+                {
+                    violations.Add(Path.Combine(dir, name));
+                }
+
+                continue;
+            }
+
+            // Readable now, invisible to the baseline: every name is an addition.
+            foreach (string name in now.Names.Order(StringComparer.Ordinal))
+            {
+                violations.Add(Path.Combine(dir, name));
+            }
+        }
+
+        return violations;
+    }
+
+    /// <summary>
     /// The part of the trust set that is fixed for a whole gate chain: the resolved gate executable,
     /// the existing argv file entries, and the <c>gate.trust</c> entries (literal paths and glob
     /// matches). The launcher resolves this list once, before round 1's worker runs, and reuses it
@@ -798,16 +976,24 @@ internal static class GateTrust
     /// the returned absolute path is hashed as <see cref="TrustSource.Executable"/>, frozen on the
     /// gate spec (<c>ResolvedExecutable</c>) and started by <c>Gate.BuildStartInfo</c> verbatim. The
     /// gate runner never searches PATH again, so an executable the worker plants in an earlier PATH
-    /// directory after this lookup cannot be swapped in for a later round. Unresolvable argv[0] is a
-    /// launch error (exit 2) before the worker.
+    /// directory after this lookup cannot be swapped in for a later round. An argv[0] that cannot be
+    /// resolved is a launch error (exit 2) before the worker: a bare name that no PATH entry has
+    /// throws <c>not found on PATH</c>; an entry with a directory part that does not exist as a file
+    /// (its <c>GetFullPath</c> resolution succeeds without the file ever existing) throws
+    /// <c>not found</c> — spent worker money for a gate that cannot start is what the check avoids.
     /// </summary>
     internal static string ResolveExecutableStrict(IReadOnlyList<string> gateCommand, string gateWorkingDirectory)
     {
+        string first = gateCommand.Count is 0 ? string.Empty : gateCommand[0];
         string resolved = ResolveExecutable(gateCommand, gateWorkingDirectory);
-        if (resolved.Length is 0)
+        if (resolved.Length is 0 && !HasDirectorySeparator(first))
         {
-            string first = gateCommand.Count is 0 ? string.Empty : gateCommand[0];
             throw new LaunchException($"gate executable '{first}' not found on PATH");
+        }
+
+        if (resolved.Length is 0 || !File.Exists(resolved))
+        {
+            throw new LaunchException($"gate executable '{first}' not found");
         }
 
         return resolved;

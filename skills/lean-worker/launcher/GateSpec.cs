@@ -19,6 +19,11 @@
 // runs): the absolute path the trust check hashes as TrustSource.Executable and Gate.BuildStartInfo starts
 // as FileName. The frozen spec carries it into every round of the chain, so the gate runner never searches
 // PATH again at gate time; it is null only in a spec no launcher has resolved.
+//
+// `GatePath` is the same kind of one-time freeze for the gate's PATH (round 1, before the worker runs): the
+// launcher's PATH with only the absolute entries kept (deduped, order kept — the GateTrust header's rule),
+// handed to the gate as its PATH in every round and watched by the name-set trust check. It is null only
+// in a spec no launcher has resolved.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -26,7 +31,7 @@ using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null, string? ResolvedExecutable = null)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null, string? ResolvedExecutable = null, string? GatePath = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can
