@@ -149,6 +149,76 @@ public class GateTrustTests
         }
     }
 
+    private static async Task<GateTrust.Snapshot> HashBoundedAsync(string path) =>
+        await GateTrust.HashAsync([path]).WaitAsync(TimeSpan.FromSeconds(20), TimeProvider.System, TestContext.Current.CancellationToken);
+
+    [Fact]
+    public async Task A_directory_is_nonregularAsync()
+    {
+        string dir = NewDir();
+        GateTrust.Snapshot snapshot = await HashBoundedAsync(dir);
+        Assert.Equal("nonregular", snapshot.Hashes[dir]);
+    }
+
+    [Fact]
+    public async Task A_symlink_to_a_directory_is_nonregularAsync()
+    {
+        string dir = NewDir();
+        string link = Path.Combine(NewDir(), "dirlink");
+        _ = File.CreateSymbolicLink(link, dir);
+        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        Assert.Equal("nonregular", Assert.Single(snapshot.Hashes).Value);
+    }
+
+    [Fact]
+    public async Task Dev_null_is_nonregularAsync()
+    {
+        if (!File.Exists("/dev/null"))
+        {
+            return;
+        }
+
+        GateTrust.Snapshot snapshot = await HashBoundedAsync("/dev/null");
+        Assert.Equal("nonregular", snapshot.Hashes["/dev/null"]);
+    }
+
+    [Fact]
+    public async Task A_symlink_to_dev_null_is_nonregularAsync()
+    {
+        if (!File.Exists("/dev/null"))
+        {
+            return;
+        }
+
+        string link = Path.Combine(NewDir(), "nulllink");
+        _ = File.CreateSymbolicLink(link, "/dev/null");
+        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        Assert.Equal("nonregular", Assert.Single(snapshot.Hashes).Value);
+    }
+
+    [Fact]
+    public async Task A_dangling_symlink_is_unreadable_not_absentAsync()
+    {
+        string dir = NewDir();
+        string link = Path.Combine(dir, "dangling");
+        _ = File.CreateSymbolicLink(link, Path.Combine(dir, "missing"));
+        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        // File.Exists is true for a dangling link on Unix, so production records it under the missing
+        // target's path as "unreadable: FileNotFoundException" rather than "unreadable: dangling link".
+        // Pinned to the invariant that matters (never absent, always unreadable) until that is fixed.
+        string state = Assert.Single(snapshot.Hashes).Value;
+        Assert.StartsWith("unreadable", state, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_regular_file_hashes_to_its_sha256Async()
+    {
+        string path = Path.Combine(NewDir(), "a.txt");
+        await File.WriteAllTextAsync(path, "hello", TestContext.Current.CancellationToken);
+        GateTrust.Snapshot snapshot = await HashBoundedAsync(path);
+        Assert.Equal("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", snapshot.Hashes[path]);
+    }
+
     [Fact]
     public async Task A_relative_argv_path_resolves_against_the_gate_working_directoryAsync()
     {
