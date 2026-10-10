@@ -103,9 +103,12 @@ internal sealed class LaunchRun
     // Trust boundary. Round 1 collects the fixed part of the trust set (gate.trust globs, argv file
     // entries, the resolved gate executable, the prices file) and hashes everything before its worker;
     // both are frozen into GateContext, and every later round compares against round 1's snapshot
-    // (before its worker, before its gate, after its gate).
+    // (before its worker, before its gate, after its gate). The fixed paths' per-path sources come
+    // along, frozen too: the gate's report path may be excluded from a comparison only when argv
+    // entries are its sole source (GateTrust.ReportPathViolation).
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
     public IReadOnlyList<string>? TrustPaths { get; private set; }
+    public IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources { get; private set; }
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -698,6 +701,7 @@ internal sealed class LaunchRun
             // ride along on the frozen spec: gate.json records them, the result block notes them.
             TrustSnapshot = GateContext.TrustSnapshot;
             TrustPaths = GateContext.TrustPaths;
+            FixedSources = GateContext.FixedSources;
             if (_gate?.Warnings is { Count: > 0 } frozen)
             {
                 _notes.AddRange(frozen);
@@ -712,7 +716,8 @@ internal sealed class LaunchRun
         // and refuses the gate if anything changed (a worker could otherwise swap the gate command
         // or its report path).
         TrustPaths = await CollectFixedPathsAsync().ConfigureAwait(false);
-        TrustSnapshot = await GateTrust.HashAsync(await CollectCheckPathsAsync(ReportPathExclusions()).ConfigureAwait(false)).ConfigureAwait(false);
+        (List<string> snapshotPaths, _) = await CollectCheckPathsAsync(ReportPathExclusions()).ConfigureAwait(false);
+        TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -729,7 +734,9 @@ internal sealed class LaunchRun
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
         List<string> warnings = [];
-        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings);
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
+        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources);
+        FixedSources = sources;
         if (warnings.Count > 0)
         {
             _gate = gate with { Warnings = warnings };
@@ -743,16 +750,28 @@ internal sealed class LaunchRun
     /// <summary>
     /// The paths for one trust check: the chain's fixed list plus the volatile walks re-collected now
     /// (runs-root files and the config-file walk, which are meant to catch new files), minus the
-    /// report paths the gate named — gate output, not a trusted input.
+    /// report paths the gate named — gate output, not a trusted input. Also returns the per-path
+    /// sources for this check (round 1's frozen fixed-path sources, deep-copied, plus the volatile
+    /// walks' sources recorded now), so the checks can tell a legally excluded report path from one
+    /// the trust set holds for another reason. The sources cover every collected path whether or not
+    /// an exclusion drops it from the path list: the rule asks where the report path is trusted
+    /// from, not whether it takes part in this comparison.
     /// </summary>
-    private async Task<List<string>> CollectCheckPathsAsync(IReadOnlySet<string> exclusions)
+    private async Task<(List<string> Paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> Sources)> CollectCheckPathsAsync(IReadOnlySet<string> exclusions)
     {
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, HashSet<GateTrust.TrustSource>> entry in NonNull(FixedSources))
+        {
+            sources[entry.Key] = [.. entry.Value];
+        }
+
+        List<string> volatilePaths = GateTrust.CollectVolatilePaths(_runsRoot, cwd, root, sources);
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
-        foreach (string path in NonNull(TrustPaths).Concat(GateTrust.CollectVolatilePaths(_runsRoot, cwd, root)))
+        foreach (string path in NonNull(TrustPaths).Concat(volatilePaths))
         {
             if (!exclusions.Contains(path) && dedupe.Add(path))
             {
@@ -760,13 +779,14 @@ internal sealed class LaunchRun
             }
         }
 
-        return paths;
+        return (paths, sources);
     }
 
     /// <summary>
-    /// The report paths the gate named, excluded from trust checks: they are gate output, not a
-    /// trusted input. The gate (re)wrote its report while it ran, and a later round must not treat
-    /// the previous round's gate output as a worker change against round 1's snapshot.
+    /// The report paths the gate named, excluded from trust checks — but only when each one passes
+    /// <see cref="GateTrust.ReportPathViolation"/>: argv entry only. Any other trusted source makes
+    /// the path a trusted input the gate would be writing over, and the checks report that instead
+    /// of dropping it from the comparison.
     /// </summary>
     private static IReadOnlySet<string> ReportPathExclusions(params string?[] reportPaths)
     {
@@ -886,7 +906,8 @@ internal sealed class LaunchRun
                 // a trusted file between the pre-gate check and the gate's end. The pre-gate check
                 // is not enough; we hash a third time after the gate exits and refuse the chain on
                 // any difference from round 1's before-worker snapshot (or a bad state). The report
-                // file the gate named is excluded: it is gate output, rewritten by the gate itself.
+                // file the gate named is excluded only when it is not itself a trusted input from
+                // another source; the check reports that case before the comparison runs.
                 //
                 // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted
                 // file between two hashes and restores it before the next hash escapes the check.
@@ -910,16 +931,27 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// Runs one trust check against round 1's before-worker snapshot: compare the path sets first
-    /// (a file that appeared or vanished is reported before anything is hashed), then hash the
-    /// stable list and stop at the first entry that differs or sits in a bad state, so a planted
-    /// FIFO cannot cost a timeout per entry. Returns null when the tree is clean; otherwise the
-    /// error message for the chain's trust violation.
+    /// Runs one trust check against round 1's before-worker snapshot: every path in
+    /// <paramref name="exclusions"/> (the report paths the gate named) must be trusted solely as an
+    /// argv file entry, or the check refuses the chain before comparing anything — an exclusion the
+    /// rule does not allow would drop a trusted input from both sides and hide the gate writing
+    /// over it. Then compare the path sets first (a file that appeared or vanished is reported
+    /// before anything is hashed), then hash the stable list and stop at the first entry that
+    /// differs or sits in a bad state, so a planted FIFO cannot cost a timeout per entry. Returns
+    /// null when the tree is clean; otherwise the error message for the chain's trust violation.
     /// </summary>
     private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string changedPrefix)
     {
         GateTrust.Snapshot before = NonNull(TrustSnapshot);
-        List<string> paths = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
+        (List<string> paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources) = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
+
+        foreach (string reportPath in exclusions)
+        {
+            if (GateTrust.ReportPathViolation(reportPath, sources) is { } reportViolation)
+            {
+                return reportViolation;
+            }
+        }
 
         List<string> setDiff = GateTrust.SetDifferences(before, paths, exclusions);
         if (setDiff.Count > 0)

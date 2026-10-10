@@ -63,6 +63,44 @@ internal static class GateTrust
     internal sealed record Snapshot(Dictionary<string, string> Hashes);
 
     /// <summary>
+    /// Where a trusted path came from. A path can be in the trusted set for more than one reason (an
+    /// argv entry that is also a gate.trust literal); <see cref="CollectChainPaths"/> and
+    /// <see cref="CollectVolatilePaths"/> record every source when the caller hands them a dictionary.
+    /// The gate's report path may be dropped from a trust comparison only when its sources are exactly
+    /// <see cref="TrustSource.ArgvEntry"/> — a gate writing its own report file named in its argv —
+    /// because any other source (the resolved executable, a gate.trust literal/glob, the prices file,
+    /// the config walk or the runs-root walk) makes the path a trusted input that a report written
+    /// over it would corrupt. <see cref="ReportPathViolation"/> enforces that rule.
+    /// </summary>
+    internal enum TrustSource
+    {
+        /// <summary>
+        /// An existing file path named in the gate's argv (after argv[0]), under the git root.
+        /// </summary>
+        ArgvEntry,
+        /// <summary>
+        /// The resolved gate executable (argv[0]).
+        /// </summary>
+        Executable,
+        /// <summary>
+        /// A gate.trust literal path or glob match.
+        /// </summary>
+        TrustEntry,
+        /// <summary>
+        /// The explicit --prices / profile "prices" file.
+        /// </summary>
+        PricesFile,
+        /// <summary>
+        /// A dotnet-tools.json / global.json / NuGet config candidate from the config walk.
+        /// </summary>
+        ConfigWalk,
+        /// <summary>
+        /// A file from the recursive runs-root walk.
+        /// </summary>
+        RunsRootWalk,
+    }
+
+    /// <summary>
     /// Reads each <paramref name="paths"/> entry and hashes its bytes. Entries that exist as a
     /// non-link record <c>"&lt;path&gt;|&lt;sha-or-sentinel&gt;"</c> (their own path is the final
     /// target). Entries that are symlinks resolve to their final target; the target path appears after
@@ -347,6 +385,29 @@ internal static class GateTrust
     }
 
     /// <summary>
+    /// The trust violation for dropping <paramref name="reportPath"/> from a trust comparison, or
+    /// null when the exclusion is allowed. The report path (resolved from the gate's stdout after
+    /// the gate runs) is dropped from the checked list and from the snapshot's keys, so a gate that
+    /// writes its report over a trusted input would otherwise hide the change. The exclusion is
+    /// therefore legal only when the path sits in the trusted set solely as an argv file entry —
+    /// the gate writing its own report file named in its argv. A path that is not in the trusted
+    /// set has nothing to exclude (null); when any other source put it there, the returned message
+    /// names the path and the caller ends the chain with <c>error</c> instead of comparing a set
+    /// the report path no longer takes part in.
+    /// </summary>
+    public static string? ReportPathViolation(string? reportPath, IReadOnlyDictionary<string, HashSet<TrustSource>> sources)
+    {
+        if (reportPath is null || reportPath.Length is 0 || !sources.TryGetValue(reportPath, out HashSet<TrustSource>? from))
+        {
+            return null;
+        }
+
+        return from.Count is 1 && from.Contains(TrustSource.ArgvEntry)
+            ? null
+            : $"the gate's report path is a trusted input: {reportPath}";
+    }
+
+    /// <summary>
     /// One checked path: its value in the new snapshot and whether that value is a bad state
     /// (nonregular or unreadable — the chain treats these as trust violations).
     /// </summary>
@@ -422,14 +483,17 @@ internal static class GateTrust
     /// <c>gate.trust[&lt;i&gt;] '&lt;glob&gt;' matched no files</c> to <paramref name="warnings"/>
     /// when that list is given), and the price book file at
     /// <paramref name="extraPricesFile"/> whenever one is given (even under
-    /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl).
+    /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl). When
+    /// <paramref name="sources"/> is given, every add records its <see cref="TrustSource"/> in it
+    /// (merged across collectors, so a path named twice is trusted from both).
     /// </summary>
     public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
-        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null)
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
+        Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
-        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings);
+        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings, sources);
         HashSet<string> dedupe = new(paths, StringComparer.Ordinal);
-        foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot))
+        foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot, sources))
         {
             if (dedupe.Add(path))
             {
@@ -447,10 +511,13 @@ internal static class GateTrust
     /// for every later hash, so glob matches and argv entries never pick up files the worker or the
     /// gate created later. The glob walk skips the git root's top-level <c>.git</c> directory and
     /// the runs root; a glob that matches no file adds a warning to <paramref name="warnings"/>
-    /// when that list is given.
+    /// when that list is given. When <paramref name="sources"/> is given, every add records its
+    /// <see cref="TrustSource"/> in it — even for a path the per-collector dedupe skips, since the
+    /// report-path rule must see every source a path is trusted from.
     /// </summary>
     public static List<string> CollectChainPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
-        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null)
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
+        Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -464,10 +531,30 @@ internal static class GateTrust
             paths.Add(p);
         }
 
-        AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => Add(p));
-        AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => Add(p));
-        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => Add(p), warnings);
-        AddPricesFile(extraPricesFile, p => Add(p));
+        // Source recording is deliberately independent of the dedupe above: a path named twice (an
+        // argv entry that is also a gate.trust literal) is trusted from both sources, and the
+        // report-path rule needs to see that.
+        void AddTracked(string p, TrustSource source)
+        {
+            Add(p);
+            if (sources is null)
+            {
+                return;
+            }
+
+            if (!sources.TryGetValue(p, out HashSet<TrustSource>? set))
+            {
+                set = [];
+                sources[p] = set;
+            }
+
+            set.Add(source);
+        }
+
+        AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.Executable));
+        AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => AddTracked(p, TrustSource.ArgvEntry));
+        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => AddTracked(p, TrustSource.TrustEntry), warnings);
+        AddPricesFile(extraPricesFile, p => AddTracked(p, TrustSource.PricesFile));
         return paths;
     }
 
@@ -476,9 +563,11 @@ internal static class GateTrust
     /// the config-file walk (working directory up to the git root). These are meant to catch new
     /// files, so they are walked again each time — unlike the fixed chain paths
     /// (<see cref="CollectChainPaths"/>), whose glob matches and argv entries would otherwise pick up
-    /// files the worker or the gate created.
+    /// files the worker or the gate created. When <paramref name="sources"/> is given, every add
+    /// records its <see cref="TrustSource"/> in it (see <see cref="CollectChainPaths"/>).
     /// </summary>
-    public static List<string> CollectVolatilePaths(string runsRoot, string gateWorkingDirectory, string gitRoot)
+    public static List<string> CollectVolatilePaths(string runsRoot, string gateWorkingDirectory, string gitRoot,
+        Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -492,8 +581,25 @@ internal static class GateTrust
             paths.Add(p);
         }
 
-        AddRunsRootFiles(runsRoot, p => Add(p));
-        AddConfigFileWalk(p => Add(p), gateWorkingDirectory, gitRoot);
+        void AddTracked(string p, TrustSource source)
+        {
+            Add(p);
+            if (sources is null)
+            {
+                return;
+            }
+
+            if (!sources.TryGetValue(p, out HashSet<TrustSource>? set))
+            {
+                set = [];
+                sources[p] = set;
+            }
+
+            set.Add(source);
+        }
+
+        AddRunsRootFiles(runsRoot, p => AddTracked(p, TrustSource.RunsRootWalk));
+        AddConfigFileWalk(p => AddTracked(p, TrustSource.ConfigWalk), gateWorkingDirectory, gitRoot);
         return paths;
     }
 

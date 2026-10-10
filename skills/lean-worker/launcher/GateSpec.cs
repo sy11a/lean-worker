@@ -56,6 +56,10 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         }
 
         List<string> command = ReadCommand(gate, gateWorkingDirectory);
+        // The gate's report path cannot be checked against the trusted inputs here: the profile only
+        // carries the reportFromLastLine regex, and the path itself arrives on the gate's stdout at
+        // run time. The trusted-input check for it is therefore run-time only (LaunchRun's trust
+        // checks via GateTrust.ReportPathViolation, after the gate runs and the path is resolved).
         Regex reportFromLastLine = ReadReportRegex(gate);
         string countPath = ReadCountPath(gate);
         int feedbackMaxChars = ReadPositiveInt(gate, "feedbackMaxChars", 8000, "profile gate.feedbackMaxChars");
