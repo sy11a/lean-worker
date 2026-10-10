@@ -2,7 +2,7 @@
   "defaultProfile": "code",
   "profiles": {
     "read": {
-      "model": "claude-haiku-4-5",
+      "model": "haiku",
       "effort": "low",
       "tools": [
         "Read",
@@ -13,7 +13,7 @@
       "maxBudgetUsd": 0.5
     },
     "edit": {
-      "model": "claude-sonnet-5",
+      "model": "sonnet",
       "effort": "low",
       "tools": [
         "Read",
@@ -25,7 +25,7 @@
       "maxBudgetUsd": 1
     },
     "code": {
-      "model": "claude-sonnet-5",
+      "model": "sonnet",
       "effort": "medium",
       "tools": [
         "Read",
@@ -47,7 +47,7 @@
       "maxBudgetUsd": 3
     },
     "research": {
-      "model": "claude-sonnet-5",
+      "model": "sonnet",
       "effort": "medium",
       "tools": [
         "Read",
@@ -61,7 +61,7 @@
       "maxBudgetUsd": 1
     },
     "review": {
-      "model": "claude-sonnet-5",
+      "model": "sonnet",
       "effort": "medium",
       "tools": [
         "Read",

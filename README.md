@@ -271,6 +271,12 @@ price book) with the key from the provider's `keyEnv` variable, or from opencode
 The shipped endpoint verified end to end is z.ai's (`zai-coding-plan`); the others are from the providers'
 documentation.
 
+**Family aliases.** `sonnet`, `opus`, `haiku` and `fable` (optionally with a suffix such as `[1m]`) are passed to
+`claude --model` as they are, so Claude Code runs the newest version of that model and no profile has to be edited
+when a new one ships. The shipped templates use them. Before launch the launcher prices and looks up traits for the
+newest `anthropic/claude-<family>-*` in the price book (a note says which); the run record's `model` is the id the
+API reported, with the alias in `model_requested`. Aliases work only in the claude runtime: opencode needs the id.
+
 ### The price book
 
 `<skill-dir>/launcher/prices.json` ships list prices (USD per million tokens, from models.dev, checked by
@@ -335,7 +341,7 @@ zai-coding-plan (max): 5h 9% (resets in 1h43m), weekly 89% (resets in 2d2h), mcp
 ```
 
 A profile's `model` can be a **chain**, e.g. `["zai-coding-plan/glm-5.3", "deepseek/deepseek-v4-flash",
-"claude-sonnet-5-5"]`. The launcher takes the first model with headroom: a subscription model while every
+"sonnet"]`. The launcher takes the first model with headroom: a subscription model while every
 window is under its `maxPercent` (shipped: 5h 90%, weekly 85%), a metered model always. If the quota
 cannot be read, the model counts as available and the result says so. A subscription run records the
 quota before and after it (`quota:` line; `quota_used_pct` in `runs.jsonl`). When a run fails on a model

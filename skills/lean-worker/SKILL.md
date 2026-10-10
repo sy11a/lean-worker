@@ -126,7 +126,7 @@ Denials are appended to `redirect-denied.log` in the run directory. Other `.lean
 off-limits.
 
 A profile's `model` may be a **chain**, e.g. `["zai-coding-plan/glm-5.3", "deepseek/deepseek-v4-flash",
-"claude-sonnet-5-5"]`. The launcher takes the first model with headroom: a subscription model while
+"sonnet"]`. The launcher takes the first model with headroom: a subscription model while
 its quota windows are under the thresholds in `prices.json`, a metered model always. The result block
 says which model ran and why; do not pick the model yourself unless the user asks.
 

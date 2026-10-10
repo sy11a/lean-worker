@@ -113,7 +113,7 @@ it to one message with at most five questions.
 - Keep the other profiles (`read`, `edit`, `research`, `review`) unless the user wants changes.
   Delete `research` if the user's policy bars web access for agents.
 - Ask whether the user runs other providers (GLM, DeepSeek, MiniMax) or opencode. If so, offer
-  model chains (`"model": ["zai-coding-plan/glm-5.3", "claude-sonnet-5-5"]`) and `"runtime"`; see the
+  model chains (`"model": ["zai-coding-plan/glm-5.3", "sonnet"]`) and `"runtime"`; see the
   README section "Models, prices and subscriptions". Do not change prices unless the user asks.
 - If the project has an obvious extra task class (a slow integration-test suite, a separate
   frontend), propose a profile for it. Add it only if the user agrees.
@@ -129,7 +129,7 @@ Ask the user before running this. It makes one real API call to Haiku with a bud
 From the project root:
 
 ```
-dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/smoke-test/task.md" --model claude-haiku-4-5 --effort low --tools Read --max-budget-usd 0.1
+dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/smoke-test/task.md" --model haiku --effort low --tools Read --max-budget-usd 0.1
 ```
 
 Before running it, create `.lean-worker/inbox/smoke-test/task.md` containing:
