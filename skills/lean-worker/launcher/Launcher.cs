@@ -349,30 +349,54 @@ internal static class Launcher
     }
 
     /// <summary>
-    /// Deletes anything at <paramref name="path"/> (a file, a dangling link, an existing symlink) and
-    /// writes <paramref name="content"/> in its place. A worker can plant a symlink at the run-dir
-    /// writes the launcher owns; <see cref="File.WriteAllTextAsync(string,string,System.Text.Encoding,CancellationToken)"/>
-    /// follows the symlink and ends up writing outside the run directory. Removing the entry first
-    /// makes the write target the regular file the launcher just created.
+    /// Writes <paramref name="content"/> to <paramref name="path"/> so a symlink planted at
+    /// <paramref name="path"/> is replaced, not followed. The bytes go to a randomly named temp file
+    /// in the same directory (an unpredictable name cannot be pre-planted), then a rename moves the
+    /// temp over the path: rename swaps the directory entry, so an entry that is itself a symlink is
+    /// replaced rather than written through. The temp file is deleted when anything fails.
     /// </summary>
     internal static async Task WritePlainAsync(string path, string content)
     {
-        try { File.Delete(path); }
-        catch (Exception ex) when (ex is DirectoryNotFoundException or IOException or UnauthorizedAccessException) { }
-
-        await File.WriteAllTextAsync(path, content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        string temp = TempSibling(path);
+        try
+        {
+            await File.WriteAllTextAsync(temp, content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            try { File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
     }
 
     /// <summary>
     /// Opens <paramref name="path"/> for writing like <c>new StreamWriter(path, append: false, encoding)</c>,
-    /// but after removing any entry already at <paramref name="path"/>. See
-    /// <see cref="WritePlainAsync"/> for the rationale (a planted symlink must not be followed).
+    /// but never follows a symlink planted at <paramref name="path"/>: the handle is created on a randomly
+    /// named temp file in the same directory and the temp is renamed over the path while the handle is open,
+    /// so the writer keeps writing the file the path now names (rename replaces the entry; the open handle
+    /// follows the inode). See <see cref="WritePlainAsync"/> for the rationale. The temp file is deleted
+    /// when the rename fails.
     /// </summary>
     internal static StreamWriter CreateWriter(string path, System.Text.Encoding encoding)
     {
-        try { File.Delete(path); }
-        catch (Exception ex) when (ex is DirectoryNotFoundException or IOException or UnauthorizedAccessException) { }
+        string temp = TempSibling(path);
+        FileStream fs = new(temp, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        try
+        {
+            File.Move(temp, path, overwrite: true);
+        }
+        catch
+        {
+            fs.Dispose();
+            try { File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
 
-        return new StreamWriter(path, append: false, encoding);
+        return new StreamWriter(fs, encoding);
     }
+
+    private static string TempSibling(string path) =>
+        Path.Combine(Path.GetDirectoryName(path) ?? ".", ".tmp-" + Guid.NewGuid().ToString("N"));
 }

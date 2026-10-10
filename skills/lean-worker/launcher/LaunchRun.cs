@@ -194,9 +194,14 @@ internal sealed class LaunchRun
         ResolveHookSettings();
     }
 
+    // The explicit --prices / profile "prices" path (null = the default <runs-root>/prices.json, which the
+    // trust walk already covers); hashed with the trusted set when it lies outside the runs root.
+    private string? _pricesFile;
+
     private void ResolvePriceBookAndChain()
     {
-        _prices = PriceBook.Load(_runsRoot, _o.PricesFile ?? Json.Str(_profile, "prices"));
+        _pricesFile = _o.PricesFile ?? Json.Str(_profile, "prices");
+        _prices = PriceBook.Load(_runsRoot, _pricesFile);
         _notes = [.. _prices.Warnings];
         // An explicit runtime holds for every model in the chain; otherwise each model gets the runtime its provider allows.
         _explicitRuntime = _o.Runtime ?? Json.Str(_profile, "runtime");
@@ -692,7 +697,7 @@ internal sealed class LaunchRun
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
-        return GateTrust.CollectPaths(_runsRoot, root, cwd, gate.Command);
+        return GateTrust.CollectPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile);
     }
 
     private string Status()
