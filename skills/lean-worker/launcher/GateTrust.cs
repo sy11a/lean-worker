@@ -838,10 +838,12 @@ internal static class GateTrust
     /// blinded by the exclusion, never sees the swap. A path is runnable when it is
     ///   - the resolved executable (argv[0]: found on PATH when the entry has no directory part, else
     ///     resolved against the gate working directory); or
-    ///   - an existing-file argv entry before the first non-file argument — the prefix an interpreter
-    ///     such as <c>sh</c>, <c>bash</c>, <c>dotnet</c> or <c>python</c> consumes as the script(s) it
-    ///     runs (<c>dotnet-lock.sh</c> in <c>sh dotnet-lock.sh dotnet build ...</c>), so every
-    ///     existing-file argv entry up to that argument is treated as runnable; or
+    ///   - argv[1] only, when it is an existing file — the script an interpreter such as <c>sh</c>,
+    ///     <c>bash</c>, <c>dotnet</c> or <c>python</c> consumes as the thing it runs
+    ///     (<c>dotnet-lock.sh</c> in <c>sh dotnet-lock.sh dotnet build ...</c>); later file arguments
+    ///     are data the command reads or writes, not scripts, so they are not runnable by this rule
+    ///     (an output file named after the script, e.g. <c>report.out</c> in <c>sh gate.sh report.out</c>
+    ///     with a pre-existing <c>report.out</c>, stays excludable); or
     ///   - any argv file entry with an execute bit (File.GetUnixFileMode: user, group or other) —
     ///     a file the command could execute no matter where it sits in the argv.
     /// Everything is evaluated when the fixed trust list is collected (round 1, before the worker):
@@ -858,9 +860,6 @@ internal static class GateTrust
             runnable.Add(exe);
         }
 
-        // True until the first argv entry that is not an existing file; from there on the interpreter
-        // prefix is over and only the execute-bit rule can still mark an entry runnable.
-        bool runnablePrefix = true;
         for (int i = 1; i < gateCommand.Count; i++)
         {
             string entry = gateCommand[i];
@@ -878,18 +877,16 @@ internal static class GateTrust
             }
             catch (ArgumentException)
             {
-                // Not resolvable, hence not an existing file: the runnable prefix ends here.
-                runnablePrefix = false;
+                // Not resolvable, hence not an existing file: only the execute-bit rule could apply.
                 continue;
             }
 
             if (!File.Exists(full))
             {
-                runnablePrefix = false;
                 continue;
             }
 
-            if (runnablePrefix)
+            if (i is 1)
             {
                 runnable.Add(full);
             }

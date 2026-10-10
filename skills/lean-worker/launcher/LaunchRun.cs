@@ -728,8 +728,8 @@ internal sealed class LaunchRun
     /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
     /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
     /// once, before round 1's worker, so glob matches and argv entries never pick up files the
-    /// worker or the gate create later. The gate's runnable inputs (executable, interpreter-consumed
-    /// argv prefix, execute-bit argv entries) are decided in the same pass — see
+    /// worker or the gate create later. The gate's runnable inputs (executable, the interpreter's
+    /// argv[1] script when it exists, execute-bit argv entries) are decided in the same pass — see
     /// <see cref="GateTrust.MarkRunnableArgv"/> — so the report-path rule never depends on what the
     /// gate did. A gate.trust glob that matched no file becomes a warning on the gate spec (recorded
     /// in gate.json) and a note in the result block.
