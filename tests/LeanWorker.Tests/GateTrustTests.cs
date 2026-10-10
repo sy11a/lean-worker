@@ -22,6 +22,37 @@ public sealed class GateTrustTests : IDisposable
     private static Dictionary<string, HashSet<GateTrust.TrustSource>> SourcesOf(string path, GateTrust.TrustSource source) =>
         new(StringComparer.Ordinal) { [path] = [source] };
 
+    // The paths whose trust state differs between two snapshots, the way the chain checks them: the
+    // path sets first, then the first hashed entry that differs.
+    private static async Task<List<string>> ChangedAsync(GateTrust.Snapshot before, GateTrust.Snapshot after)
+    {
+        List<string> paths = [.. after.Hashes.Keys];
+        List<string> setDiff = GateTrust.SetDifferences(before, paths);
+        if (setDiff.Count > 0)
+        {
+            return setDiff;
+        }
+
+        GateTrust.TrustDiff? diff = await GateTrust.FirstDiffAsync(before, paths);
+        return diff is null ? [] : [diff.Path];
+    }
+
+    // The fixed chain paths plus the volatile walks: the whole trust set as one list.
+    private static List<string> CollectPaths(string runsRoot, string gitRoot, string work, IReadOnlyList<string> command,
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
+    {
+        List<string> paths = GateTrust.CollectChainPaths(runsRoot, gitRoot, work, command, extraTrust, extraPricesFile);
+        foreach (string p in GateTrust.CollectVolatilePaths(runsRoot, work, gitRoot))
+        {
+            if (!paths.Contains(p, StringComparer.Ordinal))
+            {
+                paths.Add(p);
+            }
+        }
+
+        return paths;
+    }
+
     [Fact]
     public void A_report_path_outside_the_trusted_set_is_no_violation() =>
         Assert.Null(GateTrust.ReportPathViolation("/r/report.sarif", SourcesOf("/r/other", GateTrust.TrustSource.ArgvEntry)));
@@ -77,7 +108,7 @@ public sealed class GateTrustTests : IDisposable
         await File.WriteAllTextAsync(path, "same", TestContext.Current.CancellationToken);
         GateTrust.Snapshot before = await GateTrust.HashAsync([path]);
         GateTrust.Snapshot after = await GateTrust.HashAsync([path]);
-        Assert.Empty(GateTrust.Changed(before, after));
+        Assert.Empty(await ChangedAsync(before, after));
     }
 
     [Fact]
@@ -89,7 +120,7 @@ public sealed class GateTrustTests : IDisposable
         GateTrust.Snapshot before = await GateTrust.HashAsync([path]);
         await File.WriteAllTextAsync(path, "after", TestContext.Current.CancellationToken);
         GateTrust.Snapshot after = await GateTrust.HashAsync([path]);
-        Assert.Equal([path], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([path], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -100,7 +131,7 @@ public sealed class GateTrustTests : IDisposable
         GateTrust.Snapshot before = await GateTrust.HashAsync([path]);
         await File.WriteAllTextAsync(path, "new", TestContext.Current.CancellationToken);
         GateTrust.Snapshot after = await GateTrust.HashAsync([path]);
-        Assert.Equal([path], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([path], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -112,7 +143,7 @@ public sealed class GateTrustTests : IDisposable
         GateTrust.Snapshot before = await GateTrust.HashAsync([path]);
         File.Delete(path);
         GateTrust.Snapshot after = await GateTrust.HashAsync([path]);
-        Assert.Equal([path], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([path], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -182,7 +213,7 @@ public sealed class GateTrustTests : IDisposable
 
         Assert.StartsWith(targetA + "|", before.Hashes[link], StringComparison.Ordinal);
         Assert.StartsWith(targetB + "|", after.Hashes[link], StringComparison.Ordinal);
-        Assert.Equal([link], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([link], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -201,7 +232,7 @@ public sealed class GateTrustTests : IDisposable
         _ = File.CreateSymbolicLink(link, targetB);
         GateTrust.Snapshot after = await GateTrust.HashAsync([link]);
 
-        Assert.Equal([link], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([link], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -254,7 +285,7 @@ public sealed class GateTrustTests : IDisposable
         {
             GateTrust.Snapshot after = await GateTrust.HashAsync([path]);
             Assert.StartsWith(path + "|unreadable", after.Hashes[path], StringComparison.Ordinal);
-            Assert.Equal([path], GateTrust.Changed(before, after), StringComparer.Ordinal);
+            Assert.Equal([path], await ChangedAsync(before, after), StringComparer.Ordinal);
         }
         finally
         {
@@ -331,7 +362,7 @@ public sealed class GateTrustTests : IDisposable
         await File.WriteAllTextAsync(missing, "now here", TestContext.Current.CancellationToken);
         GateTrust.Snapshot after = await HashBoundedAsync(link);
 
-        Assert.Equal([link], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([link], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -361,7 +392,7 @@ public sealed class GateTrustTests : IDisposable
         string script = Path.Combine(scriptDir, "gate.sh");
         await File.WriteAllTextAsync(script, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
 
-        List<string> paths = GateTrust.CollectPaths(runsRoot, workDir, workDir, ["sh", Path.Combine("sub", "gate.sh")]);
+        List<string> paths = CollectPaths(runsRoot, workDir, workDir, ["sh", Path.Combine("sub", "gate.sh")]);
 
         Assert.Contains(script, paths, StringComparer.Ordinal);
     }
@@ -380,7 +411,7 @@ public sealed class GateTrustTests : IDisposable
         string work = Path.Combine(middle, "b");
         Directory.CreateDirectory(work);
 
-        List<string> paths = GateTrust.CollectPaths(NewDir(), gitRoot, work, ["sh"]);
+        List<string> paths = CollectPaths(NewDir(), gitRoot, work, ["sh"]);
 
         Assert.Contains(Path.Combine(work, relative), paths, StringComparer.Ordinal);
         Assert.Contains(Path.Combine(middle, relative), paths, StringComparer.Ordinal);
@@ -398,14 +429,14 @@ public sealed class GateTrustTests : IDisposable
         Assert.NotNull(exe);
 
         string work = NewDir();
-        List<string> paths = GateTrust.CollectPaths(NewDir(), work, work, [name]);
+        List<string> paths = CollectPaths(NewDir(), work, work, [name]);
         Assert.Contains(exe, paths, StringComparer.Ordinal);
 
         GateTrust.Snapshot before = await GateTrust.HashAsync(paths);
         await File.WriteAllTextAsync(exe, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
         GateTrust.Snapshot after = await GateTrust.HashAsync(paths);
 
-        Assert.Equal([exe], GateTrust.Changed(before, after), StringComparer.Ordinal);
+        Assert.Equal([exe], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -419,7 +450,7 @@ public sealed class GateTrustTests : IDisposable
         File.WriteAllText(props, "<Project/>");
         File.WriteAllText(text, "text");
 
-        List<string> paths = GateTrust.CollectPaths(NewDir(), gitRoot, gitRoot, ["sh"], ["Directory.Build.props", "src/**/*.props"]);
+        List<string> paths = CollectPaths(NewDir(), gitRoot, gitRoot, ["sh"], ["Directory.Build.props", "src/**/*.props"]);
 
         Assert.Contains(Path.Combine(gitRoot, "Directory.Build.props"), paths, StringComparer.Ordinal);
         Assert.Contains(props, paths, StringComparer.Ordinal);
@@ -432,7 +463,7 @@ public sealed class GateTrustTests : IDisposable
         string gitRoot = NewDir();
         File.WriteAllText(Path.Combine(gitRoot, "Directory.Build.props"), "<Project/>");
 
-        List<string> paths = GateTrust.CollectPaths(NewDir(), gitRoot, gitRoot, ["sh"], ["other.props"]);
+        List<string> paths = CollectPaths(NewDir(), gitRoot, gitRoot, ["sh"], ["other.props"]);
 
         Assert.DoesNotContain(Path.Combine(gitRoot, "Directory.Build.props"), paths, StringComparer.Ordinal);
     }
@@ -447,8 +478,8 @@ public sealed class GateTrustTests : IDisposable
         File.WriteAllText(inside, "{}");
         string work = NewDir();
 
-        List<string> withOutside = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: outside);
-        List<string> withInside = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: inside);
+        List<string> withOutside = CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: outside);
+        List<string> withInside = CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: inside);
 
         Assert.Contains(outside, withOutside, StringComparer.Ordinal);
         Assert.Equal(1, withInside.Count(p => p == inside));
@@ -467,8 +498,8 @@ public sealed class GateTrustTests : IDisposable
         }
 
         string work = NewDir();
-        List<string> inInbox = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: inboxPrices);
-        List<string> walked = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: walkedPrices);
+        List<string> inInbox = CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: inboxPrices);
+        List<string> walked = CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: walkedPrices);
 
         Assert.Equal(1, inInbox.Count(p => p == inboxPrices));
         Assert.Equal(1, walked.Count(p => p == walkedPrices));
@@ -493,7 +524,7 @@ public sealed class GateTrustTests : IDisposable
         }
 
         string work = NewDir();
-        List<string> paths = GateTrust.CollectPaths(runsRoot, work, work, ["sh"]);
+        List<string> paths = CollectPaths(runsRoot, work, work, ["sh"]);
 
         foreach (string file in kept)
         {

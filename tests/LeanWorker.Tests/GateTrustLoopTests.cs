@@ -381,8 +381,8 @@ public sealed class GateTrustLoopTests : IDisposable
     }
 
     // ---- a gate script inside the repository, plain (`sh gate.sh`) or behind a wrapper (`env X=1 sh gate.sh`) --
-    // An argv file entry counts as trusted only under the git root (or the working directory), so these
-    // tests keep the script in the working directory instead of the scratch directory.
+    // These tests keep the script in the working directory; the scratch-directory script is covered by the
+    // "outside the git root" tests below.
 
     private async Task<Setup> NewRepoScriptSetupAsync(bool wrapped) =>
         await NewSetupAsync(gate => gate["command"] = wrapped ? new JsonArray(["env", "X=1", "sh", "gate.sh"]) : new JsonArray(["sh", "gate.sh"]));
@@ -547,6 +547,108 @@ public sealed class GateTrustLoopTests : IDisposable
         (int code, string stdout) = await RunAsync(setup, "true");
 
         AssertClean(setup, code, stdout);
+    }
+
+    // A gate that rewrites its declared output (argv[2], also named in gate.outputs) on every round: round 1
+    // finds 3, round 2 finds none. The report is the output itself.
+    private const string RewritingGateScript =
+        "#!/bin/sh\nD=\"$(dirname \"$0\")\"\ntouch \"$D/gate-ran\"\nN=$(cat \"$D/n\" 2>/dev/null || echo 0); N=$((N+1)); echo $N > \"$D/n\"\n" +
+        "mkdir -p out\nif [ $N = 1 ]; then printf '{\"runs\":[{\"results\":[1,2,3]}]}' > \"$1\"; echo \"sarif: $1\"; exit 1; fi\n" +
+        "printf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n";
+
+    private async Task<(Setup Setup, int Code, string Stdout)> RunRewritingGateAsync(string workerShell)
+    {
+        Setup setup = await NewSetupAsync(
+            gate =>
+            {
+                gate["outputs"] = new JsonArray(["out/report.sarif"]);
+                gate["command"]!.AsArray().Add("out/report.sarif");
+            },
+            RewritingGateScript);
+        string counter = Path.Combine(Path.GetDirectoryName(setup.Script)!, "w");
+        string worker = "N=$(cat '" + counter + "' 2>/dev/null || echo 0); N=$((N+1)); echo $N > '" + counter + "'\n" + workerShell;
+
+        (int code, string stdout) = await RunAsync(setup, worker, () => WriteOldReport());
+        return (setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_pre_existing_declared_argv_output_the_worker_leaves_alone_survives_into_round_twoAsync()
+    {
+        (Setup setup, int code, string stdout) = await RunRewritingGateAsync("true");
+
+        Assert.True(code is 0, stdout);
+        Assert.True(File.Exists(setup.Marker), "the gate should have run");
+        Assert.Contains("gate:     clean after 2 round(s), findings 3→0", stdout, StringComparison.Ordinal);
+        Assert.Equal(2, GateLoopTests.RunDirNames(setup.Root).Length);
+    }
+
+    [Fact]
+    public async Task A_worker_that_edits_a_declared_argv_output_in_round_two_trips_the_trust_checkAsync()
+    {
+        (Setup setup, int code, string stdout) = await RunRewritingGateAsync("if [ $N = 2 ]; then printf 'tampered' > out/report.sarif; fi");
+
+        Assert.Equal(5, code);
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("report.sarif", stdout, StringComparison.Ordinal);
+        string[] names = GateLoopTests.RunDirNames(setup.Root);
+        Assert.Equal(2, names.Length);
+        JsonObject gate = RunAsyncGolden.Summary(Path.Combine(setup.Root, "runs", names[1]))["gate"]!.AsObject();
+        Assert.Equal(2, gate["round"]!.GetValue<int>());
+        Assert.Equal("error", gate["decision"]!.GetValue<string>());
+    }
+
+    // ---- an argv file outside the git root is trusted like argv[0] ------------------------------------------
+
+    [Fact]
+    public async Task A_worker_that_edits_a_gate_script_outside_the_git_root_trips_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        (int code, string stdout) = await RunAsync(setup, "printf '#!/bin/sh\\nexit 0\\n' > '" + setup.Script + "'");
+
+        AssertViolation(setup, code, stdout, setup.Script);
+    }
+
+    [Fact]
+    public async Task A_gate_script_outside_the_git_root_that_the_worker_leaves_alone_is_cleanAsync()
+    {
+        Setup setup = await NewSetupAsync();
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    // ---- a report path is normalised before the run-directory and trusted-source checks ------------------------
+
+    [Fact]
+    public async Task A_report_path_that_reaches_a_trusted_file_through_dotdot_ends_in_errorAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        await GateLoopTests.WriteExecutableAsync(
+            setup.Script,
+            "#!/bin/sh\ntouch '" + setup.Marker + "'\nfor d in '" + setup.Root + "'/runs/*/; do D=\"${d%/}\"; done\n" +
+            "echo \"sarif: $D/../../profiles.json\"\nexit 3\n");
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        await AssertReportPathViolationAsync(code, stdout, Path.GetFullPath(Path.Combine(setup.Root, "profiles.json")));
+    }
+
+    // ---- gate.trust literals ------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_gate_trust_literal_that_names_a_directory_stops_the_launch_naming_the_entryAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["other.props", "tools"]));
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
+            setup, "touch '" + workerMarker + "'", () => Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), "tools"))));
+
+        Assert.Contains("gate.trust[1]", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
     }
 
     // ---- gate.outputs validated against the trusted inputs -------------------------------------------------
@@ -813,16 +915,8 @@ public sealed class GateTrustLoopTests : IDisposable
         {
             (int code, string stdout) = await RunAsync(setup, "true");
 
-            Assert.NotEqual(2, code);
-            Assert.True(code is 0 or 5, stdout);
-            if (code is 0)
-            {
-                Assert.True(File.Exists(setup.Marker), "the gate should have run");
-            }
-            else
-            {
-                Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
-            }
+            Assert.True(code is 0, stdout);
+            Assert.True(File.Exists(setup.Marker), "the gate should have run");
         }
         finally
         {
@@ -850,16 +944,8 @@ public sealed class GateTrustLoopTests : IDisposable
                 File.SetUnixFileMode(locked, UnixFileMode.None);
             });
 
-            Assert.NotEqual(2, code);
-            Assert.True(code is 0 or 5, stdout);
-            if (code is 0)
-            {
-                Assert.True(File.Exists(setup.Marker), "the gate should have run");
-            }
-            else
-            {
-                Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
-            }
+            Assert.True(code is 0, stdout);
+            Assert.True(File.Exists(setup.Marker), "the gate should have run");
         }
         finally
         {
