@@ -82,7 +82,13 @@ internal sealed class LaunchRun
     // Status
     private string _status = string.Empty;
 
-    // Gate chain (round 1 has no GateContext; round N+1 builds it from round N's GateOutcome)
+    // Gate chain (round 1 has no GateContext; round N+1 builds it from round N's GateOutcome).
+    /// <summary>
+    /// The chain loop reads <c>LastGate</c> to decide whether to start the next round; the rest are the chain
+    /// state at this round (chain id, round number, all counts so far, summed worker cost, original task text
+    /// and name, and the round-1 GateSpec propagated to later rounds). All are null/empty/zero for the first
+    /// round until the gate runs.
+    /// </summary>
     public GateContext? GateContext { get; }
     public Gate.GateResult? GateResult { get; private set; }
     public GateOutcome? LastGate { get; private set; }
@@ -92,6 +98,11 @@ internal sealed class LaunchRun
     public decimal ChainCostUsd { get; private set; }
     public string OriginalTask { get; private set; } = string.Empty;
     public string OriginalName { get; private set; } = string.Empty;
+    public GateSpec? InitialGateSpec { get; private set; }
+
+    // Trust-boundary snapshot of the files the gate treats as trusted inputs; compared against a second
+    // hash in RunGateAsync so a worker that changed one of them between rounds is caught.
+    private GateTrust.Snapshot? _gateTrustBefore;
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -115,13 +126,8 @@ internal sealed class LaunchRun
         ChainId = gateContext?.ChainId ?? string.Empty;
         OriginalTask = gateContext?.OriginalTask ?? string.Empty;
         OriginalName = gateContext?.OriginalName ?? string.Empty;
+        InitialGateSpec = gateContext?.Spec;
     }
-
-    /// <summary>
-    /// The chain loop reads <c>LastGate</c> to decide whether to start the next round; the rest are the chain
-    /// state at this round (chain id, round number, all counts so far, summed worker cost, original task text
-    /// and name). All are null/empty/zero for the first round until the gate runs.
-    /// </summary>
 
     public async Task<int> RunAsync()
     {
@@ -248,41 +254,50 @@ internal sealed class LaunchRun
 
     private void ResolveGate()
     {
-        if (_o.NoGate)
+        // Round N+1: use the round-1 spec the launcher passed in. The worker cannot change the gate's
+        // command for the next round, so we never re-read profiles.json here.
+        GateSpec spec;
+        if (InitialGateSpec is not null)
         {
-            return;
+            spec = InitialGateSpec;
         }
-
-        GateSpec? spec = GateSpec.FromProfile(_profile);
-        if (spec is null)
+        else
         {
-            if (_o.GateMaxRounds is not null)
+            if (_o.NoGate)
             {
-                throw new LaunchException("--gate-max-rounds needs a profile with a gate");
+                return;
             }
 
-            return;
-        }
-
-        if (_o.GateMaxRounds is { } rounds)
-        {
-            if (rounds <= 0)
+            GateSpec? fromProfile = GateSpec.FromProfile(_profile);
+            if (fromProfile is null)
             {
-                throw new LaunchException("--gate-max-rounds must be a positive integer");
+                if (_o.GateMaxRounds is not null)
+                {
+                    throw new LaunchException("--gate-max-rounds needs a profile with a gate");
+                }
+
+                return;
             }
 
-            spec = spec with { MaxRounds = rounds };
+            spec = fromProfile;
+            if (_o.GateMaxRounds is { } rounds)
+            {
+                if (rounds <= 0)
+                {
+                    throw new LaunchException("--gate-max-rounds must be a positive integer");
+                }
+
+                spec = spec with { MaxRounds = rounds };
+            }
         }
 
         _gate = spec with { MaxTotalUsd = spec.MaxTotalUsd ?? (3m * _budget) };
+        InitialGateSpec = _gate;
         NoteGate(_gate);
     }
 
-    // Records the resolved gate in the run notes (the gate runner itself is wired up by a later task),
-    // and references Gate so the analyzer counts the runner type as used (MA0182, IDE0052).
     private void NoteGate(GateSpec? spec)
     {
-        _ = typeof(Gate);
         if (spec is null)
         {
             return;
@@ -533,8 +548,8 @@ internal sealed class LaunchRun
         RunDir = Path.Combine(_runsRoot, "runs", string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"));
         if (GateContext is null)
         {
-            // Round 1 anchors the chain; later rounds inherit round 1's run dir as their chain id.
-            ChainId = RunDir;
+            // Round 1 anchors the chain; later rounds inherit round 1's run-dir name as their chain id.
+            ChainId = Path.GetFileName(RunDir);
         }
         _ = Directory.CreateDirectory(RunDir);
         await File.WriteAllTextAsync(Path.Combine(RunDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
@@ -618,18 +633,12 @@ internal sealed class LaunchRun
         bool capKilled;
         try
         {
+            await SnapshotGateTrustAsync().ConfigureAwait(false);
+
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
-            {
-                if (Json.TryParseObject(line) is not { } obj)
-                {
-                    return false;
-                }
-
-                Usage? u = runtime.Parse(obj, outcome);
-                return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
-            }).ConfigureAwait(false);
+                OnWorkerLine(line, runtime, outcome, meter, model)).ConfigureAwait(false);
         }
         finally
         {
@@ -652,6 +661,38 @@ internal sealed class LaunchRun
             catch (Exception ex) when (Quota.IsReadFailure(ex)) { _notes.Add($"quota re-read failed: {ex.Message}"); }
         }
         _quotaAfter = quotaAfter;
+    }
+
+    private static bool OnWorkerLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model)
+    {
+        if (Json.TryParseObject(line) is not { } obj)
+        {
+            return false;
+        }
+
+        Usage? u = runtime.Parse(obj, outcome);
+        return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
+    }
+
+    private async Task SnapshotGateTrustAsync()
+    {
+        if (_gate is null)
+        {
+            return;
+        }
+
+        // Hash the trusted files before the worker runs. RunGateAsync hashes them again and refuses the
+        // gate if anything changed (a worker could otherwise swap the gate command or its report path).
+        _gateTrustBefore = GateTrust.Hash(await CollectGateTrustPathsAsync().ConfigureAwait(false));
+    }
+
+    private async Task<List<string>> CollectGateTrustPathsAsync()
+    {
+        GateSpec gate = NonNull(_gate);
+        string cwd = Directory.GetCurrentDirectory();
+        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
+        string root = gitRoot ?? cwd;
+        return GateTrust.CollectPaths(_runsRoot, root, gate.Command);
     }
 
     private string Status()
@@ -701,6 +742,19 @@ internal sealed class LaunchRun
             return;
         }
 
+        // Trust boundary: hash the gate's trusted inputs again and refuse the gate if anything differs
+        // from the snapshot taken before the worker ran.
+        if (_gateTrustBefore is not null)
+        {
+            GateTrust.Snapshot after = GateTrust.Hash(await CollectGateTrustPathsAsync().ConfigureAwait(false));
+            List<string> changed = GateTrust.Changed(_gateTrustBefore, after);
+            if (changed.Count > 0)
+            {
+                await FinishTrustViolationAsync(changed).ConfigureAwait(false);
+                return;
+            }
+        }
+
         Gate.GateResult result = await Gate.RunAsync(_gate, RunDir, CancellationToken.None).ConfigureAwait(false);
         GateResult = result;
 
@@ -719,6 +773,24 @@ internal sealed class LaunchRun
         Counts = countsIncludingThis;
         ChainCostUsd = chainCostIncludingThis;
         LastGate = new GateOutcome(decision, result, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason);
+    }
+
+    private async Task FinishTrustViolationAsync(List<string> changed)
+    {
+        GateSpec gate = NonNull(_gate);
+        string message = $"the worker changed files the gate trusts: {string.Join(", ", changed)}";
+        Gate.GateResult result = await Gate.WriteFailureAsync(RunDir, gate, message).ConfigureAwait(false);
+        GateResult = result;
+
+        List<int> countsIncludingThis = GateContext is null
+            ? [result.Count ?? 0]
+            : [.. GateContext.Counts, result.Count ?? 0];
+        decimal chainCostIncludingThis = ChainCostUsd + NonNull(_meter).Spent;
+
+        // The decision is forced to "error"; no StuckReason (StuckReason is only set when decision == Stuck).
+        Counts = countsIncludingThis;
+        ChainCostUsd = chainCostIncludingThis;
+        LastGate = new GateOutcome(GateChain.Error, result, RunDir, countsIncludingThis, chainCostIncludingThis, StuckReason: null);
     }
 
     private async Task ComputeSummaryStatsAsync()
@@ -788,7 +860,7 @@ internal sealed class LaunchRun
             ["wrap_up_usd"] = _wrapUp ? _budget * _wrapUpAt : null,
             ["wrapped_up"] = meter.WrappedUp,
             ["hook_checks"] = _hookChecks,
-            ["continued_from"] = _o.ContinueFrom is null ? null : Path.GetFullPath(_o.ContinueFrom),
+            ["continued_from"] = _o.ContinueFrom is not null && GateContext is null ? Path.GetFullPath(_o.ContinueFrom) : null,
             ["escalate_to"] = _next,
             ["gate"] = BuildGateSection(),
             ["model_traits"] = _traits?.Key,

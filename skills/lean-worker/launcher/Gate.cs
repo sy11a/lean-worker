@@ -6,18 +6,25 @@
 // Outcomes:
 //   "clean"    — exit 0, no findings (count 0, or the report's count path resolved to an empty array).
 //   "findings" — exit 1 with a non-empty findings array on the configured count path of the report.
-//   "error"    — any other condition (start failure, timeout, unexpected exit code, missing or malformed
-//                report file, mis-wired count path, zero findings on exit 1).
+//   "error"    — any other condition (start failure, timeout, cancellation, unexpected exit code, missing
+//                or malformed report file, mis-wired count path, zero findings on exit 1, the worker
+//                having changed files the gate trusts).
 //
 // Gate chain: a chain is a sequence of runs of one task. Round 1 is the user's run. After a successful worker
 // run the launcher runs the gate; "clean" / "error" end the chain, "findings" continue unless the chain is
 // stuck (no decrease in two consecutive rounds, the round reached MaxRounds, or the summed worker cost
 // exceeded MaxTotalUsd). GateChain.Decide captures the pure decision logic so it can be tested without
 // processes.
+//
+// Trust boundary: the gate's environment is built from an allowlist (a default set + the profile's
+// `gate.env`), not inherited from the launcher. Names that pass the gate's filter are recorded as
+// `env_names` in gate.json (sorted, never the values) so the run's record shows exactly which
+// variables reached the gate.
 
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -30,31 +37,42 @@ internal static class Gate
     /// </summary>
     internal sealed record GateResult(string Outcome, int ExitCode, int? Count, string? ReportPath, string Feedback, string? Error, TimeSpan Duration);
 
+    private sealed class StdoutBuffer
+    {
+        public readonly object Lock = new();
+        public readonly StringBuilder Text = new();
+        public string? LastNonEmptyLine;
+    }
+
+    private readonly record struct WaitResult(bool TimedOut, bool Cancelled, int ExitCode);
+
     public static async Task<GateResult> RunAsync(GateSpec spec, string runDir, CancellationToken token)
     {
         DateTimeOffset started = DateTimeOffset.Now;
         string logPath = Path.Combine(runDir, "gate.log");
         string gateJsonPath = Path.Combine(runDir, "gate.json");
         string cwd = Directory.GetCurrentDirectory();
-        List<string> stdoutLines = [];
+        StdoutBuffer stdout = new();
+        List<string> envNames = [];
 
-        ProcessStartInfo psi = BuildStartInfo(spec, cwd);
+        ProcessStartInfo psi = BuildStartInfo(spec, cwd, envNames);
 
-        Process? process;
+        Process? childProcess;
         try
         {
-            process = Process.Start(psi);
+            childProcess = Process.Start(psi);
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException or IOException or PlatformNotSupportedException)
         {
-            return BuildStartFailureResult(ex.Message, started, gateJsonPath, spec);
+            return await BuildStartFailureResultAsync(ex.Message, started, gateJsonPath, spec, envNames).ConfigureAwait(false);
         }
 
-        if (process is null)
+        if (childProcess is null)
         {
-            return BuildStartFailureResult("could not start gate", started, gateJsonPath, spec);
+            return await BuildStartFailureResultAsync("could not start gate", started, gateJsonPath, spec, envNames).ConfigureAwait(false);
         }
 
+        Process process = childProcess;
         using (process)
         {
             try
@@ -63,7 +81,7 @@ internal static class Gate
             }
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException) { }
 
-            return await DriveProcessAsync(process, spec, logPath, gateJsonPath, started, cwd, stdoutLines, token).ConfigureAwait(false);
+            return await DriveProcessAsync(process, spec, logPath, gateJsonPath, started, cwd, stdout, envNames, token).ConfigureAwait(false);
         }
     }
 
@@ -126,7 +144,7 @@ internal static class Gate
         return cur;
     }
 
-    private static ProcessStartInfo BuildStartInfo(GateSpec spec, string cwd)
+    private static ProcessStartInfo BuildStartInfo(GateSpec spec, string cwd, List<string> envNames)
     {
         List<string> cmd = spec.Command;
         string first = cmd[0];
@@ -151,45 +169,146 @@ internal static class Gate
             psi.ArgumentList.Add(cmd[i]);
         }
 
-        // The launcher's own environment: omit nothing, override nothing — ProcessStartInfo inherits the
-        // current process's env block when UseShellExecute is false and no Environment entries are added.
-        _ = psi.Environment;
+        // Minimal environment: only the allow-listed names reach the gate (no API keys, no provider creds
+        // unless explicitly listed). The names that pass the filter are also recorded for gate.json.
+        psi.Environment.Clear();
+        List<EnvPattern> patterns = BuildEnvPatterns(spec.Env);
+        foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
+        {
+            string key = (string)e.Key;
+            if (e.Value is not string value || !MatchesAny(patterns, key))
+            {
+                continue;
+            }
+
+            psi.Environment[key] = value;
+            envNames.Add(key);
+        }
+
+        envNames.Sort(StringComparer.Ordinal);
         return psi;
     }
 
-    private static GateResult BuildStartFailureResult(string message, DateTimeOffset started, string gateJsonPath, GateSpec spec)
+    /// <summary>
+    /// The patterns the gate's environment filter accepts: the built-in defaults plus the profile's
+    /// <c>gate.env</c> entries. A pattern with no trailing <c>*</c> matches exactly; one ending in
+    /// <c>*</c> matches any name that starts with the prefix before the star.
+    /// </summary>
+    private static List<EnvPattern> BuildEnvPatterns(IReadOnlyList<string> extra)
     {
-        GateResult startFailure = new(Outcome: "error", ExitCode: -1, Count: 0, ReportPath: null, Feedback: string.Empty, Error: message, Duration: DateTimeOffset.Now - started);
-        _ = WriteGateJsonAsync(gateJsonPath, startFailure, spec);
+        string[] builtIn =
+        [
+            "PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TERM",
+            "LC_*", "DOTNET_*", "NUGET_PACKAGES", "NUGET_*", "NuGetPackageSourceCredentials_*", "MSBUILD*",
+        ];
+        List<EnvPattern> patterns = new(builtIn.Length + extra.Count);
+        foreach (string p in builtIn)
+        {
+            patterns.Add(new EnvPattern(p));
+        }
+
+        foreach (string p in extra)
+        {
+            patterns.Add(new EnvPattern(p));
+        }
+
+        return patterns;
+    }
+
+    private static bool MatchesAny(List<EnvPattern> patterns, string name)
+    {
+        foreach (EnvPattern p in patterns)
+        {
+            if (p.Matches(name))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private readonly record struct EnvPattern(string Raw)
+    {
+        public bool Matches(string name) => Raw.EndsWith('*') ? name.StartsWith(Raw[..^1], StringComparison.Ordinal) : name == Raw;
+    }
+
+    private static async Task<GateResult> BuildStartFailureResultAsync(string message, DateTimeOffset started, string gateJsonPath, GateSpec spec, IReadOnlyList<string> envNames)
+    {
+        GateResult startFailure = new(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null, Feedback: string.Empty, Error: message, Duration: DateTimeOffset.Now - started);
+        await WriteGateJsonAsync(gateJsonPath, startFailure, spec, envNames).ConfigureAwait(false);
         return startFailure;
     }
 
     private static async Task<GateResult> DriveProcessAsync(Process process, GateSpec spec, string logPath, string gateJsonPath,
-        DateTimeOffset started, string cwd, List<string> stdoutLines, CancellationToken token)
+        DateTimeOffset started, string cwd, StdoutBuffer stdoutBuf, IReadOnlyList<string> envNames, CancellationToken token)
     {
         StreamWriter log = new(logPath, append: false, Json.Utf8);
         await using ConfiguredAsyncDisposable logDisposal = log.ConfigureAwait(false);
         object logLock = new();
+        int feedbackCap = spec.FeedbackMaxChars + 1;
 
-        Task stdoutPump = PumpAsync(process.StandardOutput, stdoutLines, line => WriteLog(log, logLock, line), prefix: null, token);
-        Task stderrPump = PumpAsync(process.StandardError, sink: null, write: line => WriteLog(log, logLock, line), prefix: "[stderr] ", token);
+        // One cancellation source for the pumps: cancelling it stops both readers cleanly when the
+        // bounded drain safety net expires (otherwise a stuck child can keep them appending to stdout
+        // and writing to a disposed gate.log).
+        using CancellationTokenSource pumpCts = CancellationTokenSource.CreateLinkedTokenSource(token);
 
-        bool timedOut = !process.WaitForExit(TimeSpan.FromMinutes(spec.TimeoutMinutes));
-        if (timedOut)
+        Task stdoutPump = PumpStdoutAsync(process.StandardOutput, stdoutBuf, feedbackCap, line => WriteLog(log, logLock, line), prefix: null, pumpCts.Token);
+        Task stderrPump = PumpStdoutAsync(process.StandardError, buffer: null, cap: 0, line => WriteLog(log, logLock, line), prefix: "[stderr] ", pumpCts.Token);
+
+        WaitResult wait = await WaitForExitAsync(process, spec.TimeoutMinutes, token).ConfigureAwait(false);
+        if (wait.TimedOut || wait.Cancelled)
         {
             KillTree(process);
         }
-        else
+
+        // Drain: let the pumps finish (with a 30 s safety net). On timeout, cancel them so they unwind
+        // and then await them so no further mutation of shared state or writes to a disposed gate.log.
+        Task pumpsDone = Task.WhenAll(stdoutPump, stderrPump);
+        Task safetyNet = Task.Delay(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None);
+        if (await Task.WhenAny(pumpsDone, safetyNet).ConfigureAwait(false) == safetyNet)
         {
-            token.ThrowIfCancellationRequested();
+            await pumpCts.CancelAsync().ConfigureAwait(false);
+            try { await stdoutPump.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            try { await stderrPump.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
         }
 
-        await DrainAsync(process, stdoutPump, stderrPump).ConfigureAwait(false);
-
         TimeSpan duration = DateTimeOffset.Now - started;
-        return timedOut
-            ? await FinishTimeoutAsync(gateJsonPath, spec, duration, stdoutLines, logPath).ConfigureAwait(false)
-            : await FinishResultAsync(gateJsonPath, spec, duration, cwd, stdoutLines, logPath, process.ExitCode).ConfigureAwait(false);
+        return await FinishAsync(wait, gateJsonPath, spec, duration, cwd, stdoutBuf, logPath, envNames).ConfigureAwait(false);
+    }
+
+    private static async Task<WaitResult> WaitForExitAsync(Process process, int timeoutMinutes, CancellationToken token)
+    {
+        using CancellationTokenSource waitCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        waitCts.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes));
+        try
+        {
+            await process.WaitForExitAsync(waitCts.Token).ConfigureAwait(false);
+            return new WaitResult(TimedOut: false, Cancelled: false, ExitCode: process.ExitCode);
+        }
+        catch (OperationCanceledException)
+        {
+            // waitCts was cancelled by the timer (timeout) or by the caller's token; distinguish the two.
+            bool cancelled = token.IsCancellationRequested;
+            return new WaitResult(TimedOut: !cancelled, Cancelled: cancelled, ExitCode: -1);
+        }
+    }
+
+    private static async Task<GateResult> FinishAsync(WaitResult wait, string gateJsonPath, GateSpec spec, TimeSpan duration, string cwd, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames)
+    {
+        if (wait.TimedOut)
+        {
+            return await FinishTimeoutAsync(gateJsonPath, spec, duration, stdout, logPath, envNames).ConfigureAwait(false);
+        }
+
+        if (wait.Cancelled)
+        {
+            return await FinishCancelledAsync(gateJsonPath, spec, duration, stdout, logPath, envNames).ConfigureAwait(false);
+        }
+
+        return await FinishResultAsync(gateJsonPath, spec, duration, cwd, stdout, logPath, envNames, wait.ExitCode).ConfigureAwait(false);
     }
 
     private static void WriteLog(StreamWriter log, object logLock, string line)
@@ -201,47 +320,44 @@ internal static class Gate
         }
     }
 
-    private static async Task DrainAsync(Process process, Task stdoutPump, Task stderrPump)
-    {
-        try
-        {
-            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException) { }
-
-        // The streams hang up once the process is reaped; let the pumps finish (with a safety net).
-        try
-        {
-            await Task.WhenAll(stdoutPump, stderrPump).WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (TimeoutException) { /* best-effort drain; the timeout was enforced on the process itself */ }
-        catch (OperationCanceledException) { }
-    }
-
-    private static async Task<GateResult> FinishTimeoutAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, List<string> stdoutLines, string logPath)
+    private static async Task<GateResult> FinishTimeoutAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames)
     {
         GateResult timeoutResult = new(
             Outcome: "error",
             ExitCode: -1,
             Count: null,
             ReportPath: null,
-            Feedback: JoinLines(stdoutLines, spec.FeedbackMaxChars, logPath),
+            Feedback: JoinStdout(stdout, spec.FeedbackMaxChars, logPath),
             Error: string.Create(CultureInfo.InvariantCulture, $"gate timed out after {spec.TimeoutMinutes} minutes"),
             Duration: duration);
-        await WriteGateJsonAsync(gateJsonPath, timeoutResult, spec).ConfigureAwait(false);
+        await WriteGateJsonAsync(gateJsonPath, timeoutResult, spec, envNames).ConfigureAwait(false);
         return timeoutResult;
     }
 
-    private static async Task<GateResult> FinishResultAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, string cwd, List<string> stdoutLines, string logPath, int exitCode)
+    private static async Task<GateResult> FinishCancelledAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames)
     {
-        string feedback = JoinLines(stdoutLines, spec.FeedbackMaxChars, logPath);
-        CountResolution resolution = TryResolveCount(stdoutLines, cwd, spec);
+        GateResult cancelledResult = new(
+            Outcome: "error",
+            ExitCode: -1,
+            Count: null,
+            ReportPath: null,
+            Feedback: JoinStdout(stdout, spec.FeedbackMaxChars, logPath),
+            Error: "gate cancelled",
+            Duration: duration);
+        await WriteGateJsonAsync(gateJsonPath, cancelledResult, spec, envNames).ConfigureAwait(false);
+        return cancelledResult;
+    }
+
+    private static async Task<GateResult> FinishResultAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, string cwd, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames, int exitCode)
+    {
+        string feedback = JoinStdout(stdout, spec.FeedbackMaxChars, logPath);
+        CountResolution resolution = TryResolveCount(stdout, cwd, spec);
         GateResult result = BuildResult(exitCode, spec, feedback, resolution, duration);
-        await WriteGateJsonAsync(gateJsonPath, result, spec).ConfigureAwait(false);
+        await WriteGateJsonAsync(gateJsonPath, result, spec, envNames).ConfigureAwait(false);
         return result;
     }
 
-    private static async Task PumpAsync(TextReader reader, List<string>? sink, Action<string> write, string? prefix, CancellationToken token)
+    private static async Task PumpStdoutAsync(TextReader reader, StdoutBuffer? buffer, int cap, Action<string> write, string? prefix, CancellationToken token)
     {
         try
         {
@@ -262,11 +378,27 @@ internal static class Gate
                     break;
                 }
 
-                if (sink is not null)
+                if (buffer is not null)
                 {
-                    lock (sink)
+                    lock (buffer.Lock)
                     {
-                        sink.Add(line);
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            buffer.LastNonEmptyLine = line;
+                        }
+
+                        if (buffer.Text.Length < cap)
+                        {
+                            int remaining = cap - buffer.Text.Length;
+                            if (line.Length <= remaining)
+                            {
+                                _ = buffer.Text.Append(line).Append('\n');
+                            }
+                            else
+                            {
+                                _ = buffer.Text.Append(line.AsSpan(0, remaining));
+                            }
+                        }
                     }
                 }
 
@@ -285,29 +417,30 @@ internal static class Gate
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
     }
 
-    private static string JoinLines(List<string> lines, int max, string logPath)
+    private static string JoinStdout(StdoutBuffer buffer, int max, string logPath)
     {
-        string text = string.Join('\n', lines);
+        string text;
+        lock (buffer.Lock)
+        {
+            text = buffer.Text.ToString().TrimEnd('\n');
+        }
+
         if (text.Length <= max)
         {
             return text;
         }
 
-        return text[..max] + Environment.NewLine + $"[truncated; full gate output: {logPath}]";
+        return text[..max] + '\n' + $"[truncated; full gate output: {logPath}]";
     }
 
     private readonly record struct CountResolution(int? Count, string? ReportPath, string? Error);
 
-    private static CountResolution TryResolveCount(List<string> stdoutLines, string cwd, GateSpec spec)
+    private static CountResolution TryResolveCount(StdoutBuffer stdout, string cwd, GateSpec spec)
     {
-        string? last = null;
-        for (int i = stdoutLines.Count - 1; i >= 0; i--)
+        string? last;
+        lock (stdout.Lock)
         {
-            if (!string.IsNullOrEmpty(stdoutLines[i]))
-            {
-                last = stdoutLines[i];
-                break;
-            }
+            last = stdout.LastNonEmptyLine;
         }
 
         if (last is null)
@@ -315,25 +448,72 @@ internal static class Gate
             return new CountResolution(Count: null, ReportPath: null, Error: "no non-empty stdout line was printed by the gate");
         }
 
-        Match m = spec.ReportFromLastLine.Match(last);
+        Match m;
+        try
+        {
+            m = spec.ReportFromLastLine.Match(last);
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return new CountResolution(Count: null, ReportPath: null, Error: "report path regex timed out on the last stdout line");
+        }
+
+        string? reportPath = ExtractReportPath(m);
         if (!m.Success)
         {
             return new CountResolution(Count: null, ReportPath: null, Error: $"report path regex did not match the last stdout line '{Trim(last)}'");
         }
 
-        if (m.Groups.Count < 2)
-        {
-            return new CountResolution(Count: null, ReportPath: null, Error: "report path regex has no capture group");
-        }
-
-        string? reportPath = m.Groups[1].Value.Trim();
-        if (reportPath.Length is 0)
+        if (reportPath is null)
         {
             return new CountResolution(Count: null, ReportPath: null, Error: "report path was empty");
         }
 
-        string full = Path.IsPathRooted(reportPath) ? reportPath : Path.GetFullPath(Path.Combine(cwd, reportPath));
+        string full;
+        try
+        {
+            full = Path.IsPathRooted(reportPath) ? reportPath : Path.GetFullPath(Path.Combine(cwd, reportPath));
+        }
+        catch (ArgumentException ex)
+        {
+            return new CountResolution(Count: null, ReportPath: null, Error: $"report path '{reportPath}' is invalid: {ex.Message}");
+        }
+
         return TryReadReportFile(full, spec.CountPath);
+    }
+
+    /// <summary>
+    /// The first usable capture in <paramref name="m"/>: group 1; otherwise the first named group
+    /// other than 0 and 1. Returns null when there is no usable capture (so the caller can produce an
+    /// "empty" or "no capture group" error).
+    /// </summary>
+    private static string? ExtractReportPath(Match m)
+    {
+        if (m.Groups.Count < 2)
+        {
+            return null;
+        }
+
+        if (m.Groups[1].Value.Length > 0)
+        {
+            return m.Groups[1].Value.Trim();
+        }
+
+        for (int i = 0; i < m.Groups.Count; i++)
+        {
+            Group g = m.Groups[i];
+            if (g.Name is "0" or "1")
+            {
+                continue;
+            }
+
+            if (g.Value.Length > 0)
+            {
+                return g.Value.Trim();
+            }
+        }
+
+        return null;
     }
 
     private static CountResolution TryReadReportFile(string full, string countPath)
@@ -358,7 +538,7 @@ internal static class Gate
         {
             root = Json.ParseLenient(text);
         }
-        catch (System.Text.Json.JsonException ex)
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or ArgumentException)
         {
             return new CountResolution(Count: null, ReportPath: full, Error: $"report file '{full}' is not valid JSON: {ex.Message}");
         }
@@ -368,7 +548,7 @@ internal static class Gate
         {
             target = ResolveCountPath(root, countPath);
         }
-        catch (System.Text.Json.JsonException ex)
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or ArgumentException)
         {
             return new CountResolution(Count: null, ReportPath: full, Error: $"walking {countPath} failed: {ex.Message}");
         }
@@ -406,7 +586,7 @@ internal static class Gate
             Error: string.Create(CultureInfo.InvariantCulture, $"gate exited {exitCode}"), Duration: duration);
     }
 
-    private static async Task WriteGateJsonAsync(string path, GateResult result, GateSpec spec)
+    internal static async Task WriteGateJsonAsync(string path, GateResult result, GateSpec spec, IReadOnlyList<string> envNames)
     {
         JsonObject o = new()
         {
@@ -417,8 +597,22 @@ internal static class Gate
             ["error"] = result.Error,
             ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
             ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
+            ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
         };
         await File.WriteAllTextAsync(path, o.ToJsonString(Json.Indented), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Records an error gate result for the trust-boundary case (a worker changed a file the gate
+    /// trusts). Writes <c>gate.json</c> and returns the <see cref="GateResult"/> that the chain decision
+    /// uses.
+    /// </summary>
+    internal static async Task<GateResult> WriteFailureAsync(string runDir, GateSpec spec, string errorMessage)
+    {
+        GateResult result = new(Outcome: "error", ExitCode: 5, Count: null, ReportPath: null,
+            Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero);
+        await WriteGateJsonAsync(Path.Combine(runDir, "gate.json"), result, spec, envNames: []).ConfigureAwait(false);
+        return result;
     }
 
     private static string Trim(string s) => s.Length <= 200 ? s : s[..200] + "…";

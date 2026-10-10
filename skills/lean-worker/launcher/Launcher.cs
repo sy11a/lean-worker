@@ -42,13 +42,14 @@ internal static class Launcher
         while (run.LastGate is { Decision: GateChain.Continue })
         {
             GateContext nextContext = new(
-                ChainId: run.ChainId ?? run.RunDir,
+                ChainId: run.ChainId,
                 Round: run.Round + 1,
                 Counts: [.. run.Counts],
                 ChainCostUsd: run.ChainCostUsd,
                 OriginalTask: run.OriginalTask,
                 OriginalName: run.OriginalName,
-                Feedback: run.LastGate.Result);
+                Feedback: run.LastGate.Result,
+                Spec: run.InitialGateSpec ?? throw new LaunchException("gate chain has no spec"));
             run = new LaunchRun(o, gateContext: nextContext);
             code = await run.RunAsync().ConfigureAwait(false);
         }

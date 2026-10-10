@@ -29,7 +29,8 @@ internal static class GateChain
         {
             Error => Error,
             Clean => Clean,
-            _ => StuckReason(countsIncludingThis, round, maxRounds, chainCostIncludingThis, maxTotalUsd) is not null ? Stuck : Continue,
+            "findings" => StuckReason(countsIncludingThis, round, maxRounds, chainCostIncludingThis, maxTotalUsd) is not null ? Stuck : Continue,
+            _ => throw new ArgumentOutOfRangeException(nameof(result), $"unknown gate outcome '{result.Outcome}'"),
         };
     }
 

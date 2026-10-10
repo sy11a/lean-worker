@@ -1,28 +1,45 @@
 // The gate spec: what the runner needs. Resolved from a profile's "gate" object (or absent → null, meaning
 // "no gate"). The validation matches the gate profile grammar in the task brief; failures throw LaunchException
 // so the user sees a precise, named message.
+//
+// User-supplied `reportFromLastLine` patterns must include at least one capture group. The runner reads
+// group 1 first; if that is empty it falls back to the first named group (excluding group 0), so a regex
+// that uses a named capture for its only group — like the default `^sarif: (?<report>.+)$` — still works.
 
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env)
 {
-    [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?$", RegexOptions.Compiled, matchTimeoutMilliseconds: 1000)]
+    // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
+    // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can
+    // resolve the index; the 9-digit cap bounds the value a profile can ask the runner to allocate.
+    [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*(?:\[(?:0|[1-9][0-9]{0,8})\])?$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
     private static partial Regex CountPathSegmentRegex();
 
-    [GeneratedRegex(@"^sarif: (?<report>.+)$", RegexOptions.Compiled, matchTimeoutMilliseconds: 1000)]
+    [GeneratedRegex(@"^sarif: (?<report>.+)$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
     private static partial Regex DefaultReportFromLastLineRegex();
 
+    [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*\*?$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex EnvNamePatternRegex();
+
     /// <summary>
-    /// Returns null when the profile has no gate key.
+    /// Returns null when the profile has no gate key. Any other value (a string, number, array, object
+    /// other than the gate spec) throws so a mis-spelled gate key fails fast with a precise message.
     /// </summary>
     public static GateSpec? FromProfile(JsonObject? profile)
     {
-        if (profile?["gate"] is not JsonObject gate)
+        JsonNode? node = profile?["gate"];
+        if (node is null)
         {
             return null;
+        }
+
+        if (node is not JsonObject gate)
+        {
+            throw new LaunchException("profile gate must be an object");
         }
 
         List<string> command = ReadCommand(gate);
@@ -32,8 +49,9 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         int timeoutMinutes = ReadPositiveInt(gate, "timeoutMinutes", 30, "profile gate.timeoutMinutes");
         int maxRounds = ReadPositiveInt(gate, "maxRounds", 5, "profile gate.maxRounds");
         decimal? maxTotalUsd = ReadMaxTotalUsd(gate);
+        List<string> env = ReadEnv(gate);
 
-        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd);
+        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env);
     }
 
     private static List<string> ReadCommand(JsonObject gate)
@@ -60,12 +78,12 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     private static Regex ReadReportRegex(JsonObject gate)
     {
         const string label = "profile gate.reportFromLastLine";
-        if (!gate.TryGetPropertyValue("reportFromLastLine", out JsonNode? rn) || rn is null || rn is not JsonValue rv)
+        if (!gate.TryGetPropertyValue("reportFromLastLine", out JsonNode? rn) || rn is null)
         {
             return DefaultReportFromLastLineRegex();
         }
 
-        if (!rv.TryGetValue(out string? pattern) || string.IsNullOrEmpty(pattern))
+        if (rn is not JsonValue rv || !rv.TryGetValue(out string? pattern) || string.IsNullOrEmpty(pattern))
         {
             throw new LaunchException($"{label} must be a regex string");
         }
@@ -73,7 +91,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         Regex compiled;
         try
         {
-            compiled = new Regex(pattern, RegexOptions.Compiled, TimeSpan.FromSeconds(1));
+            compiled = new Regex(pattern, RegexOptions.None, TimeSpan.FromSeconds(1));
         }
         catch (ArgumentException ex)
         {
@@ -92,12 +110,12 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
 
     private static string ReadCountPath(JsonObject gate)
     {
-        if (!gate.TryGetPropertyValue("countPath", out JsonNode? cn) || cn is null || cn is not JsonValue cv)
+        if (!gate.TryGetPropertyValue("countPath", out JsonNode? cn) || cn is null)
         {
             return "runs[0].results";
         }
 
-        if (!cv.TryGetValue(out string? path) || string.IsNullOrEmpty(path))
+        if (cn is not JsonValue cv || !cv.TryGetValue(out string? path) || string.IsNullOrEmpty(path))
         {
             throw new LaunchException("profile gate.countPath must be a non-empty string");
         }
@@ -131,17 +149,49 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
 
     private static decimal? ReadMaxTotalUsd(JsonObject gate)
     {
-        decimal? parsed = Json.Dec(gate, "maxTotalUsd");
-        if (parsed is null)
+        if (!gate.TryGetPropertyValue("maxTotalUsd", out JsonNode? n) || n is null)
         {
             return null;
         }
 
-        if (parsed.Value <= 0m)
+        // Reject non-numeric values: true / "abc" / "5" — only a numeric JsonValue is parsed.
+        if (n is not JsonValue v || !v.TryGetValue(out decimal parsed))
         {
-            throw new LaunchException("profile gate.maxTotalUsd must be a decimal greater than 0");
+            throw new LaunchException("profile gate.maxTotalUsd must be a number");
+        }
+
+        if (parsed <= 0m)
+        {
+            throw new LaunchException("profile gate.maxTotalUsd must be a number greater than 0");
         }
 
         return parsed;
+    }
+
+    private static List<string> ReadEnv(JsonObject gate)
+    {
+        if (!gate.TryGetPropertyValue("env", out JsonNode? n) || n is null)
+        {
+            return [];
+        }
+
+        if (n is not JsonArray arr)
+        {
+            throw new LaunchException("profile gate.env must be an array of names or PREFIX* patterns");
+        }
+
+        Regex pattern = EnvNamePatternRegex();
+        List<string> env = new(arr.Count);
+        foreach (JsonNode? item in arr)
+        {
+            if (item is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s) || !pattern.IsMatch(s))
+            {
+                throw new LaunchException("profile gate.env entry must match [A-Za-z_][A-Za-z0-9_]*[*]?");
+            }
+
+            env.Add(s);
+        }
+
+        return env;
     }
 }
