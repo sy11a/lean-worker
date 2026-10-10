@@ -104,8 +104,8 @@ internal sealed class LaunchRun
     // entries, the resolved gate executable, the prices file) and hashes everything before its worker;
     // both are frozen into GateContext, and every later round compares against round 1's snapshot
     // (before its worker, before its gate, after its gate). The fixed paths' per-path sources come
-    // along, frozen too, together with the gate's runnable inputs (the resolved executable, the
-    // existing-file argv prefix an interpreter runs, execute-bit argv entries), decided at the same
+    // along, frozen too, together with the gate's runnable inputs (the resolved executable, argv[1]
+    // when it is an existing file, execute-bit argv entries), decided at the same
     // moment: the gate's report path may be excluded from a comparison only when argv entries are its
     // sole source and the path is not something the gate runs (GateTrust.ReportPathViolation).
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
@@ -794,8 +794,8 @@ internal sealed class LaunchRun
     /// <summary>
     /// The report paths the gate named, excluded from trust checks — but only when each one passes
     /// <see cref="GateTrust.ReportPathViolation"/>: an argv output entry, and nothing the gate runs.
-    /// A path trusted from any other source, or a runnable gate input (the resolved executable, the
-    /// existing-file argv prefix an interpreter consumes, an execute-bit argv entry — decided once in
+    /// A path trusted from any other source, or a runnable gate input (the resolved executable,
+    /// argv[1] when it is an existing file, an execute-bit argv entry — decided once in
     /// round 1, before the worker), makes the exclusion illegal: the checks report that instead of
     /// dropping the path from the comparison.
     /// </summary>
@@ -919,7 +919,7 @@ internal sealed class LaunchRun
                 // any difference from round 1's before-worker snapshot (or a bad state). The report
                 // file the gate named is excluded only when it is a pure argv output: it must not be
                 // a trusted input from another source, nor something the gate runs (executable,
-                // interpreter-consumed argv prefix, execute-bit argv entry — fixed in round 1); the
+                // argv[1] when it is an existing file, execute-bit argv entry — fixed in round 1); the
                 // check reports that case before the comparison runs.
                 //
                 // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted

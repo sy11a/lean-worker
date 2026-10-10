@@ -562,8 +562,8 @@ internal static class GateTrust
         }
 
         // Runnable marking runs beside the adds, not inside them: the rules scan every argv entry
-        // (also ones outside the git root, which the trust set never holds, because the position of
-        // the first non-file argument decides which later entries an interpreter could still run).
+        // (also ones outside the git root, which the trust set never holds, because the argv[1]
+        // position or an execute bit can make any of them runnable).
         if (runnable is not null)
         {
             MarkRunnableArgv(gateCommand, gateWorkingDirectory, runnable);
@@ -844,8 +844,15 @@ internal static class GateTrust
     ///     are data the command reads or writes, not scripts, so they are not runnable by this rule
     ///     (an output file named after the script, e.g. <c>report.out</c> in <c>sh gate.sh report.out</c>
     ///     with a pre-existing <c>report.out</c>, stays excludable); or
-    ///   - any argv file entry with an execute bit (File.GetUnixFileMode: user, group or other) —
-    ///     a file the command could execute no matter where it sits in the argv.
+    ///   - any argv file entry with an execute bit (File.GetUnixFileMode: user, group or other — on
+    ///     Windows, which has no execute bits, a runnable extension .exe/.cmd/.bat/.ps1; a mode that
+    ///     cannot be read counts as runnable, fail closed) — a file the command could execute no
+    ///     matter where it sits in the argv.
+    /// The rule is deliberately not "only argv files that did not exist before round 1 may be
+    /// excluded": a report left over from an earlier run legitimately exists before this run starts
+    /// (the gate rewrites the same report path every round), so a pre-existing argv entry can still
+    /// be a pure output — refusing its exclusion was the false positive gate-fix11b introduced. What
+    /// must block an exclusion is runnability (something the gate could execute), not the file's age.
     /// Everything is evaluated when the fixed trust list is collected (round 1, before the worker):
     /// existence and execute bits are frozen then, so the rule never depends on what the gate did —
     /// in particular a report file the gate creates mid-run is never retroactively runnable, and a
@@ -899,15 +906,30 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Whether <paramref name="path"/> carries any execute bit (user, group or other). The check is
-    /// bounded to platforms where Unix file modes exist; elsewhere no entry becomes runnable through
-    /// this rule (the other two rules do not depend on it).
+    /// Extensions Windows treats as runnable when it has no execute bits to check
+    /// (ordinal-ignore-case).
+    /// </summary>
+    private static readonly HashSet<string> _windowsRunnableExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe",
+        ".cmd",
+        ".bat",
+        ".ps1",
+    };
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is something the command could execute: any execute bit
+    /// (user, group or other) on Unix, macOS included (File.GetUnixFileMode); on Windows, which has
+    /// no execute bits, a runnable extension (<c>.exe</c>, <c>.cmd</c>, <c>.bat</c>, <c>.ps1</c>,
+    /// ordinal-ignore-case). A mode that cannot be read counts as runnable (fail closed): the
+    /// caller refuses the report-path exclusion for a runnable path, and an unreadable stat must
+    /// never make a path excludable.
     /// </summary>
     private static bool HasExecuteBit(string path)
     {
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        if (OperatingSystem.IsWindows())
         {
-            return false;
+            return _windowsRunnableExtensions.Contains(Path.GetExtension(path));
         }
 
         try
@@ -921,8 +943,10 @@ internal static class GateTrust
             or NotSupportedException
             or PlatformNotSupportedException)
         {
-            // The path vanished or cannot be stat'ed: it cannot be executed from the argv either.
-            return false;
+            // Fail closed: a mode we cannot read (the path vanished mid-check, or stat failed)
+            // counts as runnable, so the report-path exclusion never covers a file the gate might
+            // be able to execute.
+            return true;
         }
     }
 
