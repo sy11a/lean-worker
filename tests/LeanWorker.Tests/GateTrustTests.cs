@@ -405,6 +405,26 @@ public sealed class GateTrustTests : IDisposable
     }
 
     [Fact]
+    public void A_prices_file_under_the_runs_root_inbox_is_collected_and_one_reached_by_the_walk_appears_once()
+    {
+        string runsRoot = NewDir();
+        string inboxPrices = Path.Combine(runsRoot, "inbox", "t", "prices.json");
+        string walkedPrices = Path.Combine(runsRoot, "sub", "prices.json");
+        foreach (string file in new[] { inboxPrices, walkedPrices })
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+            File.WriteAllText(file, "{}");
+        }
+
+        string work = NewDir();
+        List<string> inInbox = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: inboxPrices);
+        List<string> walked = GateTrust.CollectPaths(runsRoot, work, work, ["sh"], extraPricesFile: walkedPrices);
+
+        Assert.Equal(1, inInbox.Count(p => p == inboxPrices));
+        Assert.Equal(1, walked.Count(p => p == walkedPrices));
+    }
+
+    [Fact]
     public void The_runs_root_is_walked_recursively_except_the_launcher_owned_subtrees()
     {
         string runsRoot = NewDir();

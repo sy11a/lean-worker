@@ -372,6 +372,34 @@ public sealed class GateTrustLoopTests : IDisposable
         AssertClean(setup, code, stdout);
     }
 
+    [Fact]
+    public async Task A_prices_file_under_the_runs_root_inbox_that_the_worker_changes_trips_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        string inbox = Path.Combine(setup.Root, "inbox", "t");
+        _ = Directory.CreateDirectory(inbox);
+        string prices = Path.Combine(inbox, "my-prices.json");
+        await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
+
+        (int code, string stdout) = await RunAsync(setup, "printf '{ }' > '" + prices + "'", configure: o => o.PricesFile = prices);
+
+        AssertViolation(setup, code, stdout, prices);
+    }
+
+    [Fact]
+    public async Task A_prices_file_under_the_runs_root_inbox_that_stays_the_same_lets_the_gate_runAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        string inbox = Path.Combine(setup.Root, "inbox", "t");
+        _ = Directory.CreateDirectory(inbox);
+        string prices = Path.Combine(inbox, "my-prices.json");
+        await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
+
+        (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
+
+        AssertClean(setup, code, stdout);
+    }
+
     // ---- round bookkeeping ---------------------------------------------------------------------------------
 
     [Fact]
