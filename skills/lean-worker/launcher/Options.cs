@@ -6,6 +6,9 @@ internal sealed class Options
 {
     public const string Usage = """
         LeanWorker: run one task in a minimal-context worker (Claude Code or opencode).
+        Exit codes: 0 = worker finished without error (or a gate chain ended clean); 1 = worker reported an error;
+        2 = launcher failed; 3 = worker wrapped up near its budget; 4 = a gate chain ended stuck (no decrease in
+        two consecutive rounds, max rounds reached, or cost cap exceeded); 5 = a gate chain ended in an error.
 
           --task <file>              task prompt (required unless --continue-from)
           --continue-from <run-dir>  fresh worker on a stopped run: its original task + its report as the handoff
@@ -44,6 +47,8 @@ internal sealed class Options
           --keep-hooks               lean mode: load the user's settings, hooks and plugins (off by default; profile
                                      key "keepHooks": true). Managed (organisation) hooks always run.
           --no-user-env              lean mode: do not carry the user settings' env block into the worker
+          --no-gate                  do not run the profile's gate (profile key "gate")
+          --gate-max-rounds <n>      overrides gate.maxRounds for this run (profile key "gate.maxRounds")
 
         Other commands:
           hook --run-dir <dir>       the worker's pre-tool hook (installed by the launcher)
@@ -52,8 +57,8 @@ internal sealed class Options
           cost --claude <session-id|file.jsonl> [--provider <name>] | --opencode <session-id>
                                      price a manual session with prices.json
           stats [--since <yyyy-mm-dd>] [--json]
-                                     runs per profile and model: success rate (worker status), wrap-ups, escalations, cost per success,
-                                     quota used; --json for other tools (schema_version as in runs.jsonl)
+                                     runs per profile and model: success rate (worker status or gate clean), wrap-ups, escalations,
+                                     cost per success, quota used; --json for other tools (schema_version as in runs.jsonl)
           prices                     the merged price book: sources and each entry's date
         """;
 
@@ -85,6 +90,8 @@ internal sealed class Options
     public bool KeepMemory;
     public bool KeepHooks;
     public bool NoUserEnv;
+    public bool NoGate;
+    public int? GateMaxRounds;
     public bool Help;
     public string Mode = "auto";
 
@@ -139,6 +146,7 @@ internal sealed class Options
             case "--wrap-up-at": { WrapUpAt = decimal.Parse(next(), CultureInfo.InvariantCulture); return true; }
             case "--timeout-minutes": { TimeoutMinutes = int.Parse(next(), CultureInfo.InvariantCulture); return true; }
             case "--report-max-chars": { ReportMaxChars = int.Parse(next(), CultureInfo.InvariantCulture); return true; }
+            case "--gate-max-rounds": { GateMaxRounds = int.Parse(next(), CultureInfo.InvariantCulture); return true; }
         }
 
         return false;
@@ -156,6 +164,7 @@ internal sealed class Options
             case "--keep-hooks": { KeepHooks = true; return true; }
             case "--no-user-env": { NoUserEnv = true; return true; }
             case "--no-hooks": { return true; } // hooks are off by default; accepted for compatibility
+            case "--no-gate": { NoGate = true; return true; }
             case "-h" or "--help": { Help = true; return true; }
         }
 

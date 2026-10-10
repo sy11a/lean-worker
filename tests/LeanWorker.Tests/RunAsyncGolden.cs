@@ -16,12 +16,30 @@ internal static partial class RunAsyncGolden
 {
     public const string Notes = "golden notes";
 
+    public const string SuccessStream = """
+        printf '%s\n' '{"type":"result","subtype":"success","terminal_reason":"completed","is_error":false,"result":"DONE","session_id":"s1","total_cost_usd":0.01,"num_turns":1,"permission_denials":[]}'
+        """;
+
+    public const string ErrorStream = """
+        printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"it broke","session_id":"s2","total_cost_usd":0.0002,"num_turns":1,"permission_denials":[]}'
+        """;
+
+    /// <summary>
+    /// Writes &lt;root&gt;/profiles.json with one profile, so a LaunchRun under test resolves a profile (and its
+    /// "gate" key) without going through --profile defaults.
+    /// </summary>
+    public static void WriteProfile(string root, string name, JsonObject profile)
+    {
+        JsonObject doc = new() { ["defaultProfile"] = name, ["profiles"] = new JsonObject { [name] = profile } };
+        File.WriteAllText(Path.Combine(root, "profiles.json"), doc.ToJsonString());
+    }
+
     public static readonly string[] SummaryKeys =
     [
         "schema_version", "timestamp", "name", "run_dir", "profile", "runtime", "provider", "model", "model_reason", "effort",
         "mode", "billing", "cache_ttl", "hooks", "status", "subtype", "terminal_reason", "exit_code", "num_turns", "api_calls",
         "duration_ms", "total_cost_usd", "reported_cost_usd", "budget_usd", "wrap_up_usd", "wrapped_up", "hook_checks",
-        "continued_from", "escalate_to", "model_traits", "tokens", "context_first_call", "first_call_cache_read",
+        "continued_from", "escalate_to", "gate", "model_traits", "tokens", "context_first_call", "first_call_cache_read",
         "first_call_cache_read_share", "context_peak", "permission_denials", "write_scope", "changed_files", "out_of_scope",
         "session_id", "quota_before", "quota_after", "quota_used_pct", "notes",
     ];
@@ -57,7 +75,8 @@ internal static partial class RunAsyncGolden
     /// <summary>
     /// Runs RunAsync with the stub on PATH; returns the exit code and stdout, or rethrows what RunAsync throws.
     /// </summary>
-    public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key")
+    public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key",
+        GateContext? gateContext = null)
     {
         string? oldPath = Environment.GetEnvironmentVariable("PATH");
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
@@ -73,7 +92,9 @@ internal static partial class RunAsyncGolden
             Console.SetOut(outWriter);
             Options o = new() { TaskFile = Path.Combine(root, "task.md"), RunsRoot = root, Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "golden" };
             configure?.Invoke(o);
-            int code = await Launcher.RunAsync(o);
+            // A gate context runs that one round directly (as the launcher's loop would build it), so a test can
+            // hand a later round a spec that differs from what profiles.json now says.
+            int code = gateContext is null ? await Launcher.RunAsync(o) : await new LaunchRun(o, gateContext).RunAsync();
             return (code, outWriter.ToString());
         }
         finally
@@ -82,6 +103,14 @@ internal static partial class RunAsyncGolden
             Directory.SetCurrentDirectory(oldCwd);
             Environment.SetEnvironmentVariable("PATH", oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", oldKey);
+            try
+            {
+                Directory.Delete(cleanCwd, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A leftover temp directory must not fail the test that already finished.
+            }
         }
     }
 

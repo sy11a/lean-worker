@@ -255,7 +255,11 @@ internal static partial class Commands
             .OrderBy(g => g.Key.Item1, StringComparer.Ordinal).ThenBy(g => g.Key.Item2, StringComparer.Ordinal)
             .Select(g =>
             {
-                int ok = g.Count(r => Json.Str(r, "status") is "success");
+                // A row counts as a success when no gate ran and the worker succeeded, or when the gate ran
+                // and decided clean. Gate rounds that decided continue are in-progress (or stuck/error), not successes.
+                int ok = g.Count(r => r["gate"] is JsonObject gate
+                    ? Json.Str(gate, "decision") is GateChain.Clean
+                    : Json.Str(r, "status") is "success");
                 decimal cost = g.Sum(r => Json.Dec(r, "total_cost_usd") ?? 0);
                 List<decimal> quota = [.. g.Select(r => r["quota_used_pct"] as JsonObject).OfType<JsonObject>().Select(q => q.Select(kv => Json.Dec(q, kv.Key) ?? 0).DefaultIfEmpty(0).Max())];
                 int wrappedUp = g.Count(r => Json.Str(r, "status") is "wrapped-up");

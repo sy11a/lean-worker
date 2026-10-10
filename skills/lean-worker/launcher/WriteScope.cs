@@ -77,6 +77,13 @@ internal static class WriteScope
     /// </summary>
     public static bool InScope(string path, IReadOnlyList<string> patterns) => patterns.Any(p => ToRegex(p).IsMatch(path));
 
+    /// <summary>
+    /// Builds the matcher for a single glob pattern. Exposed so other parts of the launcher
+    /// (the trust check for <c>gate.trust</c> entries) can use exactly the same glob grammar the
+    /// write-scope filter uses.
+    /// </summary>
+    internal static Regex BuildGlobRegex(string glob) => ToRegex(glob);
+
     private static Regex ToRegex(string glob)
     {
         string g = glob.Replace('\\', '/').TrimStart('/').TrimEnd('/');

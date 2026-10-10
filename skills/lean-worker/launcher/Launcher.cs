@@ -9,8 +9,9 @@
 // budget a pre-tool hook blocks every tool call, so the worker's last message is a handoff; at the budget the
 // launcher stops the worker.
 //
-// Exit codes: 0 = worker finished without error, 1 = worker reported an error, 2 = launcher failed,
-// 3 = worker wrapped up near its budget and left a handoff (continue with --continue-from <run-dir>).
+// Exit codes: 0 = worker finished without error (or a gate chain ended clean), 1 = worker reported an error,
+// 2 = launcher failed, 3 = worker wrapped up near its budget and left a handoff (continue with
+// --continue-from <run-dir>), 4 = a gate chain ended stuck, 5 = a gate chain ended in an error.
 
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -25,6 +26,7 @@ internal static class Launcher
     // git flags that write files or run programs whatever prefix allowed the command (deny beats allow).
     internal static readonly string[] DeniedFloor = ["Bash(git *--output*)", "Bash(git *--ext-diff*)", "Bash(git *--textconv*)"];
     internal const string ContinuationHeading = "## Continuation (lean-worker)";
+    internal const string GateHeading = "## Gate report (lean-worker)";
     public const int RunSchemaVersion = 1;
 
     public static async Task<int> RunAsync(Options o)
@@ -35,7 +37,45 @@ internal static class Launcher
             return 0;
         }
 
-        return await new LaunchRun(o).RunAsync().ConfigureAwait(false);
+        LaunchRun run = new(o, gateContext: null);
+        int code = await run.RunAsync().ConfigureAwait(false);
+        while (run.LastGate is { Decision: GateChain.Continue })
+        {
+            // The next round compares against round 1's before-worker trust snapshot and its fixed
+            // path list, so nothing that changed on disk since then can become the new baseline.
+            // The one patch: the declared outputs this round's gate was allowed to rewrite, hashed
+            // after its clean after-gate check (PostGateOutputs) — they replace exactly those keys
+            // of round 1's snapshot, everything else keeps round 1's baseline.
+            GateContext nextContext = new(
+                ChainId: run.ChainId,
+                Round: run.Round + 1,
+                Counts: [.. run.Counts],
+                ChainCostUsd: run.ChainCostUsd,
+                OriginalTask: run.OriginalTask,
+                OriginalName: run.OriginalName,
+                Feedback: run.LastGate.Result,
+                Spec: run.InitialGateSpec ?? throw new LaunchException("gate chain has no spec"),
+                TrustSnapshot: run.TrustSnapshot ?? throw new LaunchException("gate chain has no trust snapshot"),
+                TrustPaths: run.TrustPaths ?? throw new LaunchException("gate chain has no trust paths"),
+                FixedSources: run.FixedSources ?? throw new LaunchException("gate chain has no trust path sources"),
+                GatePathNames: run.GatePathNames ?? throw new LaunchException("gate chain has no gate PATH name sets"),
+                PostGateOutputs: run.PostGateOutputs);
+            run = new LaunchRun(o, gateContext: nextContext);
+            code = await run.RunAsync().ConfigureAwait(false);
+        }
+
+        if (run.LastGate is null)
+        {
+            return code;
+        }
+
+        return run.LastGate.Decision switch
+        {
+            GateChain.Clean => 0,
+            GateChain.Stuck => 4,
+            GateChain.Error => 5,
+            _ => code,
+        };
     }
 
     /// <summary>
@@ -265,16 +305,36 @@ internal static class Launcher
     /// </summary>
     internal static string DefaultRuntime(Provider p) => p.Name is "anthropic" || p.AnthropicBaseUrl is not null ? "claude" : "opencode";
 
+    /// <summary>
+    /// Searches PATH for <paramref name="command"/> and returns the first existing candidate as an
+    /// absolute path. A relative PATH entry (e.g. <c>node_modules/.bin</c>) would otherwise yield a
+    /// relative result, which .NET on Unix resolves against the launcher's own directory when it
+    /// starts a process, and which no absolute trust-set key could ever match. Null when no PATH
+    /// entry has the file.
+    /// </summary>
     public static string? FindOnPath(string command)
     {
         foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
-            string candidate = Path.Combine(dir.Trim('"'), command);
+            string candidate;
+            try
+            {
+                // A relative PATH entry resolves against the launcher's working directory — the same
+                // directory the gate runs in — so the returned path is always absolute.
+                candidate = Path.GetFullPath(Path.Combine(dir.Trim('"'), command));
+            }
+            catch (ArgumentException)
+            {
+                // A PATH entry that cannot form a valid path is skipped, like a non-existent one.
+                continue;
+            }
+
             if (File.Exists(candidate))
             {
                 return candidate;
             }
         }
+
         return null;
     }
 
@@ -317,4 +377,56 @@ internal static class Launcher
         }
         finally { try { File.Delete(temp); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { } }
     }
+
+    /// <summary>
+    /// Writes <paramref name="content"/> to <paramref name="path"/> so a symlink planted at
+    /// <paramref name="path"/> is replaced, not followed. The bytes go to a randomly named temp file
+    /// in the same directory (an unpredictable name cannot be pre-planted), then a rename moves the
+    /// temp over the path: rename swaps the directory entry, so an entry that is itself a symlink is
+    /// replaced rather than written through. The temp file is deleted when anything fails.
+    /// </summary>
+    internal static async Task WritePlainAsync(string path, string content)
+    {
+        string temp = TempSibling(path);
+        try
+        {
+            await File.WriteAllTextAsync(temp, content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            try { File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for writing like <c>new StreamWriter(path, append: false, encoding)</c>,
+    /// but never follows a symlink planted at <paramref name="path"/>: the handle is created on a randomly
+    /// named temp file in the same directory and the temp is renamed over the path while the handle is open,
+    /// so the writer keeps writing the file the path now names (rename replaces the entry; the open handle
+    /// follows the inode). See <see cref="WritePlainAsync"/> for the rationale. The temp file is deleted
+    /// when the rename fails.
+    /// </summary>
+    internal static StreamWriter CreateWriter(string path, System.Text.Encoding encoding)
+    {
+        string temp = TempSibling(path);
+        FileStream fs = new(temp, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        try
+        {
+            File.Move(temp, path, overwrite: true);
+        }
+        catch
+        {
+            fs.Dispose();
+            try { File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
+
+        return new StreamWriter(fs, encoding);
+    }
+
+    private static string TempSibling(string path) =>
+        Path.Combine(Path.GetDirectoryName(path) ?? ".", ".tmp-" + Guid.NewGuid().ToString("N"));
 }

@@ -20,4 +20,48 @@ public class StatsTests
         Assert.Equal(new StatsRow("code", "anthropic/claude-sonnet-5", 1, 1, 0, 0, 2.0m, 2.0m, QuotaPctPerRun: null), rows[0]);
         Assert.Equal(new StatsRow("code", "minimax-coding-plan/MiniMax-M3", 3, 1, 1, 1, 2.0m, 2.0m, 3m), rows[1]);
     }
+
+    [Fact]
+    public void A_clean_gate_decision_counts_as_success_whatever_the_worker_status_says()
+    {
+        // Status "error" would not count as a success without the gate rule, so this fails if the rule is dropped.
+        List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"error","total_cost_usd":1.0,"gate":{"decision":"clean"}}"""),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(1, row.Success);
+    }
+
+    [Fact]
+    public void Stuck_and_error_gate_decisions_are_not_successes_even_when_the_worker_status_is_success()
+    {
+        List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"stuck"}}"""),
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"error"}}"""),
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"clean"}}"""),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(3, row.Runs);
+        Assert.Equal(1, row.Success);
+    }
+
+    [Fact]
+    public void A_continue_gate_decision_is_not_a_success_even_when_the_worker_status_is_success()
+    {
+        List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"continue"}}"""),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(0, row.Success);
+    }
+
+    [Fact]
+    public void A_null_gate_with_success_status_is_a_success()
+    {
+        List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":null}"""),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(1, row.Success);
+    }
 }
