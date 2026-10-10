@@ -883,7 +883,7 @@ internal sealed class LaunchRun
                 }
 
                 string entryPath = Path.Combine(listing.Key, entry.Key);
-                GateTrust.CanonicalPath canonical = GateTrust.Canonical(target);
+                GateTrust.CanonicalPath canonical = GateTrust.Canonical(entryPath);
                 RefuseUnresolvedCanonical(canonical, $"gate PATH entry '{entryPath}'");
                 if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
                 {
