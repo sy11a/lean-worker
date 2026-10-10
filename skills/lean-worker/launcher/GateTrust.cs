@@ -14,11 +14,14 @@
 // records "unreadable: too large". The chain treats any "nonregular" or "unreadable" entry that appears
 // after the worker as a trust violation.
 //
-// .NET 8 cannot tell a FIFO / socket / character device from a regular file through FileAttributes
-// (UnixFileMode.TypeMask lands in .NET 9), so the portable check on this runtime is to open the file
-// (catching the open failure and classifying a directory by Directory.Exists) and then require
-// FileStream.CanSeek on the same handle. Together with the 5-second open/read bound that turns a FIFO
-// with no writer into "unreadable: timeout", the seek check is the complete guard on .NET 8.
+// .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in .NET 9), so the guard on this
+// runtime is layered:
+//   - the FileAttributes pre-check below (catches directories, devices where reported, reparse points)
+//   - FileStream.CanSeek on the opened handle (FIFOs, sockets, character devices are non-seekable)
+//   - the 5-second open/read bound (catches a FIFO blocking in open with no writer)
+//   - the 16 MiB byte cap (bounds a read off a misclassified device)
+// Block devices may still look regular and seekable on this runtime; a normal user cannot open them
+// (the open fails → unreadable → trust violation), and the size cap bounds a read. No P/Invoke.
 
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
@@ -90,6 +93,23 @@ internal static class GateTrust
             }
 
             string target = ResolveTarget(path, ref key);
+
+            // Attribute pre-check: directories, devices (where reported), and reparse points must not
+            // be opened at all. .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in
+            // .NET 9), so the layered guard is: this attribute probe (Directory / Device / ReparsePoint)
+            // + FileStream.CanSeek on the opened handle (FIFOs, sockets, character devices are
+            // non-seekable) + the 5-second bound in HashFileAsync (a FIFO blocking in open with no
+            // writer) + the 16 MiB cap below (bounds a read off a misclassified device). Block devices
+            // may still look regular and seekable on this runtime; a normal user cannot open them (the
+            // open fails → unreadable → trust violation), and the size cap bounds a read. No P/Invoke.
+            FileAttributes attrs = File.GetAttributes(target);
+            if (attrs.HasFlag(FileAttributes.Directory)
+                || attrs.HasFlag(FileAttributes.Device)
+                || attrs.HasFlag(FileAttributes.ReparsePoint))
+            {
+                hashes[key] = "nonregular";
+                return;
+            }
 
             hashes[key] = await HashFileAsync(target).ConfigureAwait(false);
         }
