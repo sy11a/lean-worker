@@ -375,6 +375,230 @@ public sealed class GateTrustLoopTests : IDisposable
         Assert.False(File.Exists(workerMarker), "the worker must not run");
     }
 
+    // ---- gate PATH directories: missing/unreadable states, entry metadata, hint, location warning ----------
+
+    private const string PathHint = "PATH directories must not change during a gated run; install tools before launching or call them by absolute path";
+
+    private const UnixFileMode FullAccess = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+
+    [UnsupportedOSPlatform("windows")]
+    private static void RestoreAccess(string dir)
+    {
+        if (!Directory.Exists(dir))
+        {
+            return;
+        }
+
+        File.SetUnixFileMode(dir, FullAccess);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_creates_a_missing_PATH_directory_plants_a_tool_and_makes_it_unlistable_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows() || Environment.IsPrivilegedProcess, "needs a Unix shell and a non-root user");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string missing = Path.Combine(dirA, "bin");
+        string planted = Path.Combine(missing, ToolName);
+        try
+        {
+            (int code, string stdout) = await RunAsync(
+                setup,
+                "mkdir '" + missing + "'\nprintf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'\nchmod 0311 '" + missing + "'",
+                () => SetPath(missing, dirB));
+
+            AssertViolation(setup, code, stdout, missing);
+        }
+        finally
+        {
+            RestoreAccess(missing);
+        }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_makes_a_readable_PATH_directory_unlistable_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows() || Environment.IsPrivilegedProcess, "needs a Unix shell and a non-root user");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        try
+        {
+            (int code, string stdout) = await RunAsync(setup, "chmod 0311 '" + dirA + "'", () => SetPath(dirA, dirB));
+
+            AssertViolation(setup, code, stdout, dirA);
+            Assert.Contains("is now unreadable", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            RestoreAccess(dirA);
+        }
+    }
+
+    [Fact]
+    public async Task A_worker_that_creates_a_missing_PATH_directory_empty_trips_the_trust_checkAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string missing = Path.Combine(dirA, "bin");
+
+        (int code, string stdout) = await RunAsync(setup, "mkdir '" + missing + "'", () => SetPath(missing, dirB));
+
+        AssertViolation(setup, code, stdout, missing);
+        Assert.Contains("is now readable", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_that_has_only_relative_entries_is_a_launch_error_before_the_workerAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        // The gate's `sh` is given by absolute path, so resolving argv[0] succeeds with no PATH left to search.
+        string sh = Launcher.FindOnPath("sh") ?? "/bin/sh";
+        Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray()[0] = sh);
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(setup, "touch '" + workerMarker + "'", () => Environment.SetEnvironmentVariable("PATH", "relbin" + Path.PathSeparator + ".")));
+
+        Assert.Contains("gate PATH has no absolute entries", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    public void BuildGatePath_refuses_a_PATH_without_absolute_entries()
+    {
+        string? old = Environment.GetEnvironmentVariable("PATH");
+        try
+        {
+            Environment.SetEnvironmentVariable("PATH", "relbin" + Path.PathSeparator + ".");
+
+            LaunchException ex = Assert.Throws<LaunchException>(() => GateTrust.BuildGatePath());
+
+            Assert.Equal("gate PATH has no absolute entries", ex.Message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PATH", old);
+        }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_overwrites_a_tool_in_a_PATH_directory_in_place_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string tool = Path.Combine(dirB, ToolName);
+
+        (int code, string stdout) = await RunAsync(
+            setup, "printf '#!/bin/sh\\nexit 0\\n# a different and longer body\\n' > '" + tool + "'", () => SetPath(dirA, dirB));
+
+        AssertViolation(setup, code, stdout, tool);
+        Assert.Contains("changed length", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_renames_a_new_file_over_a_tool_in_a_PATH_directory_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string tool = Path.Combine(dirB, ToolName);
+        string staged = Path.Combine(dirA, "staged");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '#!/bin/sh\\nexit 0\\n# renamed over, with another body\\n' > '" + staged + "'\nchmod +x '" + staged + "'\nmv '" + staged + "' '" + tool + "'",
+            () => SetPath(dirA, dirB));
+
+        AssertViolation(setup, code, stdout, tool);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_retargets_a_symlink_in_a_PATH_directory_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string link = Path.Combine(dirA, "lw-link");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "ln -sfn '" + Path.Combine(dirB, ToolName) + "' '" + link + "'",
+            () =>
+            {
+                _ = File.CreateSymbolicLink(link, Path.Combine(dirB, "elsewhere"));
+                SetPath(dirA, dirB);
+            });
+
+        AssertViolation(setup, code, stdout, link);
+        Assert.Contains("changed its link target", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task PATH_directories_holding_files_and_a_symlink_that_the_worker_leaves_alone_run_cleanAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "true",
+            () =>
+            {
+                File.WriteAllText(Path.Combine(dirA, "other-tool"), "x");
+                _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), Path.Combine(dirB, ToolName));
+                SetPath(dirA, dirB);
+            });
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_PATH_directory_violation_message_carries_the_hintAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string planted = Path.Combine(dirA, ToolName);
+
+        (int code, string stdout) = await RunAsync(setup, "touch '" + planted + "'", () => SetPath(dirA, dirB));
+
+        AssertViolation(setup, code, stdout, planted);
+        Assert.Contains(PathHint, stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task An_absolute_PATH_entry_inside_the_working_directory_is_noted_and_recorded_in_gate_jsonAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string inside = string.Empty;
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "true",
+            () =>
+            {
+                inside = Path.Combine(Directory.GetCurrentDirectory(), "inbin");
+                _ = Directory.CreateDirectory(inside);
+                SetPath(inside, dirA, dirB);
+            });
+
+        AssertClean(setup, code, stdout);
+        Assert.Contains("note:     gate PATH directory '" + inside + "' lies inside the working tree", stdout, StringComparison.Ordinal);
+        JsonObject gateJson = JsonNode.Parse(
+            await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        string[] warnings = [.. gateJson["warnings"]!.AsArray().Select(w => w!.GetValue<string>())];
+        Assert.Contains(warnings, w => w.Contains("'" + inside + "'", StringComparison.Ordinal) && w.Contains("working tree", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, w => w.Contains("'" + dirA + "'", StringComparison.Ordinal));
+    }
+
     // ---- gate.trust ----------------------------------------------------------------------------------------
 
     [Fact]
