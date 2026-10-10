@@ -281,11 +281,6 @@ public sealed class GateTrustLoopTests : IDisposable
     [InlineData(false)]
     public async Task A_gate_that_writes_a_file_named_in_its_argv_is_cleanAsync(bool existedBefore)
     {
-        // Production bug (gate-fix9, LaunchRun.TrustViolationMessageAsync): the report path is dropped from the
-        // checked list but stays in round 1's snapshot, so SetDifferences reports it as "removed". Remove this
-        // skip when the exclusion also applies to the snapshot's keys.
-        Assert.SkipWhen(existedBefore, "known production bug: an excluded report path that existed before the worker is reported as changed");
-
         Setup setup = await NewSetupAsync(
             gate => gate["command"]!.AsArray().Add("report.out"),
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
@@ -688,6 +683,102 @@ public sealed class GateTrustLoopTests : IDisposable
         (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
 
         AssertClean(setup, code, stdout);
+    }
+
+    // ---- symlinked files, symlink loops, nested .git, unmatched globs ---------------------------------------
+
+    [Theory]
+    [InlineData("same")]
+    [InlineData("different")]
+    public async Task A_worker_that_replaces_a_gate_trust_glob_match_with_a_symlink_trips_the_trust_checkAsync(string target)
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["*.cfg"]));
+        string content = target is "same" ? "one" : "two";
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '" + content + "' > target.txt\nrm tools.cfg\nln -s target.txt tools.cfg",
+            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "tools.cfg"), "one"));
+
+        AssertViolation(setup, code, stdout, "tools.cfg");
+    }
+
+    [Theory]
+    [InlineData("same")]
+    [InlineData("different")]
+    public async Task A_worker_that_replaces_a_runs_root_file_with_a_symlink_trips_the_trust_checkAsync(string target)
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        Setup setup = await NewSetupAsync();
+        string project = Path.Combine(setup.Root, "project.md");
+        await File.WriteAllTextAsync(project, "one", TestContext.Current.CancellationToken);
+        string content = target is "same" ? "one" : "two";
+        string elsewhere = Path.Combine(_dirs.Create("lw-gate-link-target"), "target.md");
+
+        (int code, string stdout) = await RunAsync(
+            setup, "printf '" + content + "' > '" + elsewhere + "'\nrm '" + project + "'\nln -s '" + elsewhere + "' '" + project + "'");
+
+        AssertViolation(setup, code, stdout, "project.md");
+    }
+
+    [Fact]
+    public async Task A_symlinked_directory_that_loops_back_does_not_fail_the_git_root_walkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+        Assert.SkipWhen(Launcher.FindOnPath("git") is null, "git is not on PATH");
+
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
+
+        (int code, string stdout) = await RunAsync(setup, "true", () =>
+        {
+            string repo = Directory.GetCurrentDirectory();
+            GitInit(repo);
+            File.WriteAllText(Path.Combine(repo, "a.props"), "<Project/>");
+            _ = File.CreateSymbolicLink(Path.Combine(repo, "loop"), "..");
+        });
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_trusted_glob_match_inside_a_nested_dot_git_directory_is_protectedAsync()
+    {
+        Assert.SkipWhen(Launcher.FindOnPath("git") is null, "git is not on PATH");
+
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '<Project><PropertyGroup/></Project>' > vendor/.git/inner.props",
+            () =>
+            {
+                string repo = Directory.GetCurrentDirectory();
+                GitInit(repo);
+                _ = Directory.CreateDirectory(Path.Combine(repo, "vendor", ".git"));
+                File.WriteAllText(Path.Combine(repo, "vendor", ".git", "inner.props"), "<Project/>");
+            });
+
+        AssertViolation(setup, code, stdout, "inner.props");
+    }
+
+    [Fact]
+    public async Task A_gate_trust_glob_that_matches_no_files_is_a_warning_not_an_errorAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.lw-no-such-extension"]));
+        const string Message = "gate.trust[0] '**/*.lw-no-such-extension' matched no files";
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+        Assert.Contains("note:", stdout, StringComparison.Ordinal);
+        Assert.Contains(Message, stdout, StringComparison.Ordinal);
+        string runDir = Path.Combine(setup.Root, "runs", GateLoopTests.RunDirNames(setup.Root)[0]);
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        JsonArray warnings = gateJson["warnings"]!.AsArray();
+        Assert.Contains(warnings, w => w!.GetValue<string>() == Message);
     }
 
     // ---- round bookkeeping ---------------------------------------------------------------------------------
