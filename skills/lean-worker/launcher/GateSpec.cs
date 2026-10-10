@@ -5,6 +5,15 @@
 // User-supplied `reportFromLastLine` patterns must include at least one capture group. The runner reads
 // group 1 first; if that is empty it falls back to the first named group (excluding group 0), so a regex
 // that uses a named capture for its only group — like the default `^sarif: (?<report>.+)$` — still works.
+//
+// `gate.outputs` is the operator's explicit declaration of the repo-relative paths the gate writes (its
+// report and any other artifacts). The launcher used to guess which argv entries were pure gate outputs —
+// argv position and execute bits — so a gate could rewrite its own report file without tripping the trust
+// check. Guessing cannot see through a wrapper such as `env VAR=1 sh gate.sh`: the report is neither
+// argv[0] nor argv[1] and carries no execute bit, so the heuristic is dropped. No argv entry is excluded
+// from a trust comparison by default; a gate that writes a file named in its argv needs that file declared
+// here. A gate whose report is not named in its argv — a lint gate's default report under artifacts/, for
+// example — needs no gate.outputs at all.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -12,7 +21,7 @@ using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Warnings = null)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can
@@ -60,6 +69,8 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         // carries the reportFromLastLine regex, and the path itself arrives on the gate's stdout at
         // run time. The trusted-input check for it is therefore run-time only (LaunchRun's trust
         // checks via GateTrust.ReportPathViolation, after the gate runs and the path is resolved).
+        // Declared gate.outputs entries, in contrast, are known up front and validated against the
+        // fixed trusted inputs when round 1 collects them, before the worker starts.
         Regex reportFromLastLine = ReadReportRegex(gate);
         string countPath = ReadCountPath(gate);
         int feedbackMaxChars = ReadPositiveInt(gate, "feedbackMaxChars", 8000, "profile gate.feedbackMaxChars");
@@ -68,8 +79,9 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         decimal? maxTotalUsd = ReadMaxTotalUsd(gate);
         List<string> env = ReadEnv(gate);
         List<string> trust = ReadTrust(gate);
+        List<string> outputs = ReadOutputs(gate);
 
-        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env, trust);
+        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env, trust, outputs);
     }
 
     private static List<string> ReadCommand(JsonObject gate, string gateWorkingDirectory)
@@ -297,5 +309,69 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         }
 
         return trust;
+    }
+
+    /// <summary>
+    /// Reads <c>gate.outputs</c>: an optional array of repo-relative paths (relative to the git root, or
+    /// the working directory when not in git) that the gate writes — its report and any other artifacts.
+    /// This declaration replaces the dropped runnable-argv heuristic: whether an argv entry is a pure
+    /// output cannot be inferred from its position or its execute bit (a wrapper such as
+    /// <c>env VAR=1 sh gate.sh</c> hides both the script and the report), so nothing is guessed and the
+    /// operator names the outputs instead. Entries must be non-empty strings, relative, without a
+    /// <c>..</c> segment and without glob characters (a declared output names exactly one path; a glob
+    /// would leave it ambiguous which files the gate may rewrite). A gate whose report is not named in
+    /// its argv — a lint gate's default report under <c>artifacts/</c>, for example — needs no
+    /// <c>gate.outputs</c>: an untrusted path needs no exclusion.
+    /// </summary>
+    private static List<string> ReadOutputs(JsonObject gate)
+    {
+        if (!gate.TryGetPropertyValue("outputs", out JsonNode? n) || n is null)
+        {
+            return [];
+        }
+
+        if (n is not JsonArray arr)
+        {
+            throw new LaunchException("profile gate.outputs must be an array of repo-relative paths");
+        }
+
+        List<string> outputs = new(arr.Count);
+        for (int i = 0; i < arr.Count; i++)
+        {
+            JsonNode? item = arr[i];
+            if (item is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
+            {
+                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must be a non-empty string");
+            }
+
+            string normalized = s.Replace('\\', '/');
+            // Absolute entries would let a profile aim the gate at a file outside the repo; the trust
+            // set is repo-relative for the same reason.
+            if (Path.IsPathRooted(normalized) || normalized.StartsWith('/'))
+            {
+                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must be a relative path: {s}");
+            }
+
+            // No parent traversal: ".." would let a declared output reach outside the repo boundary.
+            foreach (string segment in normalized.Split('/'))
+            {
+                if (segment is "..")
+                {
+                    throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
+                }
+            }
+
+            // No glob characters: the exclusion of a declared output from the after-gate comparison is
+            // only safe when it names exactly the path the gate writes (the same rule that keeps
+            // gate.trust globs out of the report-path decision).
+            if (normalized.IndexOfAny(['*', '?']) >= 0)
+            {
+                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain glob characters: {s}");
+            }
+
+            outputs.Add(normalized);
+        }
+
+        return outputs;
     }
 }

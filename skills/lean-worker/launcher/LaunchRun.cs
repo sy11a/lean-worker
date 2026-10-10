@@ -104,14 +104,13 @@ internal sealed class LaunchRun
     // entries, the resolved gate executable, the prices file) and hashes everything before its worker;
     // both are frozen into GateContext, and every later round compares against round 1's snapshot
     // (before its worker, before its gate, after its gate). The fixed paths' per-path sources come
-    // along, frozen too, together with the gate's runnable inputs (the resolved executable, argv[1]
-    // when it is an existing file, execute-bit argv entries), decided at the same
-    // moment: the gate's report path may be excluded from a comparison only when argv entries are its
-    // sole source and the path is not something the gate runs (GateTrust.ReportPathViolation).
+    // along, frozen too: they tell the report-path rule where a path is trusted from. Nothing is
+    // excluded from a comparison by default — not even entries of the gate's own argv; only the
+    // profile's declared gate.outputs leave the after-gate comparison, because the gate is expected
+    // to write exactly those paths.
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
     public IReadOnlyList<string>? TrustPaths { get; private set; }
     public IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources { get; private set; }
-    public IReadOnlySet<string>? FixedRunnable { get; private set; }
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -705,7 +704,6 @@ internal sealed class LaunchRun
             TrustSnapshot = GateContext.TrustSnapshot;
             TrustPaths = GateContext.TrustPaths;
             FixedSources = GateContext.FixedSources;
-            FixedRunnable = GateContext.FixedRunnable;
             if (_gate?.Warnings is { Count: > 0 } frozen)
             {
                 _notes.AddRange(frozen);
@@ -720,7 +718,11 @@ internal sealed class LaunchRun
         // and refuses the gate if anything changed (a worker could otherwise swap the gate command
         // or its report path).
         TrustPaths = await CollectFixedPathsAsync().ConfigureAwait(false);
-        (List<string> snapshotPaths, _) = await CollectCheckPathsAsync(ReportPathExclusions()).ConfigureAwait(false);
+        (List<string> snapshotPaths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> snapshotSources) =
+            await CollectCheckPathsAsync(_noExclusions).ConfigureAwait(false);
+        // A declared output that is also a trusted input is a configuration mistake, not tampering:
+        // refuse it here, before the worker starts, as a launch error (exit 2).
+        await ValidateDeclaredOutputsAsync(snapshotSources).ConfigureAwait(false);
         TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
     }
 
@@ -728,11 +730,10 @@ internal sealed class LaunchRun
     /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
     /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
     /// once, before round 1's worker, so glob matches and argv entries never pick up files the
-    /// worker or the gate create later. The gate's runnable inputs (executable, the interpreter's
-    /// argv[1] script when it exists, execute-bit argv entries) are decided in the same pass — see
-    /// <see cref="GateTrust.MarkRunnableArgv"/> — so the report-path rule never depends on what the
-    /// gate did. A gate.trust glob that matched no file becomes a warning on the gate spec (recorded
-    /// in gate.json) and a note in the result block.
+    /// worker or the gate create later. The per-path sources are frozen with the list: the
+    /// report-path rule asks where a path is trusted from, and a later round must not re-derive
+    /// that from a tree the worker has already changed. A gate.trust glob that matched no file
+    /// becomes a warning on the gate spec (recorded in gate.json) and a note in the result block.
     /// </summary>
     private async Task<List<string>> CollectFixedPathsAsync()
     {
@@ -742,10 +743,8 @@ internal sealed class LaunchRun
         string root = gitRoot ?? cwd;
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
-        HashSet<string> runnable = new(StringComparer.Ordinal);
-        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, runnable);
+        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources);
         FixedSources = sources;
-        FixedRunnable = runnable;
         if (warnings.Count > 0)
         {
             _gate = gate with { Warnings = warnings };
@@ -759,12 +758,12 @@ internal sealed class LaunchRun
     /// <summary>
     /// The paths for one trust check: the chain's fixed list plus the volatile walks re-collected now
     /// (runs-root files and the config-file walk, which are meant to catch new files), minus the
-    /// report paths the gate named — gate output, not a trusted input. Also returns the per-path
-    /// sources for this check (round 1's frozen fixed-path sources, deep-copied, plus the volatile
-    /// walks' sources recorded now), so the checks can tell a legally excluded report path from one
-    /// the trust set holds for another reason. The sources cover every collected path whether or not
-    /// an exclusion drops it from the path list: the rule asks where the report path is trusted
-    /// from, not whether it takes part in this comparison.
+    /// caller's exclusions — empty for the before-worker and before-gate checks (nothing is excluded
+    /// by default, the gate's argv entries included), the declared gate outputs for the after-gate
+    /// check (the gate is expected to write exactly those). Also returns the per-path sources for
+    /// this check (round 1's frozen fixed-path sources, deep-copied, plus the volatile walks'
+    /// sources recorded now), so the report-path rule can ask where a path is trusted from whether
+    /// or not an exclusion dropped it from the path list.
     /// </summary>
     private async Task<(List<string> Paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> Sources)> CollectCheckPathsAsync(IReadOnlySet<string> exclusions)
     {
@@ -792,25 +791,99 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// The report paths the gate named, excluded from trust checks — but only when each one passes
-    /// <see cref="GateTrust.ReportPathViolation"/>: an argv output entry, and nothing the gate runs.
-    /// A path trusted from any other source, or a runnable gate input (the resolved executable,
-    /// argv[1] when it is an existing file, an execute-bit argv entry — decided once in
-    /// round 1, before the worker), makes the exclusion illegal: the checks report that instead of
-    /// dropping the path from the comparison.
+    /// Shared empty exclusion set: the before-worker snapshot and the pre-gate comparison exclude
+    /// nothing. No argv entry is ever excluded by default — the old runnable-argv heuristic (argv
+    /// position, execute bits) missed wrappers such as <c>env VAR=1 sh gate.sh</c>, where the report
+    /// is neither argv[0] nor argv[1] and carries no execute bit, so guessing was dropped in favour
+    /// of the profile's explicit <c>gate.outputs</c> declaration.
     /// </summary>
-    private static IReadOnlySet<string> ReportPathExclusions(params string?[] reportPaths)
+    private static readonly IReadOnlySet<string> _noExclusions = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The profile's declared <c>gate.outputs</c>, resolved against the git root (or the working
+    /// directory when not in git) — the same anchor the trust entries resolve against.
+    /// </summary>
+    private async Task<List<string>> DeclaredOutputPathsAsync()
     {
-        HashSet<string> exclusions = new(StringComparer.Ordinal);
-        foreach (string? reportPath in reportPaths)
+        GateSpec gate = NonNull(_gate);
+        if (gate.Outputs is not { Count: > 0 })
         {
-            if (reportPath is { Length: > 0 })
-            {
-                exclusions.Add(reportPath);
-            }
+            return [];
         }
 
-        return exclusions;
+        string anchor = await OutputAnchorAsync().ConfigureAwait(false);
+        List<string> resolved = new(gate.Outputs.Count);
+        foreach (string entry in gate.Outputs)
+        {
+            resolved.Add(ResolveOutputEntry(entry, anchor));
+        }
+
+        return resolved;
+    }
+
+    /// <summary>
+    /// The declared gate outputs as the exclusion set of the after-gate trust comparison: the gate
+    /// is expected to write them, so they leave both sides of that one comparison. The before-worker
+    /// snapshot and the pre-gate comparison exclude nothing (<see cref="_noExclusions"/>) — the worker
+    /// must not change a declared output either; only the gate, after the pre-gate check, may.
+    /// </summary>
+    private async Task<IReadOnlySet<string>> DeclaredOutputExclusionsAsync()
+    {
+        List<string> outputs = await DeclaredOutputPathsAsync().ConfigureAwait(false);
+        return outputs.Count is 0 ? _noExclusions : new HashSet<string>(outputs, StringComparer.Ordinal);
+    }
+
+    // gitRoot ?? cwd: the anchor CollectFixedPathsAsync resolved the fixed trust list against, so a
+    // declared output and a trust entry name the same file the same way.
+    private static async Task<string> OutputAnchorAsync()
+    {
+        string cwd = Directory.GetCurrentDirectory();
+        return await RepoToken.RootAsync(cwd).ConfigureAwait(false) ?? cwd;
+    }
+
+    private static string ResolveOutputEntry(string entry, string anchor)
+    {
+        try
+        {
+            return Path.GetFullPath(Path.Combine(anchor, entry));
+        }
+        catch (ArgumentException ex)
+        {
+            // Spec validation (non-empty, relative, no "..", no globs) has passed; this is a path
+            // the OS layer still refuses. A configuration mistake → launch error, not a crash.
+            throw new LaunchException($"profile gate.outputs entry '{entry}' is invalid: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Refuses a declared output that is also a trusted gate input from any source other than an
+    /// argv entry: the resolved executable, a gate.trust literal or glob match, the prices file, a
+    /// config-walk file (<c>global.json</c>, <c>nuget.config</c>, <c>dotnet-tools.json</c>,
+    /// <c>.config/dotnet-tools.json</c>) or a runs-root file. An argv entry is allowed: the operator
+    /// may pin the very file the gate writes to (e.g. <c>sh gate.sh artifacts/check.sarif</c> with
+    /// the path in the argv and in <c>gate.outputs</c>) — it is compared before the gate, and only
+    /// the after-gate comparison excludes it. Runs at the round-1 fixed-list collection, before the
+    /// worker: a collision is a profile mistake, so it fails as a launch error (exit 2), not as a
+    /// trust violation.
+    /// </summary>
+    private async Task ValidateDeclaredOutputsAsync(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
+    {
+        GateSpec gate = NonNull(_gate);
+        if (gate.Outputs is not { Count: > 0 })
+        {
+            return;
+        }
+
+        string anchor = await OutputAnchorAsync().ConfigureAwait(false);
+        for (int i = 0; i < gate.Outputs.Count; i++)
+        {
+            string full = ResolveOutputEntry(gate.Outputs[i], anchor);
+            if (sources.TryGetValue(full, out HashSet<GateTrust.TrustSource>? set)
+                && set.Any(s => s is not GateTrust.TrustSource.ArgvEntry))
+            {
+                throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is a trusted gate input");
+            }
+        }
     }
 
     private string Status()
@@ -900,12 +973,13 @@ internal sealed class LaunchRun
         try
         {
             // Pre-gate: a worker may have swapped a trusted input between round 1's before-worker
-            // snapshot and now. The check refuses the gate with a precise list of changed paths so
+            // snapshot and now. Nothing is excluded: a declared gate output is compared like any
+            // other trusted path here, because the worker must not change it — only the gate may,
+            // after this check. The check refuses the gate with a precise list of changed paths so
             // the chain ends in `error` instead of running the gate against tampered inputs.
             if (TrustSnapshot is not null)
             {
-                violation = await TrustViolationMessageAsync(ReportPathExclusions(GateContext?.Feedback.ReportPath),
-                    "the worker changed files the gate trusts: ").ConfigureAwait(false);
+                violation = await TrustViolationMessageAsync(_noExclusions, reportPath: null, "the worker changed files the gate trusts: ").ConfigureAwait(false);
             }
 
             if (violation is null)
@@ -916,11 +990,13 @@ internal sealed class LaunchRun
                 // Post-gate: a process the worker detached can survive the worker's exit and rewrite
                 // a trusted file between the pre-gate check and the gate's end. The pre-gate check
                 // is not enough; we hash a third time after the gate exits and refuse the chain on
-                // any difference from round 1's before-worker snapshot (or a bad state). The report
-                // file the gate named is excluded only when it is a pure argv output: it must not be
-                // a trusted input from another source, nor something the gate runs (executable,
-                // argv[1] when it is an existing file, execute-bit argv entry — fixed in round 1); the
-                // check reports that case before the comparison runs.
+                // any difference from round 1's before-worker snapshot (or a bad state). The
+                // declared gate outputs leave this comparison on both sides — the gate is expected
+                // to write exactly those paths; everything else (the gate's argv entries included)
+                // must match. The gate's report path is checked first, inside the same call: it may
+                // be under this run's directory or a declared output, it is a trust violation when
+                // it is a trusted input from any source, and it is invisible to the trust set
+                // otherwise.
                 //
                 // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted
                 // file between two hashes and restores it before the next hash escapes the check.
@@ -928,7 +1004,7 @@ internal sealed class LaunchRun
                 // not take that step.
                 if (TrustSnapshot is not null)
                 {
-                    violation = await TrustViolationMessageAsync(ReportPathExclusions(result.ReportPath, GateContext?.Feedback.ReportPath),
+                    violation = await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync().ConfigureAwait(false), result.ReportPath,
                         "trusted files changed while the gate ran: ").ConfigureAwait(false);
                 }
             }
@@ -944,27 +1020,23 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// Runs one trust check against round 1's before-worker snapshot: every path in
-    /// <paramref name="exclusions"/> (the report paths the gate named) must be trusted solely as an
-    /// argv file entry that is not runnable — an argv output entry — or the check refuses the chain
-    /// before comparing anything: an exclusion the rule does not allow would drop a trusted input
-    /// from both sides and hide the gate writing over (or running) it. Then compare the path sets
-    /// first (a file that appeared or vanished is reported before anything is hashed), then hash the
-    /// stable list and stop at the first entry that differs or sits in a bad state, so a planted
-    /// FIFO cannot cost a timeout per entry. Returns null when the tree is clean; otherwise the
-    /// error message for the chain's trust violation.
+    /// Runs one trust check against round 1's before-worker snapshot. When the gate has already run,
+    /// <paramref name="reportPath"/> is the report path it named: it is checked first, because a
+    /// trusted input the gate just announced it writes over deserves a precise error instead of a
+    /// generic comparison failure (<see cref="GateTrust.ReportPathViolation"/>). Then compare the
+    /// path sets first (a file that appeared or vanished is reported before anything is hashed),
+    /// then hash the stable list and stop at the first entry that differs or sits in a bad state, so
+    /// a planted FIFO cannot cost a timeout per entry. Returns null when the tree is clean;
+    /// otherwise the error message for the chain's trust violation.
     /// </summary>
-    private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string changedPrefix)
+    private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string? reportPath, string changedPrefix)
     {
         GateTrust.Snapshot before = NonNull(TrustSnapshot);
         (List<string> paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources) = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
 
-        foreach (string reportPath in exclusions)
+        if (GateTrust.ReportPathViolation(reportPath, sources, await DeclaredOutputExclusionsAsync().ConfigureAwait(false), RunDir) is { } reportViolation)
         {
-            if (GateTrust.ReportPathViolation(reportPath, sources, NonNull(FixedRunnable)) is { } reportViolation)
-            {
-                return reportViolation;
-            }
+            return reportViolation;
         }
 
         List<string> setDiff = GateTrust.SetDifferences(before, paths, exclusions);

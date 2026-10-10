@@ -877,6 +877,13 @@ internal static class Gate
             ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
             ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
         };
+        // The declared gate outputs, as written in the profile: the record shows which paths the
+        // gate may write (they leave the after-gate trust comparison, nothing else does).
+        if (spec.Outputs is { Count: > 0 })
+        {
+            o["outputs"] = new JsonArray([.. spec.Outputs.Select(c => (JsonNode)c)]);
+        }
+
         if (spec.Warnings is { Count: > 0 })
         {
             o["warnings"] = new JsonArray([.. spec.Warnings.Select(w => (JsonNode)w)]);

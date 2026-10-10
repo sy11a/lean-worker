@@ -66,18 +66,21 @@ internal static class GateTrust
     /// Where a trusted path came from. A path can be in the trusted set for more than one reason (an
     /// argv entry that is also a gate.trust literal); <see cref="CollectChainPaths"/> and
     /// <see cref="CollectVolatilePaths"/> record every source when the caller hands them a dictionary.
-    /// The gate's report path may be dropped from a trust comparison only when its sources are exactly
-    /// <see cref="TrustSource.ArgvEntry"/> — a gate writing its own report file named in its argv —
-    /// and the argv entry is not runnable (<see cref="MarkRunnableArgv"/>): the exclusion must never
-    /// cover something the gate runs. Any other source (the resolved executable, a gate.trust
-    /// literal/glob, the prices file, the config walk or the runs-root walk) makes the path a trusted
-    /// input that a report written over it would corrupt. <see cref="ReportPathViolation"/> enforces
-    /// that rule.
+    /// The sources feed the report-path rule (<see cref="ReportPathViolation"/>): a path the gate names
+    /// as its report must not be trusted from any source — argv entry, resolved executable, gate.trust
+    /// literal or glob match, prices file, config walk or runs-root walk — unless the operator declared
+    /// it a gate output or it lies under the current run directory. Those two exemptions are the
+    /// caller's context (the frozen spec and the run directory), so the caller checks them and only a
+    /// still-trusted path reaches this rule.
     /// </summary>
     internal enum TrustSource
     {
         /// <summary>
-        /// An existing file path named in the gate's argv (after argv[0]), under the git root.
+        /// An existing file path named in the gate's argv (after argv[0]), under the git root. No argv
+        /// entry is ever excluded from a trust comparison by default: the old runnable-position
+        /// heuristic missed wrappers such as <c>env VAR=1 sh gate.sh</c>, so a gate that writes a file
+        /// named in its argv needs that file declared in <c>gate.outputs</c> (or the run ends in a
+        /// trust violation when the report path is checked).
         /// </summary>
         ArgvEntry,
         /// <summary>
@@ -387,29 +390,41 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// The trust violation for dropping <paramref name="reportPath"/> from a trust comparison, or
-    /// null when the exclusion is allowed. The report path (resolved from the gate's stdout after
-    /// the gate runs) is dropped from the checked list and from the snapshot's keys, so a gate that
-    /// writes its report over a trusted input would otherwise hide the change. The exclusion is
-    /// therefore legal only when the path sits in the trusted set solely as an argv file entry that
-    /// is not runnable — the gate writing its own report file named in its argv, a pure output. A
-    /// path in <paramref name="runnable"/> (<see cref="MarkRunnableArgv"/>) is something the gate
-    /// executes, and the exclusion is exactly what would hide an input the worker swapped and the
-    /// gate then ran; the same holds when any other source (the resolved executable, a gate.trust
-    /// literal/glob, the prices file, the config walk or the runs-root walk) put the path in the
-    /// trusted set. A path that is not in the trusted set has nothing to exclude (null); otherwise
-    /// the returned message names the path and the caller ends the chain with <c>error</c> instead
-    /// of comparing a set the report path no longer takes part in.
+    /// The trust violation for the gate's report path, or null when writing the report is legitimate.
+    /// The launcher used to guess which argv entries were pure gate outputs (argv[1], execute bits) so
+    /// a gate could rewrite its own report file without tripping the trust check; the guess cannot see
+    /// through a wrapper such as <c>env VAR=1 sh gate.sh</c>, where the report is neither argv[0] nor
+    /// argv[1] and carries no execute bit, so the heuristic is dropped. Writing the report is
+    /// legitimate exactly when the path lies under the current run directory
+    /// (<paramref name="runDirectory"/>, the launcher's own bookkeeping), is a declared gate output
+    /// (<paramref name="declaredOutputs"/>, the profile's <c>gate.outputs</c> resolved the same way as
+    /// the trust entries), or is not in the trusted set at all. Any remaining trusted source (an argv
+    /// entry, the resolved executable, a gate.trust literal/glob, the prices file, the config walk or
+    /// the runs-root walk) makes the report path a trusted input that the gate has just announced it
+    /// writes over; the returned message ends the chain with <c>error</c> while keeping the gate's
+    /// real exit code, count and duration.
     /// </summary>
-    public static string? ReportPathViolation(string? reportPath, IReadOnlyDictionary<string, HashSet<TrustSource>> sources, IReadOnlySet<string>? runnable = null)
+    public static string? ReportPathViolation(string? reportPath, IReadOnlyDictionary<string, HashSet<TrustSource>> sources,
+        IReadOnlySet<string>? declaredOutputs = null, string? runDirectory = null)
     {
-        if (reportPath is null || reportPath.Length is 0 || !sources.TryGetValue(reportPath, out HashSet<TrustSource>? from))
+        if (string.IsNullOrEmpty(reportPath))
         {
             return null;
         }
 
-        bool argvOutputEntry = from.Count is 1 && from.Contains(TrustSource.ArgvEntry) && runnable?.Contains(reportPath) is not true;
-        return argvOutputEntry ? null : $"the gate's report path is a trusted input: {reportPath}";
+        // The report path arrives resolved to an absolute path (Gate resolves it against the working
+        // directory); the run directory may still be relative to it.
+        if (runDirectory is { Length: > 0 } && IsAtOrUnder(reportPath, Path.GetFullPath(runDirectory)))
+        {
+            return null;
+        }
+
+        if (declaredOutputs?.Contains(reportPath) is true)
+        {
+            return null;
+        }
+
+        return sources.ContainsKey(reportPath) ? $"the gate's report path is a trusted input: {reportPath}" : null;
     }
 
     /// <summary>
@@ -490,15 +505,13 @@ internal static class GateTrust
     /// <paramref name="extraPricesFile"/> whenever one is given (even under
     /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl). When
     /// <paramref name="sources"/> is given, every add records its <see cref="TrustSource"/> in it
-    /// (merged across collectors, so a path named twice is trusted from both). When
-    /// <paramref name="runnable"/> is given, the gate's runnable inputs are added to it (see
-    /// <see cref="MarkRunnableArgv"/>).
+    /// (merged across collectors, so a path named twice is trusted from both).
     /// </summary>
     public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
         IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
-        Dictionary<string, HashSet<TrustSource>>? sources = null, HashSet<string>? runnable = null)
+        Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
-        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings, sources, runnable);
+        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings, sources);
         HashSet<string> dedupe = new(paths, StringComparer.Ordinal);
         foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot, sources))
         {
@@ -520,14 +533,11 @@ internal static class GateTrust
     /// the runs root; a glob that matches no file adds a warning to <paramref name="warnings"/>
     /// when that list is given. When <paramref name="sources"/> is given, every add records its
     /// <see cref="TrustSource"/> in it — even for a path the per-collector dedupe skips, since the
-    /// report-path rule must see every source a path is trusted from. When
-    /// <paramref name="runnable"/> is given, the gate's runnable inputs are added to it at the same
-    /// moment, from the same command and working directory (<see cref="MarkRunnableArgv"/>), so the
-    /// report-path rule never depends on what the gate or the worker did later.
+    /// report-path rule must see every source a path is trusted from.
     /// </summary>
     public static List<string> CollectChainPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
         IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
-        Dictionary<string, HashSet<TrustSource>>? sources = null, HashSet<string>? runnable = null)
+        Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -559,14 +569,6 @@ internal static class GateTrust
             }
 
             set.Add(source);
-        }
-
-        // Runnable marking runs beside the adds, not inside them: the rules scan every argv entry
-        // (also ones outside the git root, which the trust set never holds, because the argv[1]
-        // position or an execute bit can make any of them runnable).
-        if (runnable is not null)
-        {
-            MarkRunnableArgv(gateCommand, gateWorkingDirectory, runnable);
         }
 
         AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.Executable));
@@ -827,126 +829,6 @@ internal static class GateTrust
             }
 
             add(full);
-        }
-    }
-
-    /// <summary>
-    /// Marks the gate's runnable inputs — the paths the gate executes — in <paramref name="runnable"/>.
-    /// The report-path exclusion drops a path from both sides of a trust comparison, so it must never
-    /// cover something the gate runs: an input the worker swapped between the before-worker snapshot
-    /// and the gate's execution would otherwise be run by the gate while the post-gate comparison,
-    /// blinded by the exclusion, never sees the swap. A path is runnable when it is
-    ///   - the resolved executable (argv[0]: found on PATH when the entry has no directory part, else
-    ///     resolved against the gate working directory); or
-    ///   - argv[1] only, when it is an existing file — the script an interpreter such as <c>sh</c>,
-    ///     <c>bash</c>, <c>dotnet</c> or <c>python</c> consumes as the thing it runs
-    ///     (<c>dotnet-lock.sh</c> in <c>sh dotnet-lock.sh dotnet build ...</c>); later file arguments
-    ///     are data the command reads or writes, not scripts, so they are not runnable by this rule
-    ///     (an output file named after the script, e.g. <c>report.out</c> in <c>sh gate.sh report.out</c>
-    ///     with a pre-existing <c>report.out</c>, stays excludable); or
-    ///   - any argv file entry with an execute bit (File.GetUnixFileMode: user, group or other — on
-    ///     Windows, which has no execute bits, a runnable extension .exe/.cmd/.bat/.ps1; a mode that
-    ///     cannot be read counts as runnable, fail closed) — a file the command could execute no
-    ///     matter where it sits in the argv.
-    /// The rule is deliberately not "only argv files that did not exist before round 1 may be
-    /// excluded": a report left over from an earlier run legitimately exists before this run starts
-    /// (the gate rewrites the same report path every round), so a pre-existing argv entry can still
-    /// be a pure output — refusing its exclusion was the false positive gate-fix11b introduced. What
-    /// must block an exclusion is runnability (something the gate could execute), not the file's age.
-    /// Everything is evaluated when the fixed trust list is collected (round 1, before the worker):
-    /// existence and execute bits are frozen then, so the rule never depends on what the gate did —
-    /// in particular a report file the gate creates mid-run is never retroactively runnable, and a
-    /// report path that equals a runnable input is refused by <see cref="ReportPathViolation"/> even
-    /// when it is trusted solely as an argv entry.
-    /// </summary>
-    private static void MarkRunnableArgv(IReadOnlyList<string> gateCommand, string gateWorkingDirectory, HashSet<string> runnable)
-    {
-        string exe = ResolveExecutable(gateCommand, gateWorkingDirectory);
-        if (exe.Length is not 0)
-        {
-            runnable.Add(exe);
-        }
-
-        for (int i = 1; i < gateCommand.Count; i++)
-        {
-            string entry = gateCommand[i];
-            if (string.IsNullOrEmpty(entry))
-            {
-                continue;
-            }
-
-            string full;
-            try
-            {
-                full = Path.IsPathRooted(entry)
-                    ? Path.GetFullPath(entry)
-                    : Path.GetFullPath(Path.Combine(gateWorkingDirectory, entry));
-            }
-            catch (ArgumentException)
-            {
-                // Not resolvable, hence not an existing file: only the execute-bit rule could apply.
-                continue;
-            }
-
-            if (!File.Exists(full))
-            {
-                continue;
-            }
-
-            if (i is 1)
-            {
-                runnable.Add(full);
-            }
-
-            if (HasExecuteBit(full))
-            {
-                runnable.Add(full);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Extensions Windows treats as runnable when it has no execute bits to check
-    /// (ordinal-ignore-case).
-    /// </summary>
-    private static readonly HashSet<string> _windowsRunnableExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".exe",
-        ".cmd",
-        ".bat",
-        ".ps1",
-    };
-
-    /// <summary>
-    /// Whether <paramref name="path"/> is something the command could execute: any execute bit
-    /// (user, group or other) on Unix, macOS included (File.GetUnixFileMode); on Windows, which has
-    /// no execute bits, a runnable extension (<c>.exe</c>, <c>.cmd</c>, <c>.bat</c>, <c>.ps1</c>,
-    /// ordinal-ignore-case). A mode that cannot be read counts as runnable (fail closed): the
-    /// caller refuses the report-path exclusion for a runnable path, and an unreadable stat must
-    /// never make a path excludable.
-    /// </summary>
-    private static bool HasExecuteBit(string path)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return _windowsRunnableExtensions.Contains(Path.GetExtension(path));
-        }
-
-        try
-        {
-            const UnixFileMode ExecuteBits = UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
-            return (File.GetUnixFileMode(path) & ExecuteBits) is not UnixFileMode.None;
-        }
-        catch (Exception ex) when (ex is IOException
-            or UnauthorizedAccessException
-            or ArgumentException
-            or NotSupportedException
-            or PlatformNotSupportedException)
-        {
-            // Fail closed: a mode we cannot read (the path vanished mid-check, or stat failed)
-            // counts as runnable, so the report-path exclusion never covers a file the gate might
-            // be able to execute.
-            return true;
         }
     }
 
