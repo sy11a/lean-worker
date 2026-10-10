@@ -9,8 +9,9 @@
 // budget a pre-tool hook blocks every tool call, so the worker's last message is a handoff; at the budget the
 // launcher stops the worker.
 //
-// Exit codes: 0 = worker finished without error, 1 = worker reported an error, 2 = launcher failed,
-// 3 = worker wrapped up near its budget and left a handoff (continue with --continue-from <run-dir>).
+// Exit codes: 0 = worker finished without error (or a gate chain ended clean), 1 = worker reported an error,
+// 2 = launcher failed, 3 = worker wrapped up near its budget and left a handoff (continue with
+// --continue-from <run-dir>), 4 = a gate chain ended stuck, 5 = a gate chain ended in an error.
 
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -25,6 +26,7 @@ internal static class Launcher
     // git flags that write files or run programs whatever prefix allowed the command (deny beats allow).
     internal static readonly string[] DeniedFloor = ["Bash(git *--output*)", "Bash(git *--ext-diff*)", "Bash(git *--textconv*)"];
     internal const string ContinuationHeading = "## Continuation (lean-worker)";
+    internal const string GateHeading = "## Gate report (lean-worker)";
     public const int RunSchemaVersion = 1;
 
     public static async Task<int> RunAsync(Options o)
@@ -35,7 +37,34 @@ internal static class Launcher
             return 0;
         }
 
-        return await new LaunchRun(o).RunAsync().ConfigureAwait(false);
+        LaunchRun run = new(o, gateContext: null);
+        int code = await run.RunAsync().ConfigureAwait(false);
+        while (run.LastGate is { Decision: GateChain.Continue })
+        {
+            GateContext nextContext = new(
+                ChainId: run.ChainId ?? run.RunDir,
+                Round: run.Round + 1,
+                Counts: [.. run.Counts],
+                ChainCostUsd: run.ChainCostUsd,
+                OriginalTask: run.OriginalTask,
+                OriginalName: run.OriginalName,
+                Feedback: run.LastGate.Result);
+            run = new LaunchRun(o, gateContext: nextContext);
+            code = await run.RunAsync().ConfigureAwait(false);
+        }
+
+        if (run.LastGate is null)
+        {
+            return code;
+        }
+
+        return run.LastGate.Decision switch
+        {
+            GateChain.Clean => 0,
+            GateChain.Stuck => 4,
+            GateChain.Error => 5,
+            _ => code,
+        };
     }
 
     /// <summary>

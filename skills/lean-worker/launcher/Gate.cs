@@ -1,13 +1,19 @@
-// The gate runner. After a successful worker run (a later task wires this up; see the gate-t50 brief), the
-// launcher starts the gate's command in <cwd>, drains its stdout and stderr in parallel into <runDir>/gate.log
-// (interleaved as the lines arrive; stderr lines prefixed "[stderr] ") and decides the run's next step from
-// the process's exit code and the report file the gate names on its last stdout line.
+// The gate runner. After a successful worker run, the launcher starts the gate's command in <cwd>, drains
+// its stdout and stderr in parallel into <runDir>/gate.log (interleaved as the lines arrive; stderr lines
+// prefixed "[stderr] ") and decides the run's next step from the process's exit code and the report file the
+// gate names on its last stdout line.
 //
 // Outcomes:
 //   "clean"    — exit 0, no findings (count 0, or the report's count path resolved to an empty array).
 //   "findings" — exit 1 with a non-empty findings array on the configured count path of the report.
 //   "error"    — any other condition (start failure, timeout, unexpected exit code, missing or malformed
 //                report file, mis-wired count path, zero findings on exit 1).
+//
+// Gate chain: a chain is a sequence of runs of one task. Round 1 is the user's run. After a successful worker
+// run the launcher runs the gate; "clean" / "error" end the chain, "findings" continue unless the chain is
+// stuck (no decrease in two consecutive rounds, the round reached MaxRounds, or the summed worker cost
+// exceeded MaxTotalUsd). GateChain.Decide captures the pure decision logic so it can be tested without
+// processes.
 
 using System.Diagnostics;
 using System.Globalization;

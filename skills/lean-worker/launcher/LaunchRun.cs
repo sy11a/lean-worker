@@ -62,7 +62,7 @@ internal sealed class LaunchRun
     private string _taskText = string.Empty;
     private string _name = string.Empty;
     private DateTimeOffset _started;
-    private string _runDir = string.Empty;
+    public string RunDir { get; private set; } = string.Empty;
 
     // WriteSystemAsync
     private string? _runSystem;
@@ -82,6 +82,17 @@ internal sealed class LaunchRun
     // Status
     private string _status = string.Empty;
 
+    // Gate chain (round 1 has no GateContext; round N+1 builds it from round N's GateOutcome)
+    public GateContext? GateContext { get; }
+    public Gate.GateResult? GateResult { get; private set; }
+    public GateOutcome? LastGate { get; private set; }
+    public string ChainId { get; private set; } = string.Empty;
+    public int Round { get; } = 1;
+    public IReadOnlyList<int> Counts { get; private set; } = [];
+    public decimal ChainCostUsd { get; private set; }
+    public string OriginalTask { get; private set; } = string.Empty;
+    public string OriginalName { get; private set; } = string.Empty;
+
     // BuildSummary (stats)
     private List<Usage> _calls = [];
     private JsonObject _tok = [];
@@ -94,7 +105,23 @@ internal sealed class LaunchRun
     private JsonObject _summary = [];
     private string _report = string.Empty;
 
-    public LaunchRun(Options o) => _o = o;
+    public LaunchRun(Options o, GateContext? gateContext = null)
+    {
+        _o = o;
+        GateContext = gateContext;
+        Round = gateContext?.Round ?? 1;
+        Counts = gateContext?.Counts ?? [];
+        ChainCostUsd = gateContext?.ChainCostUsd ?? 0m;
+        ChainId = gateContext?.ChainId ?? string.Empty;
+        OriginalTask = gateContext?.OriginalTask ?? string.Empty;
+        OriginalName = gateContext?.OriginalName ?? string.Empty;
+    }
+
+    /// <summary>
+    /// The chain loop reads <c>LastGate</c> to decide whether to start the next round; the rest are the chain
+    /// state at this round (chain id, round number, all counts so far, summed worker cost, original task text
+    /// and name). All are null/empty/zero for the first round until the gate runs.
+    /// </summary>
 
     public async Task<int> RunAsync()
     {
@@ -109,6 +136,7 @@ internal sealed class LaunchRun
         await WriteSystemAsync().ConfigureAwait(false);
         await ExecuteAsync().ConfigureAwait(false);
         _status = Status();
+        await RunGateAsync().ConfigureAwait(false);
         await ComputeSummaryStatsAsync().ConfigureAwait(false);
         BuildSummary();
         await WriteSummaryAsync().ConfigureAwait(false);
@@ -456,11 +484,23 @@ internal sealed class LaunchRun
     {
         string taskText;
         string name;
-        if (_o.ContinueFrom is not null)
+        if (GateContext is not null)
+        {
+            // Gate round: original task text (cut at any continuation/gate headings) plus a fresh gate section.
+            taskText = BuildGateTaskText(GateContext);
+            name = $"{GateContext.OriginalName}-gate{GateContext.Round.ToString(CultureInfo.InvariantCulture)}";
+        }
+        else if (_o.ContinueFrom is not null)
         {
             // Fresh worker, not a resumed session: the original task plus the previous worker's report.
             string prevTask = await File.ReadAllTextAsync(Path.Combine(_o.ContinueFrom, "task.md"), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             int cut = prevTask.IndexOf(Launcher.ContinuationHeading, StringComparison.Ordinal);
+            if (cut >= 0)
+            {
+                prevTask = prevTask[..cut];
+            }
+
+            cut = prevTask.IndexOf(Launcher.GateHeading, StringComparison.Ordinal);
             if (cut >= 0)
             {
                 prevTask = prevTask[..cut];
@@ -482,11 +522,49 @@ internal sealed class LaunchRun
         }
         _taskText = taskText;
         _name = name;
+        if (GateContext is null)
+        {
+            // Round 1: the chain id is this run's directory; the original task and name come from the file.
+            OriginalTask = taskText;
+            OriginalName = name;
+        }
         string safeName = new([.. name.Select(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '-')]);
         _started = DateTimeOffset.Now;
-        _runDir = Path.Combine(_runsRoot, "runs", string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"));
-        _ = Directory.CreateDirectory(_runDir);
-        await File.WriteAllTextAsync(Path.Combine(_runDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        RunDir = Path.Combine(_runsRoot, "runs", string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"));
+        if (GateContext is null)
+        {
+            // Round 1 anchors the chain; later rounds inherit round 1's run dir as their chain id.
+            ChainId = RunDir;
+        }
+        _ = Directory.CreateDirectory(RunDir);
+        await File.WriteAllTextAsync(Path.Combine(RunDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private static string BuildGateTaskText(GateContext context)
+    {
+        string nl = Environment.NewLine;
+        string baseText = context.OriginalTask ?? string.Empty;
+        int cut = baseText.IndexOf(Launcher.ContinuationHeading, StringComparison.Ordinal);
+        if (cut >= 0)
+        {
+            baseText = baseText[..cut];
+        }
+
+        cut = baseText.IndexOf(Launcher.GateHeading, StringComparison.Ordinal);
+        if (cut >= 0)
+        {
+            baseText = baseText[..cut];
+        }
+
+        baseText = baseText.TrimEnd();
+        Gate.GateResult feedback = context.Feedback;
+        int findings = feedback.Count ?? 0;
+        int previousRound = context.Round - 1;
+        string reportPath = feedback.ReportPath is { Length: > 0 } ? feedback.ReportPath : "(no report)";
+        string instruction = string.Create(CultureInfo.InvariantCulture,
+            $"The previous worker finished, but the gate command still reports {findings} finding(s) (round {previousRound.ToString(CultureInfo.InvariantCulture)}). Fix them; do not redo finished work. Check the current state first (git status, git diff --stat).");
+        return baseText + nl + nl + Launcher.GateHeading + nl + nl + instruction + nl + nl +
+               $"Full report: {reportPath}" + nl + nl + feedback.Feedback;
     }
 
     private async Task WriteSystemAsync()
@@ -513,7 +591,7 @@ internal sealed class LaunchRun
             string sha12 = Launcher.Sha12(content);
             runSystem = Path.GetFullPath(Path.Combine(_runsRoot, "system", $"{sha12}.md"));
             Launcher.AtomicWrite(runSystem, content);
-            await File.WriteAllTextAsync(Path.Combine(_runDir, "system.md"), content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            await File.WriteAllTextAsync(Path.Combine(RunDir, "system.md"), content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
         }
         _runSystem = runSystem;
     }
@@ -523,15 +601,15 @@ internal sealed class LaunchRun
         Provider providerInfo = NonNull(_providerInfo);
         IRuntime runtime = NonNull(_runtime);
         PriceBook prices = NonNull(_prices);
-        RunSpec spec = new(_runDir, _provider, _model, _effort, _variant, _tools, _allowed, _denied, _budget, _wrapUp, _permissionMode,
+        RunSpec spec = new(RunDir, _provider, _model, _effort, _variant, _tools, _allowed, _denied, _budget, _wrapUp, _permissionMode,
             _mcpConfig, _runSystem, _o.ReplaceSystemPrompt, _mode, _cacheTtl, _o.KeepClaudeMd, _o.KeepMemory, _keepHooks,
             !_o.NoUserEnv, _o.ClaudeSettings, providerInfo);
         Prepared prepared = runtime.Prepare(spec);
         // Locals declared before the try: needed by code after the try and the lambda inside.
-        _meter = new Meter(prices, _provider, _runDir, _budget, _wrapUp ? _wrapUpAt : null, Meter.HandoffInstruction);
+        _meter = new Meter(prices, _provider, RunDir, _budget, _wrapUp ? _wrapUpAt : null, Meter.HandoffInstruction);
         Meter meter = _meter;
-        string streamPath = Path.Combine(_runDir, "stream.jsonl");
-        _stderrPath = Path.Combine(_runDir, "stderr.txt");
+        string streamPath = Path.Combine(RunDir, "stream.jsonl");
+        _stderrPath = Path.Combine(RunDir, "stderr.txt");
         WriteScope.Snapshot? treeBefore;
         Outcome outcome = _outcome;
         string model = _model;
@@ -540,7 +618,7 @@ internal sealed class LaunchRun
         bool capKilled;
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(_runDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
             {
@@ -614,6 +692,35 @@ internal sealed class LaunchRun
         return status;
     }
 
+    private async Task RunGateAsync()
+    {
+        // The gate only runs after a successful worker (a non-success status ends the chain with the
+        // today's exit code; --no-gate or no profile key skips it).
+        if (_gate is null || _status is not "success")
+        {
+            return;
+        }
+
+        Gate.GateResult result = await Gate.RunAsync(_gate, RunDir, CancellationToken.None).ConfigureAwait(false);
+        GateResult = result;
+
+        List<int> countsIncludingThis = GateContext is null
+            ? [result.Count ?? 0]
+            : [.. GateContext.Counts, result.Count ?? 0];
+        decimal chainCostIncludingThis = ChainCostUsd + NonNull(_meter).Spent;
+        decimal maxTotalUsd = _gate.MaxTotalUsd ?? 0m;
+        int maxRounds = _gate.MaxRounds;
+
+        string decision = GateChain.Decide(result, countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd);
+        string? stuckReason = decision is GateChain.Stuck
+            ? GateChain.StuckReason(countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd)
+            : null;
+
+        Counts = countsIncludingThis;
+        ChainCostUsd = chainCostIncludingThis;
+        LastGate = new GateOutcome(decision, result, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason);
+    }
+
     private async Task ComputeSummaryStatsAsync()
     {
         _report = _outcome.Report;
@@ -638,7 +745,7 @@ internal sealed class LaunchRun
         }
         _firstCallCacheReadShare = firstCallCacheReadShare;
 
-        _hookChecks = File.Exists(Path.Combine(_runDir, "hook.log")) ? await Launcher.CountLinesAsync(Path.Combine(_runDir, "hook.log")).ConfigureAwait(false) : 0;
+        _hookChecks = File.Exists(Path.Combine(RunDir, "hook.log")) ? await Launcher.CountLinesAsync(Path.Combine(RunDir, "hook.log")).ConfigureAwait(false) : 0;
         _next = _status is "wrapped-up" or "success" ? null : Launcher.NextInChain(_chain, _provider, _model);
     }
 
@@ -651,7 +758,7 @@ internal sealed class LaunchRun
             ["schema_version"] = Launcher.RunSchemaVersion,
             ["timestamp"] = _started.ToString("o"),
             ["name"] = _name,
-            ["run_dir"] = _runDir,
+            ["run_dir"] = RunDir,
             ["profile"] = _profileName,
             ["runtime"] = _runtimeName,
             ["provider"] = _provider,
@@ -683,6 +790,7 @@ internal sealed class LaunchRun
             ["hook_checks"] = _hookChecks,
             ["continued_from"] = _o.ContinueFrom is null ? null : Path.GetFullPath(_o.ContinueFrom),
             ["escalate_to"] = _next,
+            ["gate"] = BuildGateSection(),
             ["model_traits"] = _traits?.Key,
             ["tokens"] = _tok,
             ["context_first_call"] = _first,
@@ -701,10 +809,33 @@ internal sealed class LaunchRun
         };
     }
 
+    private JsonNode? BuildGateSection()
+    {
+        GateOutcome? outcome = LastGate;
+        if (outcome is null)
+        {
+            return null;
+        }
+
+        Gate.GateResult result = outcome.Result;
+        return new JsonObject
+        {
+            ["chain_id"] = ChainId,
+            ["round"] = Round,
+            ["outcome"] = result.Outcome,
+            ["exit_code"] = result.ExitCode,
+            ["count"] = result.Count,
+            ["decision"] = outcome.Decision,
+            ["error"] = result.Error,
+            ["report_path"] = result.ReportPath,
+            ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
+        };
+    }
+
     private async Task WriteSummaryAsync()
     {
-        await File.WriteAllTextAsync(Path.Combine(_runDir, "summary.json"), _summary.ToJsonString(Json.Indented), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-        await File.WriteAllTextAsync(Path.Combine(_runDir, "report.md"), _report, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        await File.WriteAllTextAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        await File.WriteAllTextAsync(Path.Combine(RunDir, "report.md"), _report, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
         await File.AppendAllTextAsync(Path.Combine(_runsRoot, "runs.jsonl"), _summary.ToJsonString() + Environment.NewLine, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -722,7 +853,7 @@ internal sealed class LaunchRun
         TextWriter w = Console.Out;
         Meter meter = NonNull(_meter);
         await w.WriteLineAsync("LEAN-WORKER RESULT").ConfigureAwait(false);
-        await w.WriteLineAsync($"run:      {_runDir}").ConfigureAwait(false);
+        await w.WriteLineAsync($"run:      {RunDir}").ConfigureAwait(false);
         await w.WriteLineAsync(string.Create(CultureInfo.InvariantCulture, $"status:   {_status}  (subtype={_outcome.Subtype}, reason={_outcome.TerminalReason}, exit={_exitCode})")).ConfigureAwait(false);
         string knob = _runtimeName is "opencode" ? $"variant {_variant ?? "default"}" : $"effort {_effort}";
         await w.WriteLineAsync($"model:    {_provider}/{_model}{(_pickReason.Length > 0 ? $" ({_pickReason})" : string.Empty)}, {knob}, profile {_profileName ?? "(none)"}").ConfigureAwait(false);
@@ -735,6 +866,11 @@ internal sealed class LaunchRun
         await w.WriteLineAsync($"cost:     ${meter.Spent.ToString("0.0000", ic)} ({costNote}{reported})").ConfigureAwait(false);
         string wrapUpText = _wrapUp ? string.Create(CultureInfo.InvariantCulture, $"wrap-up at ${(_budget * _wrapUpAt).ToString("0.####", ic)}{(meter.WrappedUp ? " (triggered)" : string.Empty)}, {_hookChecks} hook checks") : "wrap-up off";
         await w.WriteLineAsync($"budget:   ${_budget.ToString("0.####", ic)}, {wrapUpText}{(_capKilled ? ", STOPPED at the budget" : string.Empty)}").ConfigureAwait(false);
+        string? gateLine = FormatGateLine(ic);
+        if (gateLine is not null)
+        {
+            await w.WriteLineAsync(gateLine).ConfigureAwait(false);
+        }
         await w.WriteLineAsync($"tokens:   input {N(_tok["input"])} | cache write {N(_tok["cache_write"])} | cache read {N(_tok["cache_read"])} | output {N(_tok["output"])} (thinking {N(_tok["thinking"])})").ConfigureAwait(false);
         string firstShareText = _firstCallCacheReadShare is { } s ? $" (cache read {Math.Round(s * 100, MidpointRounding.ToEven).ToString(ic)}%)" : string.Empty;
         await w.WriteLineAsync($"context:  first call {_first.ToString("N0", ic)}{firstShareText} | peak {_peak.ToString("N0", ic)}").ConfigureAwait(false);
@@ -751,6 +887,26 @@ internal sealed class LaunchRun
         await w.WriteLineAsync($"files:    {_changed.Count} changed in the working tree{(_outOfScope is null ? " (no write scope given)" : $", {_outOfScope.Count} outside the write scope")}").ConfigureAwait(false);
     }
 
+    private string? FormatGateLine(CultureInfo ic)
+    {
+        GateOutcome? outcome = LastGate;
+        if (outcome is null)
+        {
+            return null;
+        }
+
+        Gate.GateResult result = outcome.Result;
+        int n = result.Count ?? 0;
+        return outcome.Decision switch
+        {
+            GateChain.Clean => string.Create(ic, $"gate:     clean after {Round.ToString(ic)} round(s), findings {string.Join('→', outcome.Counts)}"),
+            GateChain.Continue => string.Create(ic, $"gate:     round {Round.ToString(ic)}, {n.ToString(ic)} finding(s); starting round {(Round + 1).ToString(ic)}"),
+            GateChain.Stuck => string.Create(ic, $"gate:     STUCK after {Round.ToString(ic)} round(s), findings {string.Join('→', outcome.Counts)} ({outcome.StuckReason ?? "stuck"})"),
+            GateChain.Error => $"gate:     ERROR: {result.Error ?? "(no error message)"}",
+            _ => null,
+        };
+    }
+
     private async Task PrintNoticesAsync()
     {
         foreach (string n in _notes)
@@ -761,11 +917,11 @@ internal sealed class LaunchRun
         Meter meter = NonNull(_meter);
         if (meter.WrappedUp)
         {
-            await Console.Out.WriteLineAsync($"continue: --continue-from \"{Path.GetFullPath(_runDir)}\" (fresh worker, original task + this handoff; ask the operator first)").ConfigureAwait(false);
+            await Console.Out.WriteLineAsync($"continue: --continue-from \"{Path.GetFullPath(RunDir)}\" (fresh worker, original task + this handoff; ask the operator first)").ConfigureAwait(false);
         }
         else if (_next is not null)
         {
-            await Console.Out.WriteLineAsync($"escalate: --continue-from \"{Path.GetFullPath(_runDir)}\" --model {_next} (next in the profile's chain; ask the operator first)").ConfigureAwait(false);
+            await Console.Out.WriteLineAsync($"escalate: --continue-from \"{Path.GetFullPath(RunDir)}\" --model {_next} (next in the profile's chain; ask the operator first)").ConfigureAwait(false);
         }
 
         if (!meter.WrappedUp && _outcome.Denials > 0)
@@ -788,7 +944,7 @@ internal sealed class LaunchRun
         if (_report.Length > _o.ReportMaxChars)
         {
             await Console.Out.WriteLineAsync(_report[.._o.ReportMaxChars]).ConfigureAwait(false);
-            await Console.Out.WriteLineAsync($"[truncated; full report: {Path.Combine(_runDir, "report.md")}]").ConfigureAwait(false);
+            await Console.Out.WriteLineAsync($"[truncated; full report: {Path.Combine(RunDir, "report.md")}]").ConfigureAwait(false);
         }
         else if (_report.Length > 0)
         {
