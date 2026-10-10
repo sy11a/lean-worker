@@ -1,0 +1,168 @@
+using System.Text.Json.Nodes;
+using Xunit;
+
+namespace LeanWorker.Tests;
+
+public class GateSpecTests
+{
+    private static JsonObject Profile(JsonObject gate) => new() { ["gate"] = gate };
+
+    private static JsonObject MinimalGate() => new() { ["command"] = new JsonArray(["sh", "gate.sh"]) };
+
+    [Fact]
+    public void Missing_gate_key_returns_null() => Assert.Null(GateSpec.FromProfile([]));
+
+    [Fact]
+    public void Null_profile_returns_null() => Assert.Null(GateSpec.FromProfile(profile: null));
+
+    [Fact]
+    public void Gate_json_null_returns_null() => Assert.Null(GateSpec.FromProfile(new JsonObject { ["gate"] = null }));
+
+    [Fact]
+    public void Non_object_gate_throws()
+    {
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(new JsonObject { ["gate"] = "x" }));
+        Assert.Equal("profile gate must be an object", ex.Message);
+
+        _ = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(new JsonObject { ["gate"] = new JsonArray() }));
+    }
+
+    [Fact]
+    public void Defaults_are_applied()
+    {
+        GateSpec spec = GateSpec.FromProfile(Profile(MinimalGate()))!;
+        Assert.Equal(["sh", "gate.sh"], spec.Command);
+        Assert.Equal("^sarif: (?<report>.+)$", spec.ReportFromLastLine.ToString());
+        Assert.Equal("runs[0].results", spec.CountPath);
+        Assert.Equal(8000, spec.FeedbackMaxChars);
+        Assert.Equal(30, spec.TimeoutMinutes);
+        Assert.Equal(5, spec.MaxRounds);
+        Assert.Null(spec.MaxTotalUsd);
+        Assert.Empty(spec.Env);
+    }
+
+    [Fact]
+    public void Empty_command_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["command"] = new JsonArray();
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.command", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Non_string_command_element_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["command"] = new JsonArray(["sh", 5]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.command", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Regex_without_a_group_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["reportFromLastLine"] = "^sarif: .+$";
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.reportFromLastLine", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("capture group", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Invalid_regex_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["reportFromLastLine"] = "(";
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.reportFromLastLine", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("not a valid regex", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("a[")]
+    [InlineData("a[-1]")]
+    [InlineData("[0]")]
+    [InlineData("a..b")]
+    public void Bad_count_path_segment_throws(string path)
+    {
+        JsonObject gate = MinimalGate();
+        gate["countPath"] = path;
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.countPath", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("feedbackMaxChars")]
+    [InlineData("timeoutMinutes")]
+    [InlineData("maxRounds")]
+    public void Non_positive_int_throws(string key)
+    {
+        JsonObject gate = MinimalGate();
+        gate[key] = 0;
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains($"gate.{key}", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("positive integer", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void Non_positive_max_total_usd_throws(decimal value)
+    {
+        JsonObject gate = MinimalGate();
+        gate["maxTotalUsd"] = value;
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.maxTotalUsd", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Non_numeric_max_total_usd_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["maxTotalUsd"] = "5";
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.maxTotalUsd", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Positive_max_total_usd_is_kept()
+    {
+        JsonObject gate = MinimalGate();
+        gate["maxTotalUsd"] = 1.5m;
+        GateSpec spec = GateSpec.FromProfile(Profile(gate))!;
+        Assert.Equal(1.5m, spec.MaxTotalUsd);
+    }
+
+    [Fact]
+    public void Invalid_env_entry_throws()
+    {
+        JsonObject gate = MinimalGate();
+        gate["env"] = new JsonArray(["LW_TEST_*", "bad name"]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.env", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Env_entries_are_kept_in_order()
+    {
+        JsonObject gate = MinimalGate();
+        gate["env"] = new JsonArray(["LW_TEST_*", "FOO"]);
+        GateSpec spec = GateSpec.FromProfile(Profile(gate))!;
+        Assert.Equal(["LW_TEST_*", "FOO"], spec.Env);
+    }
+
+    [Fact]
+    public void No_gate_flag_parses()
+    {
+        Options o = Options.Parse(["--no-gate"]);
+        Assert.True(o.NoGate);
+    }
+
+    [Fact]
+    public void Gate_max_rounds_flag_parses()
+    {
+        Options o = Options.Parse(["--gate-max-rounds", "3"]);
+        Assert.Equal(3, o.GateMaxRounds);
+    }
+}
