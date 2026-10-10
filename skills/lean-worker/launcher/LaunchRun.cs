@@ -829,7 +829,11 @@ internal sealed class LaunchRun
     /// spawns) write the gate's own PATH, and a symlink entry whose final target lies there lets it
     /// rewrite what the link resolves to while the PATH directory's listing stays intact — the
     /// listing check would only notice after a full worker run, and the restore-mtime gap can hide
-    /// it altogether. Both sides of every comparison are canonicalised (<see cref="GateTrust.Canonical"/>),
+    /// it altogether. A PATH directory whose listing can be neither read nor confirmed missing is
+    /// refused in its own right: an unreadable directory is invisible to every later listing
+    /// comparison (baseline and current would both say <c>unreadable</c>), so a worker that can
+    /// write it could plant a tool the gate would still run. Both sides of every
+    /// inside-the-working-tree comparison are canonicalised (<see cref="GateTrust.Canonical"/>),
     /// so a PATH entry through a symlinked directory or a git root behind a symlinked home is judged
     /// by the files the paths really name, and a link on the way to a PATH directory or to a final
     /// target is refused in its own right when the link path itself sits in the tree: the worker can
@@ -863,6 +867,20 @@ internal sealed class LaunchRun
             }
         }
 
+        RefuseGatePathListingDangers(gitRootCanonical, workingDirectoryCanonical, runsRootCanonical);
+    }
+
+    /// <summary>
+    /// The second half of the round-1 gate PATH refusal, over the frozen listings: a directory whose
+    /// listing can be neither read nor confirmed missing is refused in its own right (an unreadable
+    /// directory is invisible to every later listing comparison — baseline and current would both
+    /// say <c>unreadable</c> — so a worker that can write it could plant a tool the gate would still
+    /// run; a missing directory the gate never sees entries from is fine), and a readable
+    /// directory's symlink entries are judged like the directories themselves: a final target at or
+    /// under the working tree, or reached through a link that sits there, is refused.
+    /// </summary>
+    private void RefuseGatePathListingDangers(string gitRootCanonical, string workingDirectoryCanonical, string runsRootCanonical)
+    {
         if (GatePathNames is null)
         {
             return;
@@ -870,6 +888,11 @@ internal sealed class LaunchRun
 
         foreach (KeyValuePair<string, GateTrust.PathNameListing> listing in GatePathNames.Directories)
         {
+            if (!listing.Value.Readable && listing.Value.Reason is not "missing")
+            {
+                throw new LaunchException($"gate PATH directory '{listing.Key}' cannot be listed: {listing.Value.Reason}");
+            }
+
             if (!listing.Value.Readable)
             {
                 continue;

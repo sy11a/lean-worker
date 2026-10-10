@@ -34,7 +34,10 @@
 // even when the listings are empty) is a trust violation. Named,
 // accepted gaps: the content of a same-named entry is not hashed, so a worker that rewrites it and
 // restores the mtime (`touch -d`) while keeping the length escapes this check (put such a tool in
-// gate.trust or call it by an absolute path in a trusted script), and nothing under a subdirectory
+// gate.trust or call it by an absolute path in a trusted script); a PATH directory replaced by a
+// metadata-identical copy with one tool edited — possible wherever the worker can write the
+// directory's parent or a symlinked ancestor of it — compares equal too (the listing does not
+// change, even when the tool files themselves are not writable); and nothing under a subdirectory
 // of a PATH directory is listed directly (only that subdirectory's own listing metadata notices).
 //
 // Snapshot keys are the trusted paths the operator configured; the value always carries the resolved
@@ -690,34 +693,37 @@ internal static class GateTrust
     /// <summary>
     /// Resolves a gate PATH entry's symlink chain to its final target and reads that target's length
     /// and last write time (UTC) — the three values a symlinked <see cref="PathEntry"/> records, so
-    /// a retargeted link and a target rewritten in place are both listing changes. The target comes
-    /// back as a full path; a link whose final target does not exist records <c>dangling</c>; a
-    /// resolution that fails records <c>unreadable: &lt;exception type&gt;</c>. The target's length
-    /// follows the listing's own rule: 0 for a directory, whose size changes whenever entries are
-    /// added under it (which is not a change to what the link resolves to).
+    /// a retargeted link and a target rewritten in place are both listing changes. The final target
+    /// is <see cref="Canonical"/>'s resolution of the entry's own path (<c>&lt;dir&gt;/&lt;name&gt;</c>),
+    /// with realpath(3) semantics: a relative target resolves against the real directories on the
+    /// way, not lexically, so the recorded target — and the length and mtime stat'ed on it — belong
+    /// to the file the OS actually opens. A link whose final target does not exist records
+    /// <c>dangling</c>; a resolution that gives up records <c>unreadable: &lt;reason&gt;</c>; a
+    /// target that exists but cannot be stat'ed records <c>unreadable: &lt;exception type&gt;</c>.
+    /// The target's length follows the listing's own rule: 0 for a directory, whose size changes
+    /// whenever entries are added under it (which is not a change to what the link resolves to).
     /// </summary>
     private static (string FinalTarget, long? FinalTargetLength, DateTimeOffset? FinalTargetLastWriteTimeUtc) ResolveEntryFinalTarget(string path)
     {
+        CanonicalPath canonical = Canonical(path);
+        if (!canonical.Resolved)
+        {
+            return (canonical.Unreadable!, null, null);
+        }
+
+        string full = canonical.Path;
+        if (!PathExists(full))
+        {
+            return ("dangling", null, null);
+        }
+
         try
         {
-            // Follows the whole chain (a link to a link to a file resolves to the file) and wraps the
-            // final target path even when nothing is there, so a dangling link is detected by the
-            // existence check rather than by an exception.
-            FileSystemInfo? final = File.ResolveLinkTarget(path, returnFinalTarget: true);
-            if (final is null || !PathExists(final.FullName))
-            {
-                return ("dangling", null, null);
-            }
-
-            string full = Path.GetFullPath(final.FullName);
             return Directory.Exists(full)
                 ? (full, 0, Directory.GetLastWriteTimeUtc(full))
                 : (full, new FileInfo(full).Length, File.GetLastWriteTimeUtc(full));
         }
-        catch (Exception ex) when (ex is IOException
-            or UnauthorizedAccessException
-            or ArgumentException
-            or NotSupportedException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return ($"unreadable: {ex.GetType().Name}", null, null);
         }
@@ -1124,6 +1130,14 @@ internal static class GateTrust
     {
         string root = Path.GetPathRoot(absolute) ?? string.Empty;
         List<string> pending = ComponentsToWalk(absolute[root.Length..]);
+        // A UNC root comes back without its trailing separator ("\\s\c"): every other root ("/",
+        // "C:\") ends in one. Compose and the walk assume a separator-terminated root — without
+        // it, Compose would glue the first component onto the share ("\\s\cx") — so put it back.
+        if (root.Length > 0 && !Path.EndsInDirectorySeparator(root))
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+
         List<string> resolved = [];
         List<string> links = [];
         while (pending.Count > 0)
@@ -1219,17 +1233,21 @@ internal static class GateTrust
             string? targetRoot = Path.GetPathRoot(target);
             if (targetRoot is { Length: > 0 } && target.StartsWith(targetRoot, PathComparison))
             {
-                // A root that ends in a separator names its own tree ("/", "C:\", "\\s\c\"): the
-                // walk restarts there. A bare drive ("C:") does not: that target is relative to
-                // the drive's current directory, which nothing in the walk can know.
-                if (!targetRoot.EndsWith(Path.DirectorySeparatorChar) && !targetRoot.EndsWith(Path.AltDirectorySeparatorChar))
+                // The walk restarts at the target's own root ("/", "C:\", "\\s\c\"): clear the
+                // stack and queue the rest. A UNC root comes back without its trailing separator
+                // ("\\s\c") — append it, or Compose would glue the first component onto the share
+                // ("\\s\cx"). A target rooted on a volume whose current directory the walk cannot
+                // know ("C:foo") was refused above as rooted-but-not-fully-qualified. The rest is
+                // sliced before the separator goes back in: the target may be the bare root.
+                string rest = target[targetRoot.Length..];
+                if (!Path.EndsInDirectorySeparator(targetRoot))
                 {
-                    return $"unreadable: {nameof(ArgumentException)}";
+                    targetRoot += Path.DirectorySeparatorChar;
                 }
 
                 resolved.Clear();
                 root = targetRoot;
-                pending.InsertRange(0, ComponentsToWalk(target[targetRoot.Length..]));
+                pending.InsertRange(0, ComponentsToWalk(rest));
                 return null;
             }
 
@@ -1252,7 +1270,8 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Joins the root (which always ends in a separator) with the resolved component stack.
+    /// Joins the root with the resolved component stack. Both callers normalise the root to end in
+    /// a separator (a UNC root from <c>Path.GetPathRoot</c> does not have one on its own).
     /// </summary>
     private static string Compose(string root, IReadOnlyList<string> parts) =>
         parts.Count is 0 ? root : root + string.Join(Path.DirectorySeparatorChar, parts);
@@ -1516,12 +1535,17 @@ internal static class GateTrust
         // working directory is the fallback so a non-git launch can still pin files.
         string anchor = Directory.Exists(gitRoot) ? gitRoot : gateWorkingDirectory;
         string skipRunsRoot = Path.GetFullPath(runsRoot);
+        // Both sides of the walks-root prune test, canonicalised once for every glob walk below:
+        // the walk never follows directory links, so each walked directory's canonical path is the
+        // anchor's canonical path plus its relative path and needs no resolution of its own.
+        CanonicalPath anchorCanonical = Canonical(anchor);
+        CanonicalPath runsRootCanonical = Canonical(skipRunsRoot);
 
         for (int i = 0; i < entries.Count; i++)
         {
             if (entries[i].IndexOfAny(['*', '?']) >= 0)
             {
-                AddGlobEntry(entries[i], i, anchor, skipRunsRoot, add, warnings ?? []);
+                AddGlobEntry(entries[i], i, anchor, anchorCanonical, runsRootCanonical, add, warnings ?? []);
             }
             else
             {
@@ -1555,7 +1579,7 @@ internal static class GateTrust
     // the worker runs (Absence here is not a violation on its own; the trust check also catches
     // "present and later gone"). A glob entry that ends up matching nothing is not an error, but the
     // operator should hear about it: a warning is recorded and noted in the result block.
-    private static void AddGlobEntry(string entry, int index, string anchor, string skipRunsRoot, Action<string> add, List<string> warnings)
+    private static void AddGlobEntry(string entry, int index, string anchor, CanonicalPath anchorCanonical, CanonicalPath runsRootCanonical, Action<string> add, List<string> warnings)
     {
         Regex matcher;
         try
@@ -1572,7 +1596,7 @@ internal static class GateTrust
             return;
         }
 
-        List<string> matches = [.. WalkFiles(anchor, dir => SkipWalkedDirectory(dir, anchor, skipRunsRoot))
+        List<string> matches = [.. WalkFiles(anchor, dir => SkipWalkedDirectory(dir, anchor, anchorCanonical, runsRootCanonical))
             .Where(file => matcher.IsMatch(Path.GetRelativePath(anchor, file).Replace('\\', '/'))),];
 
         foreach (string file in matches)
@@ -1589,18 +1613,31 @@ internal static class GateTrust
     /// root's own top-level <c>.git</c> — the metadata store is walked for names only and a glob
     /// such as **/*.json would otherwise match files git itself created and trip every run. A
     /// directory named <c>.git</c> deeper in the tree is an ordinary directory and stays in the walk.
-    /// The runs-root comparison runs on canonical paths: the walk never descends into a symlinked
-    /// directory, but the anchor itself can sit behind symlinks, and only the canonical form of both
-    /// sides names the same tree. A side that cannot be resolved keeps the directory in the walk.
+    /// The runs-root comparison runs on canonical paths, both computed once per walk by the caller
+    /// (<see cref="AddExtraTrust"/>): the walk never descends into a symlinked directory, so each
+    /// walked directory's canonical path is simply the anchor's canonical path plus its relative
+    /// path — only the anchor itself can sit behind symlinks, and no per-directory resolution is
+    /// needed. A side that cannot be resolved keeps the directory in the walk.
     /// </summary>
-    private static bool SkipWalkedDirectory(string dir, string anchor, string skipRunsRoot)
+    private static bool SkipWalkedDirectory(string dir, string anchor, CanonicalPath anchorCanonical, CanonicalPath runsRootCanonical)
     {
-        return (Path.GetFileName(dir) is ".git"
+        if (Path.GetFileName(dir) is ".git"
             && Path.GetDirectoryName(dir) is { } parent
             && string.Equals(Path.TrimEndingDirectorySeparator(parent), Path.TrimEndingDirectorySeparator(anchor), PathComparison))
-            || (Canonical(dir) is { Resolved: true } dirCanonical
-                && Canonical(skipRunsRoot) is { Resolved: true } runsCanonical
-                && IsAtOrUnder(dirCanonical.Path, runsCanonical.Path));
+        {
+            return true;
+        }
+
+        if (!anchorCanonical.Resolved || !runsRootCanonical.Resolved)
+        {
+            return false;
+        }
+
+        List<string> relativeParts = ComponentsToWalk(Path.GetRelativePath(anchor, dir));
+        string dirCanonical = relativeParts.Count is 0
+            ? anchorCanonical.Path
+            : anchorCanonical.Path + Path.DirectorySeparatorChar + string.Join(Path.DirectorySeparatorChar, relativeParts);
+        return IsAtOrUnder(dirCanonical, runsRootCanonical.Path);
     }
 
     private static void AddPricesFile(string? pricesFile, Action<string> add)
