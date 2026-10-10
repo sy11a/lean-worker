@@ -710,6 +710,79 @@ public sealed class GateTrustLoopTests : IDisposable
 
     [Fact]
     [UnsupportedOSPlatform("windows")]
+    public async Task A_looping_symlink_pair_in_a_PATH_directory_is_a_launch_error_before_the_workerAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string a = Path.Combine(dirA, "a");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    _ = File.CreateSymbolicLink(a, Path.Combine(dirA, "b"));
+                    _ = File.CreateSymbolicLink(Path.Combine(dirA, "b"), a);
+                    SetPath(dirA, dirB);
+                }));
+
+        // both halves of the loop are unresolvable; the listing order decides which one is named first
+        Assert.True(
+            ex.Message.StartsWith("gate PATH entry '" + a + "' cannot be resolved", StringComparison.Ordinal)
+            || ex.Message.StartsWith("gate PATH entry '" + Path.Combine(dirA, "b") + "' cannot be resolved", StringComparison.Ordinal),
+            ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_dangling_symlink_in_a_PATH_directory_that_the_worker_leaves_alone_runs_cleanAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string missing = Path.Combine(_dirs.Create("lw-gate-linktarget"), "missing");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "true",
+            () =>
+            {
+                _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), missing);
+                SetPath(dirA, dirB);
+            });
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_creates_the_target_of_a_dangling_PATH_directory_symlink_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "missing");
+        string link = Path.Combine(dirA, "lw-link");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf 'planted' > '" + target + "'",
+            () =>
+            {
+                _ = File.CreateSymbolicLink(link, target);
+                SetPath(dirA, dirB);
+            });
+
+        AssertViolation(setup, code, stdout, link);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
     public async Task A_worker_that_retargets_a_PATH_directory_symlink_to_another_outside_file_trips_the_trust_checkAsync()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
