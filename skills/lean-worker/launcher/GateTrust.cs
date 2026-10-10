@@ -8,16 +8,25 @@
 //
 // Hashing is conservative: only regular files are hashed. A symlink is resolved to its final target and
 // the target path is recorded as the key (so a retargeted link shows up as a change). Non-regular targets
-// (directories, FIFOs, sockets, character/block devices) record the sentinel "nonregular"; any
-// IOException or UnauthorizedAccessException records "unreadable: <ExceptionType>"; an open that hangs
-// on a FIFO without a writer records "unreadable: timeout"; a file larger than the per-file byte cap
-// records "unreadable: too large". The chain treats any "nonregular" or "unreadable" entry that appears
-// after the worker as a trust violation.
+// (directories, FIFOs, sockets, character/block devices, final-target paths under /dev/, /proc/ or
+// /sys/) record the sentinel "nonregular"; a symlink whose target is unreachable records "unreadable:
+// dangling link"; a read that returned fewer bytes than the length reported at open time records
+// "unreadable: length mismatch"; any IOException or UnauthorizedAccessException records
+// "unreadable: <ExceptionType>"; an open that hangs on a FIFO without a writer records "unreadable:
+// timeout"; a file larger than the per-file byte cap records "unreadable: too large". The chain treats
+// any "nonregular" or "unreadable" entry that appears after the worker as a trust violation.
 //
 // .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in .NET 9), so the guard on this
 // runtime is layered:
+//   - the existence gate at the top of HashOneAsync (File.Exists || Directory.Exists, so a directory
+//     or a symlink whose final target is one is not "absent"; a broken link is "unreadable: dangling
+//     link")
+//   - the final-target refusal for /dev/, /proc/, /sys/ (kernel surfaces whose contents are generated
+//     on read; /dev/null passes every other guard and would otherwise hash the empty SHA-256)
 //   - the FileAttributes pre-check below (catches directories, devices where reported, reparse points)
 //   - FileStream.CanSeek on the opened handle (FIFOs, sockets, character devices are non-seekable)
+//   - the bytes-read vs. fs.Length check at the end of HashCoreAsync (a mismatch reports
+//     "unreadable: length mismatch" and refuses to hash)
 //   - the 5-second open/read bound (catches a FIFO blocking in open with no writer)
 //   - the 16 MiB byte cap (bounds a read off a misclassified device)
 // Block devices may still look regular and seekable on this runtime; a normal user cannot open them
@@ -32,19 +41,24 @@ internal static class GateTrust
 {
     /// <summary>
     /// One set of trusted files and their SHA-256 of the bytes. The sentinel "<c>-</c>" is recorded for
-    /// every path that does not exist at hash time, "<c>nonregular</c>" for a path whose last target is
-    /// not a regular file, and "<c>unreadable: &lt;reason&gt;</c>" when reading was bounded by the
-    /// per-file time limit ("<c>timeout</c>"), the per-file byte cap ("<c>too large</c>"), or any I/O or
-    /// permission failure ("<c>&lt;ExceptionType&gt;</c>"). A file the worker created between the two
-    /// hashes shows up as a difference just like a content change; a nonregular/unreadable state
-    /// appearing in the after-worker snapshot is itself a trust violation.
+    /// every path that does not exist at hash time (a directory, or a symlink whose final target is a
+    /// directory, is <em>not</em> "absent" — it records "<c>nonregular</c>"), "<c>nonregular</c>" for a
+    /// path whose last target is not a regular file, and "<c>unreadable: &lt;reason&gt;</c>" when
+    /// reading was bounded by the per-file time limit ("<c>timeout</c>"), the per-file byte cap
+    /// ("<c>too large</c>"), a length mismatch reported at open time ("<c>length mismatch</c>"), the
+    /// link pointed at a missing target ("<c>dangling link</c>"), or any I/O or permission failure
+    /// ("<c>&lt;ExceptionType&gt;</c>"). A file the worker created between the two hashes shows up as a
+    /// difference just like a content change; a nonregular/unreadable state appearing in the
+    /// after-worker snapshot is itself a trust violation.
     /// </summary>
     internal sealed record Snapshot(Dictionary<string, string> Hashes);
 
     /// <summary>
     /// Reads each <paramref name="paths"/> entry and hashes its bytes. Absent files get the sentinel
     /// "<c>-</c>"; a symlink's final target is the key (so retargeting the link differs); a non-regular
-    /// target records "<c>nonregular</c>"; any I/O or permission error records
+    /// target records "<c>nonregular</c>"; a symlink whose target is unreachable records
+    /// "<c>unreadable: dangling link</c>"; a hash whose bytes-read did not match the length reported at
+    /// open time records "<c>unreadable: length mismatch</c>"; any I/O or permission error records
     /// "<c>unreadable: &lt;ExceptionType&gt;</c>". Hashing never blocks or throws: a hang on a FIFO
     /// without a writer is bounded by a per-file timeout (the open + read run on the thread pool and the
     /// wait is capped at <see cref="_hashTimeout"/>), and an unbounded file is bounded by a per-file byte
@@ -86,22 +100,33 @@ internal static class GateTrust
         string key = path;
         try
         {
-            if (!File.Exists(path))
+            // File.Exists and Directory.Exists both follow symlinks; the OR fires for a regular
+            // file, a directory, or a symlink whose final target is one. "Absent" must mean
+            // nothing-at-this-path. A dangling symlink (the link exists, the target does not)
+            // also fails the OR, and ClassifyMissing uses FileSystemInfo.LinkTarget to pick the
+            // sentinel: a non-null value means the path is itself a symlink (ReadLink succeeds on
+            // the link even when the target is unreachable), a null value means it is not.
+            if (!File.Exists(path) && !Directory.Exists(path))
             {
-                hashes[key] = "-";
+                hashes[key] = ClassifyMissing(path);
                 return;
             }
 
             string target = ResolveTarget(path, ref key);
 
-            // Attribute pre-check: directories, devices (where reported), and reparse points must not
-            // be opened at all. .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in
-            // .NET 9), so the layered guard is: this attribute probe (Directory / Device / ReparsePoint)
-            // + FileStream.CanSeek on the opened handle (FIFOs, sockets, character devices are
-            // non-seekable) + the 5-second bound in HashFileAsync (a FIFO blocking in open with no
-            // writer) + the 16 MiB cap below (bounds a read off a misclassified device). Block devices
-            // may still look regular and seekable on this runtime; a normal user cannot open them (the
-            // open fails → unreadable → trust violation), and the size cap bounds a read. No P/Invoke.
+            // Pseudo-filesystem refusal: /dev/, /proc/ and /sys/ are kernel-generated surfaces.
+            // /dev/null passes every other guard and hashes the empty SHA-256; refuse by the final
+            // target so a symlink chain that resolves into one of them is also caught.
+            if (target.StartsWith("/dev/", StringComparison.Ordinal)
+                || target.StartsWith("/proc/", StringComparison.Ordinal)
+                || target.StartsWith("/sys/", StringComparison.Ordinal))
+            {
+                hashes[key] = "nonregular";
+                return;
+            }
+
+            // Attribute pre-check: directories, devices (where reported), and reparse points must
+            // not be opened at all. The full layered-guard reasoning is in the file header.
             FileAttributes attrs = File.GetAttributes(target);
             if (attrs.HasFlag(FileAttributes.Directory)
                 || attrs.HasFlag(FileAttributes.Device)
@@ -125,6 +150,36 @@ internal static class GateTrust
             // crashing the gate chain. Non-I/O exceptions (e.g. NullReferenceException) propagate.
             hashes[key] = $"unreadable: {ex.GetType().Name}";
         }
+    }
+
+    /// <summary>
+    /// Returns the sentinel for a path that failed both <see cref="File.Exists"/> and
+    /// <see cref="Directory.Exists"/>: "<c>-</c>" when nothing is at the path,
+    /// "<c>unreadable: dangling link</c>" when the path itself is a symlink whose target is
+    /// unreachable. <see cref="FileSystemInfo.LinkTarget"/> returns the immediate ReadLink target
+    /// whenever the path is a symlink (even a dangling one) and <c>null</c> otherwise, which is the
+    /// signal that separates the two cases.
+    /// </summary>
+    private static string ClassifyMissing(string path)
+    {
+        string? linkTarget = null;
+        try
+        {
+            linkTarget = new FileInfo(path).LinkTarget;
+        }
+        catch (Exception ex) when (ex is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PlatformNotSupportedException
+            or ObjectDisposedException
+            or InvalidOperationException)
+        {
+            // Best-effort ReadLink: the absent sentinel is the conservative choice when the kernel
+            // refuses to read the link for any of these reasons.
+        }
+
+        return linkTarget is null ? "-" : "unreadable: dangling link";
     }
 
     private static async Task<string> HashFileAsync(string target)
@@ -170,6 +225,13 @@ internal static class GateTrust
                 return "nonregular";
             }
 
+            // Capture the length right after opening. Some kernel-managed entries report a Length
+            // that does not match the bytes the read actually returns (the file is being modified
+            // while we read it, or Length is a hint and the kernel returns less). A mismatch means
+            // the hash would not reflect the file's actual contents at this moment, so refuse to
+            // classify it as a regular-file read.
+            long expectedLength = fs.Length;
+
             using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             byte[] buffer = new byte[HashBufferSize];
             long total = 0;
@@ -178,6 +240,11 @@ internal static class GateTrust
                 int n = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false);
                 if (n is 0)
                 {
+                    if (total != expectedLength)
+                    {
+                        return "unreadable: length mismatch";
+                    }
+
                     return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
                 }
 
