@@ -6,7 +6,7 @@
 // group 1 first; if that is empty it falls back to the first named group (excluding group 0), so a regex
 // that uses a named capture for its only group — like the default `^sarif: (?<report>.+)$` — still works.
 //
-// `gate.outputs` is the operator's explicit declaration of the repo-relative paths the gate writes (its
+// `gate.outputs` is the operator's explicit declaration of the paths the gate writes (its
 // report and any other artifacts). The launcher used to guess which argv entries were pure gate outputs —
 // argv position and execute bits — so a gate could rewrite its own report file without tripping the trust
 // check. Guessing cannot see through a wrapper such as `env VAR=1 sh gate.sh`: the report is neither
@@ -312,16 +312,20 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     }
 
     /// <summary>
-    /// Reads <c>gate.outputs</c>: an optional array of repo-relative paths (relative to the git root, or
-    /// the working directory when not in git) that the gate writes — its report and any other artifacts.
+    /// Reads <c>gate.outputs</c>: an optional array of paths that the gate writes — its report and any
+    /// other artifacts. A relative entry resolves against the git root (or the working directory when
+    /// not in git), the same anchor the trust entries resolve against; an absolute entry (the report
+    /// may live outside the repo — an argv-named file in the user's cache, for example) is used as-is.
     /// This declaration replaces the dropped runnable-argv heuristic: whether an argv entry is a pure
     /// output cannot be inferred from its position or its execute bit (a wrapper such as
     /// <c>env VAR=1 sh gate.sh</c> hides both the script and the report), so nothing is guessed and the
-    /// operator names the outputs instead. Entries must be non-empty strings, relative, without a
-    /// <c>..</c> segment and without glob characters (a declared output names exactly one path; a glob
-    /// would leave it ambiguous which files the gate may rewrite). A gate whose report is not named in
-    /// its argv — a lint gate's default report under <c>artifacts/</c>, for example — needs no
-    /// <c>gate.outputs</c>: an untrusted path needs no exclusion.
+    /// operator names the outputs instead. Entries must be non-empty strings, without glob characters
+    /// (a declared output names exactly one path; a glob would leave it ambiguous which files the gate
+    /// may rewrite) and, when relative, without a <c>..</c> segment (a relative path must not cross the
+    /// repo boundary; an absolute entry's <c>..</c> segments are resolved away by
+    /// <c>Path.GetFullPath</c>, so the path stays exactly the one the operator named). A gate whose
+    /// report is not named in its argv — a lint gate's default report under <c>artifacts/</c>, for
+    /// example — needs no <c>gate.outputs</c>: an untrusted path needs no exclusion.
     /// </summary>
     private static List<string> ReadOutputs(JsonObject gate)
     {
@@ -332,7 +336,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
 
         if (n is not JsonArray arr)
         {
-            throw new LaunchException("profile gate.outputs must be an array of repo-relative paths");
+            throw new LaunchException("profile gate.outputs must be an array of paths");
         }
 
         List<string> outputs = new(arr.Count);
@@ -345,19 +349,19 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             }
 
             string normalized = s.Replace('\\', '/');
-            // Absolute entries would let a profile aim the gate at a file outside the repo; the trust
-            // set is repo-relative for the same reason.
-            if (Path.IsPathRooted(normalized) || normalized.StartsWith('/'))
+            // A relative entry resolves against the git root (or the working directory when not in
+            // git), so it stays inside the repo; an absolute entry is used as-is (normalised by
+            // LaunchRun.ResolveOutputEntry), which is how a gate report outside the repo is declared.
+            if (!Path.IsPathRooted(normalized))
             {
-                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must be a relative path: {s}");
-            }
-
-            // No parent traversal: ".." would let a declared output reach outside the repo boundary.
-            foreach (string segment in normalized.Split('/'))
-            {
-                if (segment is "..")
+                // No parent traversal in a relative entry: ".." would let a declared output reach
+                // outside the repo boundary.
+                foreach (string segment in normalized.Split('/'))
                 {
-                    throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
+                    if (segment is "..")
+                    {
+                        throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
+                    }
                 }
             }
 

@@ -1,8 +1,9 @@
 // The gate runs in the working tree the worker has just changed, but the launcher treats some files as
 // trusted inputs (the gate's command, the profile, the project notes, the price book, the run-root
 // config, the .config/dotnet-tools.json at the work tree root, plus dotnet-tools.json/
-// global.json/nuget.config searched from the gate's working directory up to the git root, and the
-// resolved gate executable wherever it lives). A worker that edits them can swap the gate's report
+// global.json/nuget.config searched from the gate's working directory up to the git root, the
+// resolved gate executable wherever it lives, and every existing argv file entry, wherever it lives).
+// A worker that edits them can swap the gate's report
 // path or its command for the next round. The launcher hashes these files before the worker starts,
 // again before the gate runs, and a third time after the gate exits; any difference from the
 // before-worker snapshot ends the chain with `error` instead of running the gate against tampered
@@ -655,7 +656,7 @@ internal static class GateTrust
     /// <summary>
     /// Whether <paramref name="path"/> is <paramref name="root"/> or lies under it (ordinal).
     /// </summary>
-    private static bool IsAtOrUnder(string path, string root)
+    internal static bool IsAtOrUnder(string path, string root)
     {
         if (string.Equals(path, root, StringComparison.Ordinal))
         {
