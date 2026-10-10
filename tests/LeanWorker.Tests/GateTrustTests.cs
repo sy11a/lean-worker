@@ -671,4 +671,113 @@ public sealed class GateTrustTests : IDisposable
         Assert.NotEmpty(canonical.Links);
         Assert.All(canonical.Links, l => Assert.True(l == a || l == b));
     }
+
+    // What the OS resolves: realpath(1) through sh; null when the OS itself fails (a loop, a missing path).
+    private static async Task<string?> OsRealpathAsync(string path)
+    {
+        ProcessStartInfo info = new("sh") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+        info.ArgumentList.Add("-c");
+        info.ArgumentList.Add("realpath \"$1\"");
+        info.ArgumentList.Add("sh");
+        info.ArgumentList.Add(path);
+        using Process process = Process.Start(info)!;
+        string output = await process.StandardOutput.ReadToEndAsync(TestContext.Current.CancellationToken);
+        _ = await process.StandardError.ReadToEndAsync(TestContext.Current.CancellationToken);
+        await process.WaitForExitAsync(TestContext.Current.CancellationToken);
+        return process.ExitCode is 0 ? output.TrimEnd('\n') : null;
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task Canonical_resolves_a_relative_dot_dot_link_target_physically_inside_a_symlinked_parentAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string realB = Path.Combine(dir, "real", "b");
+        _ = Directory.CreateDirectory(realB);
+        _ = Directory.CreateDirectory(Path.Combine(dir, "real", "x"));
+        _ = Directory.CreateDirectory(Path.Combine(dir, "x"));
+        _ = Directory.CreateSymbolicLink(Path.Combine(dir, "a"), realB);
+        _ = Directory.CreateSymbolicLink(Path.Combine(realB, "link"), "../x");
+        string input = Path.Combine(dir, "a", "link");
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(input);
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(dir, "real", "x"), canonical.Path);
+        Assert.False(string.Equals(Path.Combine(dir, "x"), canonical.Path, StringComparison.Ordinal));
+        Assert.Equal(await OsRealpathAsync(input), canonical.Path);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task Canonical_restarts_from_the_root_for_a_rooted_absolute_link_targetAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string target = Path.Combine(dir, "real", "deep");
+        _ = Directory.CreateDirectory(target);
+        string sub = Path.Combine(dir, "sub", "inner");
+        _ = Directory.CreateDirectory(sub);
+        string link = Path.Combine(sub, "abs");
+        _ = Directory.CreateSymbolicLink(link, target);
+        string input = Path.Combine(link, "..", "tail");
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(input);
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(dir, "real", "tail"), canonical.Path);
+        Assert.Equal([link], canonical.Links);
+        Assert.Equal(Path.Combine(dir, "real"), await OsRealpathAsync(Path.GetDirectoryName(canonical.Path)!));
+        Assert.Equal(await OsRealpathAsync(Path.Combine(link, "..")), Path.GetDirectoryName(canonical.Path));
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task Canonical_follows_a_chain_mixing_a_relative_and_an_absolute_targetAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string final = Path.Combine(dir, "real", "final");
+        _ = Directory.CreateDirectory(final);
+        string hop = Path.Combine(dir, "hop");
+        _ = Directory.CreateDirectory(Path.Combine(hop, "in"));
+        string absLink = Path.Combine(dir, "abs");
+        string relLink = Path.Combine(hop, "in", "rel");
+        string top = Path.Combine(dir, "top");
+        _ = Directory.CreateSymbolicLink(absLink, final);
+        _ = Directory.CreateSymbolicLink(relLink, "../../abs");
+        _ = Directory.CreateSymbolicLink(top, "hop/in/rel");
+        string input = Path.Combine(top, "file.txt");
+        await File.WriteAllTextAsync(Path.Combine(final, "file.txt"), "x", TestContext.Current.CancellationToken);
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(input);
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(final, "file.txt"), canonical.Path);
+        Assert.Equal([top, relLink, absLink], canonical.Links);
+        Assert.Equal(await OsRealpathAsync(input), canonical.Path);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task Canonical_of_a_relative_and_absolute_mixed_loop_is_unreadable_where_the_os_failsAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string a = Path.Combine(dir, "a");
+        string b = Path.Combine(dir, "b");
+        _ = Directory.CreateSymbolicLink(a, b);
+        _ = Directory.CreateSymbolicLink(b, "./a");
+
+        GateTrust.CanonicalPath canonical = await Task.Run(() => GateTrust.Canonical(a), TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+
+        Assert.False(canonical.Resolved);
+        Assert.Null(await OsRealpathAsync(a));
+    }
 }
