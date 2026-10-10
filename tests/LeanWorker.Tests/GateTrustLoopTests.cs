@@ -575,28 +575,127 @@ public sealed class GateTrustLoopTests : IDisposable
     }
 
     [Fact]
-    public async Task An_absolute_PATH_entry_inside_the_working_directory_is_noted_and_recorded_in_gate_jsonAsync()
+    public async Task An_absolute_PATH_entry_inside_the_working_directory_is_a_launch_error_before_the_workerAsync()
     {
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
         string inside = string.Empty;
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    inside = Path.Combine(Directory.GetCurrentDirectory(), "inbin");
+                    _ = Directory.CreateDirectory(inside);
+                    SetPath(inside, dirA, dirB);
+                }));
+
+        Assert.Equal("gate PATH directory '" + inside + "' is inside the working tree", ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_directory_symlink_whose_final_target_is_inside_the_working_directory_is_a_launch_error_before_the_workerAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string link = Path.Combine(dirA, "lw-link");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    string target = Path.Combine(Directory.GetCurrentDirectory(), "inside-target");
+                    File.WriteAllText(target, "x");
+                    _ = File.CreateSymbolicLink(link, target);
+                    SetPath(dirA, dirB);
+                }));
+
+        Assert.StartsWith("gate PATH entry '" + link + "' links into the working tree: ", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("inside-target", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_changes_the_content_of_a_file_a_PATH_directory_symlink_points_to_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "data");
+        string link = Path.Combine(dirA, "lw-link");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf 'a much longer replacement body' > '" + target + "'",
+            () =>
+            {
+                File.WriteAllText(target, "short");
+                _ = File.CreateSymbolicLink(link, target);
+                SetPath(dirA, dirB);
+            });
+
+        AssertViolation(setup, code, stdout, link);
+        Assert.Contains("changed its target's length", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_retargets_a_PATH_directory_symlink_to_another_outside_file_trips_the_trust_checkAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string targetDir = _dirs.Create("lw-gate-linktarget");
+        string first = Path.Combine(targetDir, "first");
+        string second = Path.Combine(targetDir, "second");
+        string link = Path.Combine(dirA, "lw-link");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "ln -sfn '" + second + "' '" + link + "'",
+            () =>
+            {
+                File.WriteAllText(first, "same");
+                File.WriteAllText(second, "same");
+                _ = File.CreateSymbolicLink(link, first);
+                SetPath(dirA, dirB);
+            });
+
+        AssertViolation(setup, code, stdout, link);
+        Assert.Contains("changed its final target", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_directory_symlink_to_an_outside_file_that_the_worker_leaves_alone_runs_cleanAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "data");
 
         (int code, string stdout) = await RunAsync(
             setup,
             "true",
             () =>
             {
-                inside = Path.Combine(Directory.GetCurrentDirectory(), "inbin");
-                _ = Directory.CreateDirectory(inside);
-                SetPath(inside, dirA, dirB);
+                File.WriteAllText(target, "short");
+                _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), target);
+                SetPath(dirA, dirB);
             });
 
         AssertClean(setup, code, stdout);
-        Assert.Contains("note:     gate PATH directory '" + inside + "' lies inside the working tree", stdout, StringComparison.Ordinal);
-        JsonObject gateJson = JsonNode.Parse(
-            await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
-        string[] warnings = [.. gateJson["warnings"]!.AsArray().Select(w => w!.GetValue<string>())];
-        Assert.Contains(warnings, w => w.Contains("'" + inside + "'", StringComparison.Ordinal) && w.Contains("working tree", StringComparison.Ordinal));
-        Assert.DoesNotContain(warnings, w => w.Contains("'" + dirA + "'", StringComparison.Ordinal));
     }
 
     // ---- gate.trust ----------------------------------------------------------------------------------------
