@@ -14,6 +14,11 @@
 // from a trust comparison by default; a gate that writes a file named in its argv needs that file declared
 // here. A gate whose report is not named in its argv — a lint gate's default report under artifacts/, for
 // example — needs no gate.outputs at all.
+//
+// `ResolvedExecutable` is the launcher's one resolution of the gate's argv[0] (round 1, before the worker
+// runs): the absolute path the trust check hashes as TrustSource.Executable and Gate.BuildStartInfo starts
+// as FileName. The frozen spec carries it into every round of the chain, so the gate runner never searches
+// PATH again at gate time; it is null only in a spec no launcher has resolved.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -21,7 +26,7 @@ using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null, string? ResolvedExecutable = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can

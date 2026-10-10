@@ -62,10 +62,10 @@ internal static class Gate
         }
         catch (LaunchException ex)
         {
-            // BuildStartInfo throws when the gate's argv[0] does not resolve on PATH (a launcher-
-            // level decision that Process.Start cannot safely make: on Unix, .NET would then also
-            // search the launcher's directory and the working directory). The message is precise,
-            // so just turn it into a start failure.
+            // BuildStartInfo throws when the gate's argv[0] cannot be resolved. For a spec the
+            // launcher resolved in round 1 this cannot happen (the resolved path is absolute and
+            // used as-is); only a caller that bypasses round 1 resolves here, and its failure is
+            // a start failure with a precise, named message.
             return await BuildStartFailureResultAsync(ex.Message, started, gateJsonPath, spec, envNames).ConfigureAwait(false);
         }
 
@@ -165,14 +165,13 @@ internal static class Gate
     private static ProcessStartInfo BuildStartInfo(GateSpec spec, string cwd, List<string> envNames)
     {
         List<string> cmd = spec.Command;
-        string first = cmd[0];
-        // The executable: PATH lookup only when there's no directory part (a path with a directory is used as given).
-        // A bare command the launcher cannot resolve on PATH must not reach Process.Start, which on
-        // Unix also searches the launcher's directory and the working directory (the tree the worker
-        // controls). Fail the start so the gate records "error" with a precise, named message.
-        bool hasDir = first.Contains(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
-                   || first.Contains(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal);
-        string resolved = hasDir ? first : (Launcher.FindOnPath(first) ?? throw new LaunchException($"gate executable '{first}' not found on PATH"));
+        // The executable: exactly the path round 1 resolved (GateSpec.ResolvedExecutable — the same
+        // string the trust check hashed as TrustSource.Executable, frozen on the spec the chain
+        // carries into every round). The gate never searches PATH again at gate time: a worker could
+        // plant an executable in an earlier PATH directory after round 1's lookup, and re-resolving
+        // here would run the planted file while the trust check hashes the real one. Only a spec no
+        // launcher has resolved (a direct Gate.RunAsync caller) resolves now, once, by the same rule.
+        string resolved = spec.ResolvedExecutable ?? GateTrust.ResolveExecutableStrict(cmd, cwd);
 
         ProcessStartInfo psi = new()
         {

@@ -304,16 +304,36 @@ internal static class Launcher
     /// </summary>
     internal static string DefaultRuntime(Provider p) => p.Name is "anthropic" || p.AnthropicBaseUrl is not null ? "claude" : "opencode";
 
+    /// <summary>
+    /// Searches PATH for <paramref name="command"/> and returns the first existing candidate as an
+    /// absolute path. A relative PATH entry (e.g. <c>node_modules/.bin</c>) would otherwise yield a
+    /// relative result, which .NET on Unix resolves against the launcher's own directory when it
+    /// starts a process, and which no absolute trust-set key could ever match. Null when no PATH
+    /// entry has the file.
+    /// </summary>
     public static string? FindOnPath(string command)
     {
         foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
-            string candidate = Path.Combine(dir.Trim('"'), command);
+            string candidate;
+            try
+            {
+                // A relative PATH entry resolves against the launcher's working directory — the same
+                // directory the gate runs in — so the returned path is always absolute.
+                candidate = Path.GetFullPath(Path.Combine(dir.Trim('"'), command));
+            }
+            catch (ArgumentException)
+            {
+                // A PATH entry that cannot form a valid path is skipped, like a non-existent one.
+                continue;
+            }
+
             if (File.Exists(candidate))
             {
                 return candidate;
             }
         }
+
         return null;
     }
 

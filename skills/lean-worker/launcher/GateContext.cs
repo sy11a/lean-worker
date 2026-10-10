@@ -13,7 +13,10 @@ namespace LeanWorker;
 /// What a gate round N+1 needs to know about the chain so far. Round 1 passes null; subsequent rounds are
 /// built by the launcher from the previous round's <see cref="GateOutcome"/>. The frozen <c>Spec</c>
 /// is the round-1 <see cref="GateSpec"/>: the launcher uses it instead of re-reading
-/// <c>profiles.json</c>, so a worker cannot change the gate's command for the next round. The frozen
+/// <c>profiles.json</c>, so a worker cannot change the gate's command for the next round. The spec
+/// also carries the round-1 resolved gate executable (<c>ResolvedExecutable</c>, the absolute path
+/// hashed as <c>TrustSource.Executable</c>), which every round starts verbatim — the gate runner
+/// never searches PATH again. The frozen
 /// <c>TrustSnapshot</c>, <c>TrustPaths</c> and <c>FixedSources</c> are round 1's
 /// before-worker trust snapshot, its fixed trust-path list and those paths' sources: every later round
 /// compares against round 1's snapshot (before its worker, before its gate,

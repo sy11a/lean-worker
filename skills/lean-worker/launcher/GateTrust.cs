@@ -86,7 +86,8 @@ internal static class GateTrust
         /// </summary>
         ArgvEntry,
         /// <summary>
-        /// The resolved gate executable (argv[0]).
+        /// The resolved gate executable (argv[0]) — resolved once in round 1, to the absolute path
+        /// the spec carries as <c>ResolvedExecutable</c> and the gate runner starts.
         /// </summary>
         Executable,
         /// <summary>
@@ -134,6 +135,11 @@ internal static class GateTrust
     /// simply needs the time to stream through the hash. The trust check must fail closed rather
     /// than hang the chain, so the open + read run on the thread pool and the wait is capped at this
     /// value — generous enough for a real executable of that size, still short enough to fail closed.
+    /// Two side effects are accepted: a timed-out open leaves its thread-pool thread blocked for
+    /// good (the kernel offers no way to cancel an open), and hashing is sequential
+    /// (<c>HashAsync</c> / <c>FirstDiffAsync</c> take one path at a time), so N hung entries cost
+    /// N × 30 s before the snapshot fails closed — bounded by how many entries the operator
+    /// configured, and still failing closed in the end.
     /// </summary>
     private static readonly TimeSpan _hashTimeout = TimeSpan.FromSeconds(30);
 
@@ -471,7 +477,11 @@ internal static class GateTrust
     /// the existing argv file entries, and the <c>gate.trust</c> entries (literal paths and glob
     /// matches). The launcher resolves this list once, before round 1's worker runs, and reuses it
     /// for every later hash, so glob matches and argv entries never pick up files the worker or the
-    /// gate created later. The glob walk skips the git root's top-level <c>.git</c> directory and
+    /// gate created later. The gate executable is handed in via <paramref name="resolvedExecutable"/>
+    /// — round 1's single resolution, the exact string the spec freezes as <c>ResolvedExecutable</c>
+    /// and the gate runner starts — so the hashed path and the started path can never diverge;
+    /// <paramref name="gateCommand"/> is only the fallback for callers that have no resolved path.
+    /// The glob walk skips the git root's top-level <c>.git</c> directory and
     /// the runs root; a glob that matches no file adds a warning to <paramref name="warnings"/>
     /// when that list is given. When <paramref name="sources"/> is given, every add records its
     /// <see cref="TrustSource"/> in it — even for a path the per-collector dedupe skips, since the
@@ -479,7 +489,7 @@ internal static class GateTrust
     /// </summary>
     public static List<string> CollectChainPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
         IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
-        Dictionary<string, HashSet<TrustSource>>? sources = null)
+        Dictionary<string, HashSet<TrustSource>>? sources = null, string? resolvedExecutable = null)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -513,7 +523,7 @@ internal static class GateTrust
             set.Add(source);
         }
 
-        AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.Executable));
+        AddResolvedExecutable(resolvedExecutable, gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.Executable));
         AddArgvEntries(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.ArgvEntry));
         AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => AddTracked(p, TrustSource.TrustEntry), warnings);
         AddPricesFile(extraPricesFile, p => AddTracked(p, TrustSource.PricesFile));
@@ -731,15 +741,76 @@ internal static class GateTrust
         add(Path.Combine(dir, ".config", "dotnet-tools.json"));
     }
 
-    private static void AddResolvedExecutable(IReadOnlyList<string> gateCommand, string gateWorkingDirectory, Action<string> add)
+    /// <summary>
+    /// Adds the gate executable to the trust set: <paramref name="resolvedExecutable"/> (round 1's
+    /// single resolution, already absolute) when the caller has one, otherwise a fresh resolution
+    /// from the command for callers that have not resolved it yet.
+    /// </summary>
+    private static void AddResolvedExecutable(string? resolvedExecutable, IReadOnlyList<string> gateCommand, string gateWorkingDirectory, Action<string> add)
     {
-        string exe = ResolveExecutable(gateCommand, gateWorkingDirectory);
+        string exe = resolvedExecutable ?? ResolveExecutable(gateCommand, gateWorkingDirectory);
         if (exe.Length is 0)
         {
             return;
         }
 
         add(exe);
+    }
+
+    /// <summary>
+    /// Resolves the gate's argv[0] to an absolute path: a path with a directory part resolves against
+    /// the gate working directory (<c>Path.GetFullPath</c>, so <c>./tools/gate.sh</c> cannot fall back
+    /// to .NET's exe-directory-adjacent lookup at start time), a bare name on PATH
+    /// (<see cref="Launcher.FindOnPath"/> already returns absolute results, so a relative PATH entry
+    /// cannot produce a relative trust key). Returns the empty string when argv[0] cannot be resolved;
+    /// <see cref="ResolveExecutableStrict"/> turns that into a launch error.
+    /// </summary>
+    private static string ResolveExecutable(IReadOnlyList<string> gateCommand, string gateWorkingDirectory)
+    {
+        if (gateCommand.Count is 0)
+        {
+            return string.Empty;
+        }
+
+        string first = gateCommand[0];
+        if (string.IsNullOrEmpty(first))
+        {
+            return string.Empty;
+        }
+
+        if (HasDirectorySeparator(first))
+        {
+            try
+            {
+                return Path.GetFullPath(Path.Combine(gateWorkingDirectory, first));
+            }
+            catch (ArgumentException)
+            {
+                return string.Empty;
+            }
+        }
+
+        return Launcher.FindOnPath(first) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// The one resolution of the gate's argv[0], run exactly once in round 1 before the worker starts:
+    /// the returned absolute path is hashed as <see cref="TrustSource.Executable"/>, frozen on the
+    /// gate spec (<c>ResolvedExecutable</c>) and started by <c>Gate.BuildStartInfo</c> verbatim. The
+    /// gate runner never searches PATH again, so an executable the worker plants in an earlier PATH
+    /// directory after this lookup cannot be swapped in for a later round. Unresolvable argv[0] is a
+    /// launch error (exit 2) before the worker.
+    /// </summary>
+    internal static string ResolveExecutableStrict(IReadOnlyList<string> gateCommand, string gateWorkingDirectory)
+    {
+        string resolved = ResolveExecutable(gateCommand, gateWorkingDirectory);
+        if (resolved.Length is 0)
+        {
+            string first = gateCommand.Count is 0 ? string.Empty : gateCommand[0];
+            throw new LaunchException($"gate executable '{first}' not found on PATH");
+        }
+
+        return resolved;
     }
 
     /// <summary>
@@ -778,34 +849,6 @@ internal static class GateTrust
 
             add(full);
         }
-    }
-
-    private static string ResolveExecutable(IReadOnlyList<string> gateCommand, string gateWorkingDirectory)
-    {
-        if (gateCommand.Count is 0)
-        {
-            return string.Empty;
-        }
-
-        string first = gateCommand[0];
-        if (string.IsNullOrEmpty(first))
-        {
-            return string.Empty;
-        }
-
-        if (HasDirectorySeparator(first))
-        {
-            try
-            {
-                return Path.GetFullPath(Path.Combine(gateWorkingDirectory, first));
-            }
-            catch (ArgumentException)
-            {
-                return string.Empty;
-            }
-        }
-
-        return Launcher.FindOnPath(first) ?? first;
     }
 
     private static bool HasDirectorySeparator(string s)

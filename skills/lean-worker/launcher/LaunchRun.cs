@@ -317,6 +317,18 @@ internal sealed class LaunchRun
         }
 
         _gate = spec with { MaxTotalUsd = spec.MaxTotalUsd ?? (3m * _budget) };
+        // Round 1 resolves the gate's argv[0] exactly once, to the absolute path the trust check
+        // hashes as TrustSource.Executable (CollectFixedPathsAsync adds exactly this string); later
+        // rounds reuse the value frozen on the round-1 spec, which the chain carries in
+        // GateContext.Spec. Gate.BuildStartInfo starts exactly this path — there is no PATH search at
+        // gate time — so an executable the worker plants in an earlier PATH directory after this
+        // lookup can never be swapped in for a later round. An unresolvable argv[0] is a launch error
+        // (exit 2) before the worker starts.
+        if (_gate.ResolvedExecutable is null)
+        {
+            _gate = _gate with { ResolvedExecutable = GateTrust.ResolveExecutableStrict(_gate.Command, Directory.GetCurrentDirectory()) };
+        }
+
         InitialGateSpec = _gate;
         NoteGate(_gate);
     }
@@ -752,10 +764,13 @@ internal sealed class LaunchRun
     /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
     /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
     /// once, before round 1's worker, so glob matches and argv entries never pick up files the
-    /// worker or the gate create later. The per-path sources are frozen with the list: the
-    /// report-path rule asks where a path is trusted from, and a later round must not re-derive
-    /// that from a tree the worker has already changed. A gate.trust glob that matched no file
-    /// becomes a warning on the gate spec (recorded in gate.json) and a note in the result block.
+    /// worker or the gate create later. The executable enters as the spec's
+    /// <c>ResolvedExecutable</c> — the exact string round 1 resolved and the gate will start — so
+    /// the hashed path and the started path are the same value. The per-path sources are frozen
+    /// with the list: the report-path rule asks where a path is trusted from, and a later round
+    /// must not re-derive that from a tree the worker has already changed. A gate.trust glob that
+    /// matched no file becomes a warning on the gate spec (recorded in gate.json) and a note in
+    /// the result block.
     /// </summary>
     private async Task<List<string>> CollectFixedPathsAsync()
     {
@@ -765,7 +780,7 @@ internal sealed class LaunchRun
         string root = gitRoot ?? cwd;
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
-        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources);
+        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, gate.ResolvedExecutable);
         FixedSources = sources;
         if (warnings.Count > 0)
         {
@@ -925,14 +940,17 @@ internal sealed class LaunchRun
     /// paths whether or not they exist, so a declared output with a config-walk file name is
     /// already refused by that check — no file-name rule is needed on top. The one refusal that
     /// applies whether or not the file is in the trusted set yet is the runs-root one: the moment
-    /// the gate creates an output at or under the runs root outside <c>runs/</c>, a later round's
-    /// runs-root walk picks it up and the pre-gate check fails on the launcher's own tree. An argv
-    /// entry is allowed as a trusted input: the operator may pin the very file the gate writes to
-    /// (e.g. <c>sh gate.sh artifacts/check.sarif</c> with the path in the argv and in
-    /// <c>gate.outputs</c>) — it is compared before the gate, and only the after-gate comparison
-    /// excludes it. Runs with the round-1 snapshot, before the run directory is created: a
-    /// collision is a profile mistake, so it fails as a launch error (exit 2), not as a trust
-    /// violation.
+    /// the gate creates an output at or under the runs root outside the launcher's own bookkeeping
+    /// subtrees, a later round's runs-root walk picks it up and the pre-gate check fails on the
+    /// launcher's own tree. Like the walk's skip set, <c>runs/</c>, <c>inbox/</c> and
+    /// <c>system/</c> under the runs root are exempt — the walk never descends into them, so an
+    /// output there can never trip a later round (and <c>inbox/</c> is a likely place for scratch
+    /// output). An argv entry is allowed as a trusted input: the operator may pin the very file
+    /// the gate writes to (e.g. <c>sh gate.sh artifacts/check.sarif</c> with the path in the argv
+    /// and in <c>gate.outputs</c>) — it is compared before the gate, and only the after-gate
+    /// comparison excludes it. Runs with the round-1 snapshot, before the run directory is
+    /// created: a collision is a profile mistake, so it fails as a launch error (exit 2), not as a
+    /// trust violation.
     /// </summary>
     private async Task ValidateDeclaredOutputsAsync(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
     {
@@ -944,7 +962,10 @@ internal sealed class LaunchRun
 
         string anchor = await OutputAnchorAsync().ConfigureAwait(false);
         string runsRoot = Path.GetFullPath(_runsRoot);
+        // The same subtrees AddRunsRootFiles never descends into: the launcher's own bookkeeping.
         string runsDir = Path.Combine(runsRoot, "runs");
+        string inboxDir = Path.Combine(runsRoot, "inbox");
+        string systemDir = Path.Combine(runsRoot, "system");
         for (int i = 0; i < gate.Outputs.Count; i++)
         {
             string full = ResolveOutputEntry(gate.Outputs[i], anchor);
@@ -954,7 +975,10 @@ internal sealed class LaunchRun
                 throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is a trusted gate input");
             }
 
-            if (GateTrust.IsAtOrUnder(full, runsRoot) && !GateTrust.IsAtOrUnder(full, runsDir))
+            if (GateTrust.IsAtOrUnder(full, runsRoot)
+                && !GateTrust.IsAtOrUnder(full, runsDir)
+                && !GateTrust.IsAtOrUnder(full, inboxDir)
+                && !GateTrust.IsAtOrUnder(full, systemDir))
             {
                 throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is at or under the runs root outside runs/");
             }
