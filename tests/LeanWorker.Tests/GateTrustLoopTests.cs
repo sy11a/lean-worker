@@ -162,8 +162,92 @@ public sealed class GateTrustLoopTests : IDisposable
         AssertViolation(setup, code, stdout, exe);
     }
 
+    // ---- commands the gate script runs by name: the frozen absolute PATH and its name sets ------------------
+
+    private const string ToolName = "lw-tool";
+
+    private async Task<(Setup Setup, string DirA, string DirB)> NewNamedToolSetupAsync()
+    {
+        string dirA = _dirs.Create("lw-gate-patha");
+        string dirB = _dirs.Create("lw-gate-pathb");
+        Setup setup = await NewSetupAsync(scriptBody: "#!/bin/sh\n" + ToolName + "\nexit 0\n");
+        await GateLoopTests.WriteExecutableAsync(Path.Combine(dirB, ToolName), "#!/bin/sh\ntouch '" + setup.Marker + "'\nexit 0\n");
+        return (setup, dirA, dirB);
+    }
+
+    private static void SetPath(params string[] entries) =>
+        Environment.SetEnvironmentVariable("PATH", string.Join(Path.PathSeparator, entries) + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"));
+
+    [Fact]
+    public async Task A_gate_script_that_runs_a_tool_by_name_runs_clean_when_the_PATH_directories_are_unchangedAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+
+        (int code, string stdout) = await RunAsync(setup, "true", () => SetPath(dirA, dirB));
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_worker_that_plants_a_tool_in_an_earlier_PATH_directory_trips_the_trust_checkAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string planted = Path.Combine(dirA, ToolName);
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'",
+            () => SetPath(dirA, dirB));
+
+        AssertViolation(setup, code, stdout, planted);
+    }
+
+    [Fact]
+    public async Task A_worker_that_removes_a_name_from_a_PATH_directory_trips_the_trust_checkAsync()
+    {
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string removed = Path.Combine(dirB, ToolName);
+
+        (int code, string stdout) = await RunAsync(setup, "rm -f '" + removed + "'", () => SetPath(dirA, dirB));
+
+        AssertViolation(setup, code, stdout, removed);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_relative_PATH_entry_is_dropped_from_the_gates_PATHAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string relativeMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "relative-ran");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "true",
+            () =>
+            {
+                string bin = Path.Combine(Directory.GetCurrentDirectory(), "relbin");
+                _ = Directory.CreateDirectory(bin);
+                File.WriteAllText(Path.Combine(bin, ToolName), "#!/bin/sh\ntouch '" + relativeMarker + "'\nexit 0\n");
+                File.SetUnixFileMode(Path.Combine(bin, ToolName), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                SetPath("relbin", dirA, dirB);
+            });
+
+        AssertClean(setup, code, stdout);
+        Assert.False(File.Exists(relativeMarker), "a tool found through a relative PATH entry must not run");
+        JsonObject gateJson = JsonNode.Parse(
+            await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        string[] entries = gateJson["path"]!.GetValue<string>().Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+        Assert.NotEmpty(entries);
+        Assert.All(entries, e => Assert.True(Path.IsPathRooted(e), "gate PATH entry '" + e + "' is not absolute"));
+        Assert.Contains(dirA, entries, StringComparer.Ordinal);
+        Assert.Contains(dirB, entries, StringComparer.Ordinal);
+    }
+
     // A gate on PATH whose real executable is only in dirB; the worker plants a clean-printing file of the
-    // same name in dirA, which comes first on PATH. The gate that runs must be dirB's, found in round 1.
+    // same name in dirA, which comes first on PATH. dirA is a gate PATH directory, so the planted name trips
+    // the name-set check before the gate runs.
     [Fact]
     public async Task A_worker_that_plants_an_executable_in_an_earlier_PATH_directory_does_not_replace_the_gateAsync()
     {
@@ -185,15 +269,8 @@ public sealed class GateTrustLoopTests : IDisposable
             () => Environment.SetEnvironmentVariable(
                 "PATH", dirA + Path.PathSeparator + dirB + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")));
 
-        Assert.True(File.Exists(setup.Marker), "dirB's gate should have run");
+        AssertViolation(setup, code, stdout, exeA);
         Assert.False(File.Exists(plantedMarker), "the planted gate must not run");
-        Assert.NotEqual(0, code);
-        Assert.DoesNotContain("gate:     clean", stdout, StringComparison.Ordinal);
-
-        string runDir = RunAsyncGolden.RunDirFrom(stdout);
-        string log = await File.ReadAllTextAsync(Path.Combine(runDir, "gate.log"), TestContext.Current.CancellationToken);
-        Assert.Contains("argv0=" + exeB, log, StringComparison.Ordinal);
-        Assert.DoesNotContain(exeA, log, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,20 +295,84 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["./tools/gate.sh"]));
         string expected = string.Empty;
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () =>
-            {
-                string cwd = Directory.GetCurrentDirectory();
-                string script = Path.Combine(cwd, "tools", "gate.sh");
-                _ = Directory.CreateDirectory(Path.GetDirectoryName(script)!);
-                File.WriteAllText(script, "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nexit 0\n");
-                File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-                expected = script;
-            });
+        // A decoy at the same relative path under the launcher's own folder: .NET's start-time fallback
+        // would find it, the resolved absolute path must not.
+        string decoyMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "decoy-ran");
+        string decoy = Path.Combine(AppContext.BaseDirectory, "tools", "gate.sh");
+        bool createdDecoyDir = !Directory.Exists(Path.GetDirectoryName(decoy));
+        try
+        {
+            _ = Directory.CreateDirectory(Path.GetDirectoryName(decoy)!);
+            await GateLoopTests.WriteExecutableAsync(decoy, "#!/bin/sh\ntouch '" + decoyMarker + "'\nexit 0\n");
 
-        AssertClean(setup, code, stdout);
-        string log = await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.log"), TestContext.Current.CancellationToken);
-        Assert.Contains("argv0=" + expected, log, StringComparison.Ordinal);
+            (int code, string stdout) = await RunAsync(
+                setup, "true", () =>
+                {
+                    string cwd = Directory.GetCurrentDirectory();
+                    string script = Path.Combine(cwd, "tools", "gate.sh");
+                    _ = Directory.CreateDirectory(Path.GetDirectoryName(script)!);
+                    File.WriteAllText(script, "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nexit 0\n");
+                    File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                    expected = script;
+                });
+
+            AssertClean(setup, code, stdout);
+            Assert.False(File.Exists(decoyMarker), "the script under the launcher's folder must not run");
+            string log = await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.log"), TestContext.Current.CancellationToken);
+            Assert.Contains("argv0=" + expected, log, StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(decoy);
+            if (createdDecoyDir)
+            {
+                Directory.Delete(Path.GetDirectoryName(decoy)!);
+            }
+        }
+    }
+
+    [Fact]
+    public void ResolveExecutableStrict_resolves_a_relative_argv0_against_the_gate_working_directory()
+    {
+        string cwd = _dirs.Create("lw-gate-resolve");
+        string script = Path.Combine(cwd, "tools", "gate.sh");
+        _ = Directory.CreateDirectory(Path.GetDirectoryName(script)!);
+        File.WriteAllText(script, "x");
+
+        Assert.Equal(script, GateTrust.ResolveExecutableStrict(["./tools/gate.sh"], cwd));
+    }
+
+    [Fact]
+    public void ResolveExecutableStrict_refuses_a_missing_entry_with_a_directory_part_without_naming_PATH()
+    {
+        string cwd = _dirs.Create("lw-gate-resolve");
+
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateTrust.ResolveExecutableStrict(["./tools/missing.sh"], cwd));
+
+        Assert.Equal("gate executable './tools/missing.sh' not found", ex.Message);
+    }
+
+    [Fact]
+    public void ResolveExecutableStrict_names_PATH_for_a_missing_bare_name()
+    {
+        string cwd = _dirs.Create("lw-gate-resolve");
+
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateTrust.ResolveExecutableStrict(["lw-gate-t53n-does-not-exist"], cwd));
+
+        Assert.Contains("not found on PATH", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_missing_relative_gate_argv0_with_a_directory_is_a_launch_error_before_the_workerAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["./tools/missing.sh"]));
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+
+        Assert.Contains("gate executable './tools/missing.sh' not found", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("on PATH", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
     }
 
     // ---- gate.trust ----------------------------------------------------------------------------------------

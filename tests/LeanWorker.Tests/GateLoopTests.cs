@@ -273,11 +273,37 @@ public class GateLoopTests
         RunAsyncGolden.WriteProfile(root, "test", new JsonObject { ["gate"] = new JsonObject { ["command"] = new JsonArray(["./gate.sh"]) } });
         const string worker = "printf '#!/bin/sh\\nexit 0\\n' > gate.sh\n" + RunAsyncGolden.SuccessStream;
 
-        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+        // The script exists before the launch (a missing one is a launch error); the worker rewrites it.
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker, _ =>
+        {
+            string script = Path.Combine(Directory.GetCurrentDirectory(), "gate.sh");
+            File.WriteAllText(script, "#!/bin/sh\nexit 1\n");
+            if (OperatingSystem.IsWindows())
+            {
+                return;
+            }
+
+            File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        });
 
         Assert.Equal(5, code);
         Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
         Assert.Contains("gate.sh", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_missing_relative_gate_script_is_a_launch_error_before_the_workerAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        RunAsyncGolden.WriteProfile(root, "test", new JsonObject { ["gate"] = new JsonObject { ["command"] = new JsonArray(["./gate.sh"]) } });
+        string workerMarker = Path.Combine(root, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsyncGolden.RunAsync(root, "touch '" + workerMarker + "'\n" + RunAsyncGolden.SuccessStream));
+
+        Assert.Contains("gate executable './gate.sh' not found", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("on PATH", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
     }
 
     [Fact]
