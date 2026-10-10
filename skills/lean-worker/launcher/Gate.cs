@@ -20,8 +20,8 @@
 // `gate.env`), not inherited from the launcher. Names that pass the gate's filter are recorded as
 // `env_names` in gate.json (sorted, never the values) so the run's record shows exactly which
 // variables reached the gate. The PATH the gate receives is not the launcher's own: it is the
-// frozen absolute-only PATH the spec carries (`GateSpec.GatePath`), whose directories' name sets
-// the trust check watches (the GateTrust header's rule).
+// frozen absolute-only PATH the spec carries (`GateSpec.GatePath`), whose directories' listings —
+// entry names plus per-entry metadata — the trust check watches (the GateTrust header's rule).
 
 using System.Diagnostics;
 using System.Globalization;
@@ -211,8 +211,10 @@ internal static class Gate
         // the GateTrust header's rule), not the launcher's own PATH: a relative entry would resolve
         // inside the worker's tree, and a PATH re-read at gate time would let a later round pick up
         // directories the worker created. Null only in a spec no launcher has resolved; then the
-        // allowlist's PATH (the launcher's own) is left in place.
-        if (spec.GatePath is not null)
+        // allowlist's PATH (the launcher's own) is left in place. An empty value is treated the same
+        // way and never assigned: round 1 refuses an all-relative PATH, and setting PATH to "" would
+        // make the gate resolve bare command names in its current directory.
+        if (!string.IsNullOrEmpty(spec.GatePath))
         {
             psi.Environment["PATH"] = spec.GatePath;
             if (!envNames.Contains("PATH"))

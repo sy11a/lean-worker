@@ -12,13 +12,18 @@
 // The gate's PATH: commands a gate script runs by name resolve only through the frozen absolute
 // PATH — built once in round 1 from the launcher's PATH by keeping only the absolute entries
 // (deduped, order kept; relative entries such as "." or node_modules/.bin resolve inside the
-// worker's own tree and are dropped), frozen on the gate spec, and handed to the gate as PATH in
-// every round. Each directory on that PATH has its name set trusted: at round 1 the launcher
-// records the set of entry names directly in each directory (no recursion, no hashing; a missing
-// or unreadable directory is recorded as such), and the pre-gate and after-gate checks list them
-// again — any added, removed or now-unreadable name is a trust violation. The content of the
-// binaries on those directories is not hashed: a worker able to overwrite a system binary in
-// place is out of scope.
+// worker's own tree and are dropped; a PATH with no absolute entry left is a launch error, since
+// an empty PATH would resolve bare names in the gate's current directory), frozen on the gate
+// spec, and handed to the gate as PATH in every round. Each directory on that PATH is trusted as
+// listed: at round 1 the launcher records the entries directly in each directory (no recursion, no
+// hashing) — name, length, last write time (UTC), whether the entry is a symlink and, for a
+// symlink, its link target — and the pre-gate and after-gate checks list them again. An added or
+// removed name, a changed length, mtime or link target, and any change of a directory's own state
+// (missing ↔ readable ↔ unreadable, even when the listings are empty) is a trust violation. Named,
+// accepted gaps: the content of a same-named entry is not hashed, so a worker that rewrites it and
+// restores the mtime (`touch -d`) while keeping the length escapes this check (put such a tool in
+// gate.trust or call it by an absolute path in a trusted script), and nothing under a subdirectory
+// of a PATH directory is listed directly (only that subdirectory's own listing metadata notices).
 //
 // Snapshot keys are the trusted paths the operator configured; the value always carries the resolved
 // final target before a bar, then the SHA-256 (for regular file bytes) or a sentinel for everything
@@ -48,6 +53,7 @@
 // (the open fails → unreadable → trust violation). No P/Invoke.
 
 using System.Globalization;
+using System.IO.Enumeration;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
@@ -484,17 +490,24 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// One gate PATH directory's listing: the entry names directly in it, or why there are none.
-    /// <paramref name="Readable"/> is false exactly when the directory itself could not be listed —
-    /// <paramref name="Reason"/> then says whether it is <c>missing</c> or
-    /// <c>unreadable: &lt;exception type&gt;</c> — which the comparison treats as a state of its own
-    /// (the GateTrust header's rule), not as an empty directory.
+    /// One entry directly in a gate PATH directory: its name, its length (0 for a directory — a
+    /// subdirectory's own size changes whenever entries are added under it, which is not a change to
+    /// the PATH directory's listing), its last write time in UTC, whether it is a symlink, and for a
+    /// symlink the link target it carries.
     /// </summary>
-    internal sealed record PathNameListing(bool Readable, string? Reason, IReadOnlySet<string> Names);
+    internal sealed record PathEntry(string Name, long Length, DateTimeOffset LastWriteTimeUtc, bool IsSymlink, string? LinkTarget);
 
     /// <summary>
-    /// Round 1's name sets for the gate PATH's directories, keyed by the frozen absolute directory
-    /// (the GateTrust header's rule: the name-set baseline every later listing is compared against).
+    /// One listing of a gate PATH directory. A readable listing carries every direct entry's
+    /// <see cref="PathEntry"/> (the GateTrust header's rule); a missing (<c>missing</c>) or unreadable
+    /// (<c>unreadable: &lt;exception type&gt;</c>) directory records the reason — which the comparison
+    /// treats as a state of its own (the GateTrust header's rule), not as an empty directory.
+    /// </summary>
+    internal sealed record PathNameListing(bool Readable, string? Reason, IReadOnlyDictionary<string, PathEntry> Entries);
+
+    /// <summary>
+    /// Round 1's listings for the gate PATH's directories, keyed by the frozen absolute directory
+    /// (the GateTrust header's rule: the listing baseline every later listing is compared against).
     /// </summary>
     internal sealed record PathNamesSnapshot(IReadOnlyDictionary<string, PathNameListing> Directories);
 
@@ -512,7 +525,10 @@ internal static class GateTrust
         foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
             string dir = entry.Trim('"');
-            if (!Path.IsPathRooted(dir))
+            // Fully qualified, not merely rooted: on Windows `\foo` and `C:foo` are rooted but still
+            // relative to the current drive or directory, and a relative entry would resolve inside
+            // the worker's tree.
+            if (!Path.IsPathFullyQualified(dir))
             {
                 continue;
             }
@@ -538,12 +554,23 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// The gate's PATH: <see cref="GatePathDirectories"/> joined with the path separator — possibly
-    /// empty, when every PATH entry is relative (then the gate runs with no PATH and its scripts
-    /// must use absolute command paths). Frozen on the gate spec in round 1 and split back by
-    /// <see cref="SplitGatePath"/>.
+    /// The gate's PATH: <see cref="GatePathDirectories"/> joined with the path separator. When every
+    /// PATH entry is relative nothing is left to join — and an empty PATH is not "no PATH": both
+    /// glibc <c>execvp</c> and bash read an empty PATH element as the current directory, so the gate
+    /// would resolve bare command names inside the worker's own tree (the very hole the absolute-only
+    /// rule closes). This throws a launch error instead of returning an empty string. Frozen on the
+    /// gate spec in round 1 and split back by <see cref="SplitGatePath"/>.
     /// </summary>
-    public static string BuildGatePath() => string.Join(Path.PathSeparator, GatePathDirectories());
+    public static string BuildGatePath()
+    {
+        IReadOnlyList<string> dirs = GatePathDirectories();
+        if (dirs.Count is 0)
+        {
+            throw new LaunchException("gate PATH has no absolute entries");
+        }
+
+        return string.Join(Path.PathSeparator, dirs);
+    }
 
     /// <summary>
     /// The frozen PATH string split back into its directories — the exact list
@@ -553,11 +580,10 @@ internal static class GateTrust
         [.. gatePath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)];
 
     /// <summary>
-    /// Lists the names directly in each directory — one
-    /// <see cref="Directory.EnumerateFileSystemEntries(string, string, EnumerationOptions)"/> per
-    /// directory over <see cref="_walkOptions"/> (no recursion, no hashing; the GateTrust header's
-    /// rule). A missing or unreadable directory is recorded as such
-    /// (<see cref="PathNameListing"/>), never silently as an empty directory.
+    /// Lists the entries directly in each directory — one
+    /// <see cref="FileSystemEnumerable{T}"/> per directory over <see cref="_pathListOptions"/> (no
+    /// recursion, no hashing; the GateTrust header's rule). A missing or unreadable directory is
+    /// recorded as such (<see cref="PathNameListing"/>), never silently as an empty directory.
     /// </summary>
     public static PathNamesSnapshot SnapshotPathNames(IReadOnlyList<string> directories)
     {
@@ -574,33 +600,52 @@ internal static class GateTrust
     {
         if (!Directory.Exists(dir))
         {
-            return new PathNameListing(Readable: false, Reason: "missing", Names: _emptyNames);
+            return new PathNameListing(Readable: false, Reason: "missing", Entries: _emptyEntries);
         }
 
         try
         {
-            HashSet<string> names = new(StringComparer.Ordinal);
-            foreach (string entry in Directory.EnumerateFileSystemEntries(dir, "*", _walkOptions))
+            Dictionary<string, PathEntry> entries = new(StringComparer.Ordinal);
+            // One enumeration; the transform reads the FileSystemEntry the walk already holds (name,
+            // length, last write time, link flag) and resolves a symlink's target with one call.
+            // _pathListOptions, not _walkOptions: an unreadable directory must throw here — on Unix
+            // IgnoreInaccessible also silences the root's own open failure, which would record a
+            // directory the worker made unreadable as "readable, no entries".
+            foreach (PathEntry entry in new FileSystemEnumerable<PathEntry>(
+                dir,
+                static (ref FileSystemEntry e) =>
+                {
+                    bool isSymlink = e.Attributes.HasFlag(FileAttributes.ReparsePoint);
+                    return new PathEntry(
+                        Name: e.FileName.ToString(),
+                        Length: e.IsDirectory ? 0 : e.Length,
+                        LastWriteTimeUtc: e.LastWriteTimeUtc,
+                        IsSymlink: isSymlink,
+                        LinkTarget: isSymlink ? e.ToFileSystemInfo().LinkTarget : null);
+                },
+                _pathListOptions))
             {
-                _ = names.Add(Path.GetFileName(entry));
+                entries[entry.Name] = entry;
             }
 
-            return new PathNameListing(Readable: true, Reason: null, Names: names);
+            return new PathNameListing(Readable: true, Reason: null, Entries: entries);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return new PathNameListing(Readable: false, Reason: $"unreadable: {ex.GetType().Name}", Names: _emptyNames);
+            return new PathNameListing(Readable: false, Reason: $"unreadable: {ex.GetType().Name}", Entries: _emptyEntries);
         }
     }
 
-    private static readonly IReadOnlySet<string> _emptyNames = new HashSet<string>(StringComparer.Ordinal);
+    private static readonly IReadOnlyDictionary<string, PathEntry> _emptyEntries = new Dictionary<string, PathEntry>(StringComparer.Ordinal);
 
     /// <summary>
-    /// The gate PATH name-set violations right now, against round 1's frozen listing: a name added
-    /// to or removed from a readable directory, a readable directory that turned missing or
-    /// unreadable, and every name in a directory that was missing or unreadable at round 1 and is
-    /// readable now (the baseline never saw them, so each one is an addition). Name changes are
-    /// named as <c>&lt;dir&gt;/&lt;name&gt;</c> and a directory state change as
+    /// The gate PATH listing violations right now, against round 1's frozen listing: a name added to
+    /// or removed from a readable directory, a name whose length, last write time, link flag or link
+    /// target changed, a readable directory that turned missing or unreadable, and a directory that
+    /// was missing or unreadable at round 1 and is readable now (the baseline never saw its entries,
+    /// so each one is an addition, and the state change itself is reported even when it is empty —
+    /// the check must not depend on how listing errors are classified). Entry changes are named as
+    /// <c>&lt;dir&gt;/&lt;name&gt;</c> with what changed, a directory state change as
     /// <c>&lt;dir&gt; is now &lt;reason&gt;</c>, in the frozen directory order; the caller prefixes
     /// them like the other trust messages. One enumeration per directory, no hashing.
     /// </summary>
@@ -611,28 +656,31 @@ internal static class GateTrust
         {
             PathNameListing was = before.Directories.TryGetValue(dir, out PathNameListing? listing)
                 ? listing
-                : new PathNameListing(Readable: false, Reason: "missing", Names: _emptyNames);
+                : new PathNameListing(Readable: false, Reason: "missing", Entries: _emptyEntries);
             PathNameListing now = ListPathDirectory(dir);
-            if (!was.Readable && !now.Readable)
+            if (!now.Readable)
             {
-                // Neither state could be listed: whatever sits there was invisible to both checks.
-                continue;
-            }
-
-            if (was.Readable)
-            {
-                if (!now.Readable)
+                if (was.Readable)
                 {
                     violations.Add($"{dir} is now {now.Reason}");
-                    continue;
                 }
-
-                foreach (string name in now.Names.Where(n => !was.Names.Contains(n)).Order(StringComparer.Ordinal))
+                else if (!string.Equals(was.Reason, now.Reason, StringComparison.Ordinal))
                 {
-                    violations.Add(Path.Combine(dir, name));
+                    // Neither listing could read anything, but the directory's state still changed
+                    // (missing ↔ unreadable, or a different unreadable reason): a change of state is
+                    // a violation even when the listing is empty.
+                    violations.Add($"{dir} was {was.Reason}, is now {now.Reason}");
                 }
 
-                foreach (string name in was.Names.Where(n => !now.Names.Contains(n)).Order(StringComparer.Ordinal))
+                continue;
+            }
+
+            if (!was.Readable)
+            {
+                // Readable now, invisible to the baseline: the state change (even for an empty
+                // directory) plus every entry as an addition.
+                violations.Add($"{dir} was {was.Reason}, is now readable");
+                foreach (string name in now.Entries.Keys.Order(StringComparer.Ordinal))
                 {
                     violations.Add(Path.Combine(dir, name));
                 }
@@ -640,14 +688,65 @@ internal static class GateTrust
                 continue;
             }
 
-            // Readable now, invisible to the baseline: every name is an addition.
-            foreach (string name in now.Names.Order(StringComparer.Ordinal))
-            {
-                violations.Add(Path.Combine(dir, name));
-            }
+            EntryViolations(dir, was.Entries, now.Entries, violations);
         }
 
         return violations;
+    }
+
+    /// <summary>
+    /// The entry-level violations for one readable directory against its readable baseline: added
+    /// names, removed names, and surviving names whose recorded <see cref="PathEntry"/> differs.
+    /// </summary>
+    private static void EntryViolations(string dir, IReadOnlyDictionary<string, PathEntry> was, IReadOnlyDictionary<string, PathEntry> now, List<string> violations)
+    {
+        foreach (string name in now.Keys.Where(n => !was.ContainsKey(n)).Order(StringComparer.Ordinal))
+        {
+            violations.Add(Path.Combine(dir, name));
+        }
+
+        foreach (string name in was.Keys.Where(n => !now.ContainsKey(n)).Order(StringComparer.Ordinal))
+        {
+            violations.Add(Path.Combine(dir, name));
+        }
+
+        foreach (string name in was.Keys.Where(n => now.ContainsKey(n)).Order(StringComparer.Ordinal))
+        {
+            if (EntryChange(was[name], now[name]) is { } change)
+            {
+                violations.Add($"{Path.Combine(dir, name)} {change}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// What changed between round 1's record of a surviving entry and now, or null when nothing did:
+    /// the link flag (a plain file swapped for a symlink or back), a symlink's target, the length or
+    /// the last write time.
+    /// </summary>
+    private static string? EntryChange(PathEntry was, PathEntry now)
+    {
+        List<string> changes = [];
+        if (was.IsSymlink != now.IsSymlink)
+        {
+            changes.Add(was.IsSymlink ? "stopped being a symlink" : "became a symlink");
+        }
+        else if (was.IsSymlink && !string.Equals(was.LinkTarget, now.LinkTarget, StringComparison.Ordinal))
+        {
+            changes.Add($"changed its link target from '{was.LinkTarget}' to '{now.LinkTarget}'");
+        }
+
+        if (was.Length != now.Length)
+        {
+            changes.Add($"changed length from {was.Length} to {now.Length}");
+        }
+
+        if (was.LastWriteTimeUtc != now.LastWriteTimeUtc)
+        {
+            changes.Add($"changed mtime from {was.LastWriteTimeUtc:o} to {now.LastWriteTimeUtc:o}");
+        }
+
+        return changes.Count is 0 ? null : string.Join(", ", changes);
     }
 
     /// <summary>
@@ -767,6 +866,21 @@ internal static class GateTrust
     {
         RecurseSubdirectories = false,
         IgnoreInaccessible = true,
+        AttributesToSkip = FileAttributes.None,
+    };
+
+    /// <summary>
+    /// Options for the gate PATH directory listings (<see cref="ListPathDirectory"/>): no recursion,
+    /// nothing skipped — neither inaccessible directories (an unreadable directory must reach the
+    /// listing's <c>unreadable:</c> branch; on Unix <see cref="EnumerationOptions.IgnoreInaccessible"/>
+    /// also silences the root's own open failure and would record it as a readable empty directory)
+    /// nor attributes (no entry name drops out of the listing). Deliberately not
+    /// <see cref="_walkOptions"/>, whose skips are what the trust walk wants.
+    /// </summary>
+    private static readonly EnumerationOptions _pathListOptions = new()
+    {
+        RecurseSubdirectories = false,
+        IgnoreInaccessible = false,
         AttributesToSkip = FileAttributes.None,
     };
 

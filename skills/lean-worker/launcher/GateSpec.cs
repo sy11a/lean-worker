@@ -22,8 +22,10 @@
 //
 // `GatePath` is the same kind of one-time freeze for the gate's PATH (round 1, before the worker runs): the
 // launcher's PATH with only the absolute entries kept (deduped, order kept — the GateTrust header's rule),
-// handed to the gate as its PATH in every round and watched by the name-set trust check. It is null only
-// in a spec no launcher has resolved.
+// handed to the gate as its PATH in every round and watched by the listing trust check (names plus per-entry
+// metadata). It is null only in a spec no launcher has resolved: an all-relative launcher PATH is refused as
+// a launch error (exit 2) rather than frozen as an empty value, which would resolve bare command names in
+// the gate's current directory.
 
 using System.Globalization;
 using System.Text.Json.Nodes;

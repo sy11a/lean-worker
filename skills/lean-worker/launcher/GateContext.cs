@@ -2,8 +2,8 @@
 // built by the launcher from the previous round's GateOutcome. The frozen Spec is the round-1 GateSpec —
 // the launcher uses it instead of re-reading profiles.json, so a worker cannot swap the gate command for
 // the next round. The frozen TrustSnapshot, TrustPaths, FixedSources and GatePathNames are round 1's
-// before-worker trust snapshot, its fixed trust-path list, those paths' sources and its gate-PATH name-set
-// listing — every later round compares against them, so a detached process cannot re-baseline the trust
+// before-worker trust snapshot, its fixed trust-path list, those paths' sources and its gate-PATH listing
+// — every later round compares against them, so a detached process cannot re-baseline the trust
 // check by surviving into the next round. PostGateOutputs
 // carries the previous round's post-gate re-hash of the declared outputs that are in the trusted set; the
 // next round's baseline is round 1's snapshot with exactly those keys replaced.
@@ -24,8 +24,9 @@ namespace LeanWorker;
 /// compares against round 1's snapshot (before its worker, before its gate,
 /// after its gate) instead of taking a fresh baseline that a tampering process could hide in, and the
 /// report-path rule reads round 1's sources so a later round cannot re-derive them from a tree the
-/// worker has already changed. <c>GatePathNames</c> is round 1's name-set listing of the gate PATH's
-/// directories, the baseline every later round's pre-gate and after-gate listing is compared against.
+/// worker has already changed. <c>GatePathNames</c> is round 1's listing of the gate PATH's
+/// directories (entry names plus per-entry metadata), the baseline every later round's pre-gate and
+/// after-gate listing is compared against.
 /// <c>PostGateOutputs</c> is the one patch over that frozen baseline: the
 /// declared gate outputs that are in the trusted set, re-hashed after the previous round's clean
 /// after-gate check — the gate legitimately rewrote exactly those paths, so their keys carry the

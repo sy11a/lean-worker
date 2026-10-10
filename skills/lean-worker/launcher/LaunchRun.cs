@@ -111,17 +111,18 @@ internal sealed class LaunchRun
     // the trusted set are re-hashed (PostGateOutputs): the gate legitimately rewrote them after
     // round 1's baseline was taken, so the next round's baseline is round 1's snapshot with exactly
     // those keys replaced. Everything else keeps round 1's value.
-    // The gate's PATH directories get the same treatment without hashing: round 1 records the entry
-    // names directly in each (the frozen GatePath, the GateTrust header's rule) into GatePathNames,
-    // and every pre-gate and after-gate check compares the listing again — an added, removed or
-    // now-unreadable name is a trust violation.
+    // The gate's PATH directories get the same treatment without hashing: round 1 records the entries
+    // directly in each (the frozen GatePath, the GateTrust header's rule) into GatePathNames, and
+    // every pre-gate and after-gate check compares the listing again — an added or removed name, a
+    // changed length, mtime or link target, and any change of a directory's own state is a trust
+    // violation.
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
     public IReadOnlyList<string>? TrustPaths { get; private set; }
     public IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources { get; private set; }
 
     /// <summary>
-    /// Round 1's name-set listing of the gate PATH's directories, the baseline the pre-gate and
-    /// after-gate name-set checks compare against; frozen into the gate context for later rounds.
+    /// Round 1's listing of the gate PATH's directories, the baseline the pre-gate and
+    /// after-gate listing checks compare against; frozen into the gate context for later rounds.
     /// Null when no gate PATH was resolved.
     /// </summary>
     public GateTrust.PathNamesSnapshot? GatePathNames { get; private set; }
@@ -350,9 +351,12 @@ internal sealed class LaunchRun
         //
         // The same freeze covers the gate's PATH: built once from the launcher's PATH by keeping only
         // the absolute entries (the GateTrust header's rule), it is what every round hands the gate
-        // as PATH and what the name-set trust check watches; a PATH re-read at gate time would let a
-        // later round pick up directories the worker created.
-        if (gate.ResolvedExecutable is not null)
+        // as PATH and what the listing trust check watches; a PATH re-read at gate time would let a
+        // later round pick up directories the worker created. A PATH with no absolute entry left is
+        // refused here (exit 2): an empty PATH would make the gate resolve bare command names in its
+        // current directory. The early return below requires both frozen values: a spec carrying only
+        // one of them (a hand-built spec) is resolved the same way round 1 is.
+        if (gate.ResolvedExecutable is not null && gate.GatePath is not null)
         {
             return;
         }
@@ -790,9 +794,10 @@ internal sealed class LaunchRun
         await ValidateDeclaredOutputsAsync(snapshotSources).ConfigureAwait(false);
         TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
         RefuseBadSnapshotValues(snapshotSources);
-        // The gate PATH's directories: one name listing each, frozen as the baseline the pre-gate
-        // and after-gate checks compare against (the GateTrust header's rule). ResolveGate set
-        // GatePath whenever it resolved the executable, so this is non-null for every round-1 gate.
+        // The gate PATH's directories: one listing each, frozen as the baseline the pre-gate
+        // and after-gate checks compare against (the GateTrust header's rule). FreezeRound1GateResolution
+        // set both ResolvedExecutable and GatePath (or refused the launch), so this is non-null for
+        // every round-1 gate.
         string? gatePath = NonNull(_gate).GatePath;
         GatePathNames = gatePath is null ? null : GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
     }
@@ -818,6 +823,7 @@ internal sealed class LaunchRun
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
         List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, gate.ResolvedExecutable);
+        warnings.AddRange(GatePathLocationWarnings(root, cwd));
         FixedSources = sources;
         if (warnings.Count > 0)
         {
@@ -827,6 +833,45 @@ internal sealed class LaunchRun
         }
 
         return paths;
+    }
+
+    /// <summary>
+    /// Round-1 warnings for absolute gate PATH entries that lie inside the working tree (the git
+    /// root or the working directory) or the runs root: any worker, gate or launcher write into such
+    /// a directory during the run trips the gate PATH check, so the operator should drop the entry
+    /// from PATH or rely on the check knowingly. Recorded on the gate spec (gate.json's warnings)
+    /// and in the result notes like the other round-1 warnings.
+    /// </summary>
+    private List<string> GatePathLocationWarnings(string treeRoot, string workingDirectory)
+    {
+        string? gatePath = NonNull(_gate).GatePath;
+        if (gatePath is null)
+        {
+            return [];
+        }
+
+        string runsRoot = Path.GetFullPath(_runsRoot);
+        List<string> warnings = [];
+        foreach (string dir in GateTrust.SplitGatePath(gatePath))
+        {
+            List<string> inside = [];
+            if (GateTrust.IsAtOrUnder(dir, treeRoot) || GateTrust.IsAtOrUnder(dir, workingDirectory))
+            {
+                inside.Add("the working tree");
+            }
+
+            if (GateTrust.IsAtOrUnder(dir, runsRoot))
+            {
+                inside.Add("the runs root");
+            }
+
+            if (inside.Count > 0)
+            {
+                warnings.Add($"gate PATH directory '{dir}' lies inside {string.Join(" and ", inside)}; the gate PATH check treats any write there during the run as a violation (drop it from PATH or rely on the check knowingly)");
+            }
+        }
+
+        return warnings;
     }
 
     /// <summary>
@@ -1196,11 +1241,12 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// The name-set trust check over the gate PATH's directories against round 1's frozen listing:
+    /// The listing trust check over the gate PATH's directories against round 1's frozen listing:
     /// one enumeration per directory, no hashing (<see cref="GateTrust.PathNameViolations"/>). Null
     /// when there is no frozen listing or no frozen PATH (a hand-built context without the trust
     /// fields) or nothing changed. A violation here ends the chain with <c>error</c> (exit 5) like
-    /// the hash-based checks; <paramref name="prefix"/> says which check found it.
+    /// the hash-based checks; <paramref name="prefix"/> says which check found it, and the remedy
+    /// hint is appended so the cause is actionable.
     /// </summary>
     private string? GatePathViolation(string prefix)
     {
@@ -1211,8 +1257,15 @@ internal sealed class LaunchRun
         }
 
         IReadOnlyList<string> diffs = GateTrust.PathNameViolations(GatePathNames, GateTrust.SplitGatePath(gatePath));
-        return diffs.Count is 0 ? null : prefix + string.Join(", ", diffs);
+        return diffs.Count is 0 ? null : prefix + string.Join(", ", diffs) + PathPathHint;
     }
+
+    /// <summary>
+    /// Appended to every gate PATH violation: these directories are usually written by installs and
+    /// updates, so the message names the remedy (install before launching, or call by absolute path)
+    /// instead of leaving the operator to guess why an unrelated install ended the chain.
+    /// </summary>
+    private const string PathPathHint = " (PATH directories must not change during a gated run; install tools before launching or call them by absolute path)";
 
     /// <summary>
     /// After a clean after-gate check: hashes the declared gate outputs that are keys of the trust
