@@ -137,6 +137,8 @@ internal sealed class LaunchRun
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
+    private string _reportedModel = string.Empty;
+    private bool AliasResolved => PriceBook.IsAlias(_model) && _reportedModel.Length > 0 && _reportedModel != _model;
     private JsonObject _tok = [];
     private long _first;
     private long _peak;
@@ -253,7 +255,7 @@ internal sealed class LaunchRun
         }
         else
         {
-            _chain = [Json.Str(_profile, "model") ?? "claude-sonnet-5"];
+            _chain = [Json.Str(_profile, "model") ?? "sonnet"];
         }
     }
 
@@ -503,8 +505,17 @@ internal sealed class LaunchRun
         {
             _notes.Add($"runtime {_runtimeName}: provider {_provider} has no Anthropic-compatible endpoint in the price book");
         }
+        if (PriceBook.IsAlias(_model) && prices.Provider(_provider).PriceAs is "anthropic" && _runtimeName is not "claude")
+        {
+            throw new LaunchException($"model alias {_model} works only with the claude runtime; name the model id");
+        }
+        string priced = prices.ResolveAlias(_provider, _model);
+        if (priced != _model)
+        {
+            _notes.Add($"model alias {_model} -> {priced} (price book)");
+        }
         // What the model needs, whichever provider serves it: extra pre-approved commands and a note.
-        ModelTraits? traits = prices.Traits(_model);
+        ModelTraits? traits = prices.Traits(priced);
         if (traits is not null)
         {
             List<string> added = new([.. traits.AllowedTools.Where(t => !_allowed.Contains(t))]);
@@ -521,7 +532,7 @@ internal sealed class LaunchRun
                       (traits.Note is { Length: > 0 } tn ? $"; {tn}" : string.Empty));
         }
         _traits = traits;
-        _ = prices.Resolve(_provider, _model, out string? priceNote); // fails early under unknownModel: "error"
+        _ = prices.Resolve(_provider, priced, out string? priceNote); // fails early under unknownModel: "error"
         if (priceNote is null)
         {
             return;
@@ -700,6 +711,7 @@ internal sealed class LaunchRun
         WriteScope.Snapshot? treeBefore;
         Outcome outcome = _outcome;
         string model = _model;
+        string? reportedModel = null;
         int exitCode;
         bool timedOut;
         bool capKilled;
@@ -707,13 +719,14 @@ internal sealed class LaunchRun
         {
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
-            (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
-                OnWorkerLine(line, runtime, outcome, meter, model)).ConfigureAwait(false);
+            (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes,
+                line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel)).ConfigureAwait(false);
         }
         finally
         {
             RemoveScratch(prepared.ScratchDirectory);
         }
+        _reportedModel = reportedModel ?? string.Empty;
         _exitCode = exitCode;
         _timedOut = timedOut;
         _capKilled = capKilled;
@@ -733,7 +746,7 @@ internal sealed class LaunchRun
         _quotaAfter = quotaAfter;
     }
 
-    private static bool OnWorkerLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model)
+    private static bool HandleUsageLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model, ref string? reportedModel)
     {
         if (Json.TryParseObject(line) is not { } obj)
         {
@@ -741,7 +754,16 @@ internal sealed class LaunchRun
         }
 
         Usage? u = runtime.Parse(obj, outcome);
-        return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
+        if (u is null)
+        {
+            return false;
+        }
+
+        if (reportedModel is null && u.Model.Length > 0)
+        {
+            reportedModel = u.Model;
+        }
+        return meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
     }
 
     private async Task SnapshotTrustAsync()
@@ -1533,7 +1555,7 @@ internal sealed class LaunchRun
             ["profile"] = _profileName,
             ["runtime"] = _runtimeName,
             ["provider"] = _provider,
-            ["model"] = _model,
+            ["model"] = AliasResolved ? _reportedModel : _model,
             ["model_reason"] = _pickReason.Length > 0 ? _pickReason : null,
             ["effort"] = _effort,
             ["mode"] = _mode,
@@ -1578,6 +1600,13 @@ internal sealed class LaunchRun
             ["quota_used_pct"] = Launcher.QuotaDelta(_quotaBefore, _quotaAfter),
             ["notes"] = new JsonArray([.. _notes.Select(n => (JsonNode)n)]),
         };
+        AddModelRequested();
+    }
+
+    private void AddModelRequested()
+    {
+        if (!AliasResolved) { return; }
+        _summary["model_requested"] = _model;
     }
 
     private JsonNode? BuildGateSection()
@@ -1627,7 +1656,10 @@ internal sealed class LaunchRun
         await w.WriteLineAsync($"run:      {RunDir}").ConfigureAwait(false);
         await w.WriteLineAsync(string.Create(CultureInfo.InvariantCulture, $"status:   {_status}  (subtype={_outcome.Subtype}, reason={_outcome.TerminalReason}, exit={_exitCode})")).ConfigureAwait(false);
         string knob = _runtimeName is "opencode" ? $"variant {_variant ?? "default"}" : $"effort {_effort}";
-        await w.WriteLineAsync($"model:    {_provider}/{_model}{(_pickReason.Length > 0 ? $" ({_pickReason})" : string.Empty)}, {knob}, profile {_profileName ?? "(none)"}").ConfigureAwait(false);
+        string modelRef = AliasResolved
+            ? $"{_provider}/{_reportedModel} (alias {_model})"
+            : $"{_provider}/{_model}";
+        await w.WriteLineAsync($"model:    {modelRef}{(_pickReason.Length > 0 ? $" ({_pickReason})" : string.Empty)}, {knob}, profile {_profileName ?? "(none)"}").ConfigureAwait(false);
         await w.WriteLineAsync(_runtimeName is "opencode"
             ? $"runtime:  opencode, {_summary["hooks"]}"
             : $"runtime:  claude, mode {_mode}, hooks {_summary["hooks"]}, cache {_cacheTtl}").ConfigureAwait(false);

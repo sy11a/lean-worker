@@ -1,6 +1,7 @@
 // Price book: list prices per model, loaded from the shipped prices.json with the user's and the project's
 // files merged over it, so a new model or a price change never needs a rebuild.
 
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -121,6 +122,97 @@ internal sealed class PriceBook
                                             && model.StartsWith(kv.Key[prefix.Length..], StringComparison.OrdinalIgnoreCase));
         KeyValuePair<string, JsonNode?> best = candidates.OrderByDescending(kv => kv.Key.Length).FirstOrDefault();
         return best.Value is JsonObject o ? Parse(best.Key, o) : null;
+    }
+
+    /// <summary>
+    /// True for a Claude family alias: sonnet, opus, haiku or fable (case-insensitive), optionally followed by a
+    /// "[...]" suffix; no provider check.
+    /// </summary>
+    internal static bool IsAlias(string model)
+    {
+        int familyEnd = model.Length;
+        if (model.Length > 0 && model[^1] == ']')
+        {
+            int open = model.IndexOf('[', StringComparison.Ordinal);
+            if (open >= 0 && model.Length - open >= 3)
+            {
+                familyEnd = open;
+            }
+        }
+        string family = model[..familyEnd];
+        return family.Equals("sonnet", StringComparison.OrdinalIgnoreCase)
+            || family.Equals("opus", StringComparison.OrdinalIgnoreCase)
+            || family.Equals("haiku", StringComparison.OrdinalIgnoreCase)
+            || family.Equals("fable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resolves a Claude family alias to the newest matching model id in the price book
+    /// (anthropic/claude-&lt;family&gt;-&lt;rest&gt; where &lt;rest&gt; is all-int), so a profile's alias keeps pointing
+    /// at the current version without anyone editing it. Returns the input unchanged for non-aliases, for
+    /// providers priced as anyone other than anthropic, or when no key matches.
+    /// </summary>
+    public string ResolveAlias(string provider, string model)
+    {
+        if (!IsAlias(model) || Provider(provider).PriceAs is not "anthropic")
+        {
+            return model;
+        }
+
+        int bracket = model.IndexOf('[', StringComparison.Ordinal);
+        string family = (bracket >= 0 ? model[..bracket] : model).ToLowerInvariant();
+        string prefix = "anthropic/claude-" + family + "-";
+        string? best = null;
+        List<int>? bestParts = null;
+        if (_doc["models"] is JsonObject models)
+        {
+            foreach ((string? key, _) in models)
+            {
+                if (key is not { } k || !k.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                string rest = k[prefix.Length..];
+                string[] raw = rest.Split('-');
+                List<int> parts = [];
+                bool ok = true;
+                foreach (string p in raw)
+                {
+                    if (!int.TryParse(p, NumberStyles.None, CultureInfo.InvariantCulture, out int n))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    parts.Add(n);
+                }
+                if (!ok)
+                {
+                    continue;
+                }
+
+                if (bestParts is null || CompareVersions(parts, bestParts) > 0)
+                {
+                    best = "claude-" + family + "-" + rest;
+                    bestParts = parts;
+                }
+            }
+        }
+        return best ?? model;
+    }
+
+    private static int CompareVersions(List<int> a, List<int> b)
+    {
+        int n = Math.Min(a.Count, b.Count);
+        for (int i = 0; i < n; i++)
+        {
+            int c = a[i].CompareTo(b[i]);
+            if (c is not 0)
+            {
+                return c;
+            }
+        }
+        return a.Count.CompareTo(b.Count);
     }
 
     /// <summary>

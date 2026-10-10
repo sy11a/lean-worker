@@ -197,7 +197,7 @@ if [ "$smoke" = 1 ]; then
     mkdir -p "$task_dir"
     printf '# Task: smoke test\n\nDo not read or change any file. Reply with exactly one line: lean-worker smoke test OK\n' > "$task_dir/task.md"
     set +e
-    (cd "$work" && dotnet run --project "$launcher" -c Release -- --task "$task_dir/task.md" --model claude-haiku-4-5 --effort low --tools Read --max-budget-usd 0.1 --no-project-notes)
+    (cd "$work" && dotnet run --project "$launcher" -c Release -- --task "$task_dir/task.md" --model haiku --effort low --tools Read --max-budget-usd 0.1 --no-project-notes)
     smoke_exit=$?
     set -e
     if [ "$smoke_exit" = 0 ]; then ok "smoke test passed"; else warn "smoke test did not succeed (exit $smoke_exit); read the block above"; fi

@@ -20,7 +20,8 @@ public class TemplateTests
     public void Chain_template_ends_every_chain_in_claude_and_prices_every_model()
     {
         JsonNode doc = JsonNode.Parse(File.ReadAllText(Path.Combine(Templates(), "profiles-chains.json")))!;
-        JsonNode book = JsonNode.Parse(File.ReadAllText(Path.Combine(Templates(), "..", "launcher", "prices.json")))!;
+        JsonNode priceDoc = JsonNode.Parse(File.ReadAllText(Path.Combine(Templates(), "..", "launcher", "prices.json")))!;
+        PriceBook book = PriceBook.FromJson(priceDoc.AsObject());
         foreach ((string? name, JsonNode? p) in doc["profiles"]!.AsObject())
         {
             if (p!["model"] is not JsonArray arr)
@@ -29,12 +30,14 @@ public class TemplateTests
             }
 
             List<string> chain = [.. arr.Select(m => m!.GetValue<string>())];
-            Assert.True(chain.Count >= 2 && chain[^1].StartsWith("claude-", StringComparison.Ordinal), $"{name}: {string.Join(',', chain)}");
-            foreach (string? id in chain.Where(m => m.Contains('/', StringComparison.Ordinal)))
+            Assert.True(chain.Count >= 2 && (chain[^1].StartsWith("claude-", StringComparison.Ordinal) || PriceBook.IsAlias(chain[^1])), $"{name}: {string.Join(',', chain)}");
+            foreach (string id in chain)
             {
-                (string? prov, string? model) = (id[..id.IndexOf('/', StringComparison.Ordinal)], id[(id.IndexOf('/', StringComparison.Ordinal) + 1)..]);
-                string priced = book["providers"]?[prov]?["priceAs"]?.GetValue<string>() ?? prov;
-                Assert.True(book["models"]?[$"{priced}/{model}"] is not null, $"{name}: {id} has no price-book entry");
+                int slash = id.IndexOf('/', StringComparison.Ordinal);
+                (string prov, string model) = slash >= 0 ? (id[..slash], id[(slash + 1)..]) : ("anthropic", id);
+                string priced = book.ResolveAlias(prov, model);
+                string pricedProv = priceDoc["providers"]?[prov]?["priceAs"]?.GetValue<string>() ?? prov;
+                Assert.True(priceDoc["models"]?[$"{pricedProv}/{priced}"] is not null, $"{name}: {id} has no price-book entry");
             }
         }
     }
