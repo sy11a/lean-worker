@@ -13,7 +13,14 @@
 // on a FIFO without a writer records "unreadable: timeout"; a file larger than the per-file byte cap
 // records "unreadable: too large". The chain treats any "nonregular" or "unreadable" entry that appears
 // after the worker as a trust violation.
+//
+// .NET 8 cannot tell a FIFO / socket / character device from a regular file through FileAttributes
+// (UnixFileMode.TypeMask lands in .NET 9), so the portable check on this runtime is to open the file
+// (catching the open failure and classifying a directory by Directory.Exists) and then require
+// FileStream.CanSeek on the same handle. Together with the 5-second open/read bound that turns a FIFO
+// with no writer into "unreadable: timeout", the seek check is the complete guard on .NET 8.
 
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 
 namespace LeanWorker;
@@ -84,29 +91,6 @@ internal static class GateTrust
 
             string target = ResolveTarget(path, ref key);
 
-            FileAttributes attrs;
-            try
-            {
-                attrs = File.GetAttributes(target);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                hashes[key] = $"unreadable: {ex.GetType().Name}";
-                return;
-            }
-
-            if (IsForbiddenFileType(attrs))
-            {
-                hashes[key] = "nonregular";
-                return;
-            }
-
-            // .NET 8 cannot tell a FIFO or socket from a regular file through FileAttributes
-            // (UnixFileMode.TypeMask, which separates the type bits, lands in .NET 9). On Linux a
-            // FIFO reports the same Normal attributes as a regular file, so the only safe guard is
-            // a timeout on the open + read. File.GetUnixFileMode is no help here: the value it
-            // returns on net8.0 is the permission bits only, and a permission-less regular file
-            // would look just like a FIFO.
             hashes[key] = await HashFileAsync(target).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException
@@ -151,12 +135,24 @@ internal static class GateTrust
 
     private static async Task<string> HashCoreAsync(string target, CancellationToken token)
     {
-        FileStream fs = new(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        byte[] buffer = new byte[HashBufferSize];
-        long total = 0;
+        // .NET 8 cannot tell a FIFO / socket / character device from a regular file through
+        // FileAttributes (UnixFileMode.TypeMask lands in .NET 9). The portable guard on this
+        // runtime is FileStream.CanSeek on the same handle: the kernel reports pipes, sockets and
+        // character devices as non-seekable, so the seek check plus the 5-second timeout (which
+        // catches a FIFO with a writer that hangs the read) is the complete classification. A
+        // directory throws on open; that exception is classified by Directory.Exists below.
         try
         {
+            FileStream fs = new(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            await using ConfiguredAsyncDisposable fsDisposal = fs.ConfigureAwait(false);
+            if (!fs.CanSeek)
+            {
+                return "nonregular";
+            }
+
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            byte[] buffer = new byte[HashBufferSize];
+            long total = 0;
             while (true)
             {
                 int n = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false);
@@ -180,11 +176,8 @@ internal static class GateTrust
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return $"unreadable: {ex.GetType().Name}";
-        }
-        finally
-        {
-            await fs.DisposeAsync().ConfigureAwait(false);
+            // fs was disposed (using) on the way out; classify the directory here.
+            return Directory.Exists(target) ? "nonregular" : $"unreadable: {ex.GetType().Name}";
         }
     }
 
@@ -203,13 +196,6 @@ internal static class GateTrust
 
         key = resolved.FullName;
         return resolved.FullName;
-    }
-
-    private static bool IsForbiddenFileType(FileAttributes attrs)
-    {
-        return attrs.HasFlag(FileAttributes.Directory)
-            || attrs.HasFlag(FileAttributes.Device)
-            || attrs.HasFlag(FileAttributes.ReparsePoint);
     }
 
     /// <summary>
