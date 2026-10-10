@@ -1210,6 +1210,12 @@ internal static class GateTrust
     {
         try
         {
+            if (Path.IsPathRooted(target) && !Path.IsPathFullyQualified(target))
+            {
+                // Rooted without a volume ("\foo", "C:foo"; Windows only): resolving would drop the volume.
+                return $"unreadable: {nameof(ArgumentException)}";
+            }
+
             string? targetRoot = Path.GetPathRoot(target);
             if (targetRoot is { Length: > 0 } && target.StartsWith(targetRoot, PathComparison))
             {
