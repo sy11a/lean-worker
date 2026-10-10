@@ -683,7 +683,7 @@ internal sealed class LaunchRun
 
         // Hash the trusted files before the worker runs. RunGateAsync hashes them again and refuses the
         // gate if anything changed (a worker could otherwise swap the gate command or its report path).
-        _gateTrustBefore = GateTrust.Hash(await CollectGateTrustPathsAsync().ConfigureAwait(false));
+        _gateTrustBefore = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
     }
 
     private async Task<List<string>> CollectGateTrustPathsAsync()
@@ -748,7 +748,7 @@ internal sealed class LaunchRun
         // place of a file the gate reads), so the violation check covers that case first.
         if (_gateTrustBefore is not null)
         {
-            GateTrust.Snapshot after = GateTrust.Hash(await CollectGateTrustPathsAsync().ConfigureAwait(false));
+            GateTrust.Snapshot after = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
             string? badState = FindBadState(after);
             if (badState is not null)
             {

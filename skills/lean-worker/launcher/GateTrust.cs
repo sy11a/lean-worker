@@ -9,8 +9,10 @@
 // Hashing is conservative: only regular files are hashed. A symlink is resolved to its final target and
 // the target path is recorded as the key (so a retargeted link shows up as a change). Non-regular targets
 // (directories, FIFOs, sockets, character/block devices) record the sentinel "nonregular"; any
-// IOException or UnauthorizedAccessException records "unreadable: <ExceptionType>". The chain treats
-// any "nonregular" or "unreadable" entry that appears after the worker as a trust violation.
+// IOException or UnauthorizedAccessException records "unreadable: <ExceptionType>"; an open that hangs
+// on a FIFO without a writer records "unreadable: timeout"; a file larger than the per-file byte cap
+// records "unreadable: too large". The chain treats any "nonregular" or "unreadable" entry that appears
+// after the worker as a trust violation.
 
 using System.Security.Cryptography;
 
@@ -21,10 +23,11 @@ internal static class GateTrust
     /// <summary>
     /// One set of trusted files and their SHA-256 of the bytes. The sentinel "<c>-</c>" is recorded for
     /// every path that does not exist at hash time, "<c>nonregular</c>" for a path whose last target is
-    /// not a regular file, and "<c>unreadable: &lt;ExceptionType&gt;</c>" when an I/O or permission
-    /// failure prevented reading. A file the worker created between the two hashes shows up as a
-    /// difference just like a content change; a nonregular/unreadable state appearing in the after-worker
-    /// snapshot is itself a trust violation.
+    /// not a regular file, and "<c>unreadable: &lt;reason&gt;</c>" when reading was bounded by the
+    /// per-file time limit ("<c>timeout</c>"), the per-file byte cap ("<c>too large</c>"), or any I/O or
+    /// permission failure ("<c>&lt;ExceptionType&gt;</c>"). A file the worker created between the two
+    /// hashes shows up as a difference just like a content change; a nonregular/unreadable state
+    /// appearing in the after-worker snapshot is itself a trust violation.
     /// </summary>
     internal sealed record Snapshot(Dictionary<string, string> Hashes);
 
@@ -32,20 +35,43 @@ internal static class GateTrust
     /// Reads each <paramref name="paths"/> entry and hashes its bytes. Absent files get the sentinel
     /// "<c>-</c>"; a symlink's final target is the key (so retargeting the link differs); a non-regular
     /// target records "<c>nonregular</c>"; any I/O or permission error records
-    /// "<c>unreadable: &lt;ExceptionType&gt;</c>". Hashing never blocks or throws.
+    /// "<c>unreadable: &lt;ExceptionType&gt;</c>". Hashing never blocks or throws: a hang on a FIFO
+    /// without a writer is bounded by a per-file timeout (the open + read run on the thread pool and the
+    /// wait is capped at <see cref="_hashTimeout"/>), and an unbounded file is bounded by a per-file byte
+    /// cap (<see cref="MaxHashBytes"/>).
     /// </summary>
-    public static Snapshot Hash(IEnumerable<string> paths)
+    public static async Task<Snapshot> HashAsync(IEnumerable<string> paths)
     {
         Dictionary<string, string> hashes = new(StringComparer.Ordinal);
         foreach (string path in paths)
         {
-            HashOne(hashes, path);
+            await HashOneAsync(hashes, path).ConfigureAwait(false);
         }
 
         return new Snapshot(hashes);
     }
 
-    private static void HashOne(Dictionary<string, string> hashes, string path)
+    /// <summary>
+    /// Time budget for opening a file and hashing its bytes. A FIFO without a writer parks the open
+    /// call in the kernel until a writer appears, and a character device like <c>/dev/zero</c> never
+    /// returns EOF. The trust check must fail closed rather than hang the chain, so the open + read
+    /// run on the thread pool and the wait is capped at this value.
+    /// </summary>
+    private static readonly TimeSpan _hashTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Byte cap for a single file hash. Inputs larger than this record "<c>unreadable: too large</c>"
+    /// rather than streaming the whole file into memory.
+    /// </summary>
+    private const long MaxHashBytes = 16L * 1024L * 1024L;
+
+    /// <summary>
+    /// Buffer used by every file hash. 80 KiB matches the typical kernel pipe / file-copy granularity
+    /// and keeps the per-read overhead negligible.
+    /// </summary>
+    private const int HashBufferSize = 80 * 1024;
+
+    private static async Task HashOneAsync(Dictionary<string, string> hashes, string path)
     {
         string key = path;
         try
@@ -75,21 +101,13 @@ internal static class GateTrust
                 return;
             }
 
-            if (!IsRegularFile(target, attrs))
-            {
-                hashes[key] = "nonregular";
-                return;
-            }
-
-            try
-            {
-                using FileStream fs = new(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                hashes[key] = Convert.ToHexString(SHA256.HashData(fs)).ToLowerInvariant();
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                hashes[key] = $"unreadable: {ex.GetType().Name}";
-            }
+            // .NET 8 cannot tell a FIFO or socket from a regular file through FileAttributes
+            // (UnixFileMode.TypeMask, which separates the type bits, lands in .NET 9). On Linux a
+            // FIFO reports the same Normal attributes as a regular file, so the only safe guard is
+            // a timeout on the open + read. File.GetUnixFileMode is no help here: the value it
+            // returns on net8.0 is the permission bits only, and a permission-less regular file
+            // would look just like a FIFO.
+            hashes[key] = await HashFileAsync(target).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException
             or UnauthorizedAccessException
@@ -102,6 +120,71 @@ internal static class GateTrust
             // Fail closed: any I/O / platform / argument failure still records a sentinel rather than
             // crashing the gate chain. Non-I/O exceptions (e.g. NullReferenceException) propagate.
             hashes[key] = $"unreadable: {ex.GetType().Name}";
+        }
+    }
+
+    private static async Task<string> HashFileAsync(string target)
+    {
+        // The CTS defines the cancellation token handed to ReadAsync and to Task.Run; the WhenAny
+        // below caps the same value as a belt-and-suspenders bound. Either signal produces the same
+        // "unreadable: timeout" sentinel.
+        using CancellationTokenSource cts = new(_hashTimeout, TimeProvider.System);
+        CancellationToken token = cts.Token;
+
+        Task<string> hashTask = Task.Run(async () => await HashCoreAsync(target, token).ConfigureAwait(false), token);
+
+        try
+        {
+            Task winner = await Task.WhenAny(hashTask, Task.Delay(_hashTimeout, TimeProvider.System, token)).ConfigureAwait(false);
+            if (winner == hashTask)
+            {
+                return await hashTask.ConfigureAwait(false);
+            }
+
+            return "unreadable: timeout";
+        }
+        catch (OperationCanceledException)
+        {
+            return "unreadable: timeout";
+        }
+    }
+
+    private static async Task<string> HashCoreAsync(string target, CancellationToken token)
+    {
+        FileStream fs = new(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] buffer = new byte[HashBufferSize];
+        long total = 0;
+        try
+        {
+            while (true)
+            {
+                int n = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false);
+                if (n is 0)
+                {
+                    return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+                }
+
+                if (total + n > MaxHashBytes)
+                {
+                    return "unreadable: too large";
+                }
+
+                hash.AppendData(buffer, 0, n);
+                total += n;
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return "unreadable: timeout";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return $"unreadable: {ex.GetType().Name}";
+        }
+        finally
+        {
+            await fs.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -127,35 +210,6 @@ internal static class GateTrust
         return attrs.HasFlag(FileAttributes.Directory)
             || attrs.HasFlag(FileAttributes.Device)
             || attrs.HasFlag(FileAttributes.ReparsePoint);
-    }
-
-    private static bool IsRegularFile(string target, FileAttributes attrs)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return attrs.HasFlag(FileAttributes.Normal)
-                || attrs.HasFlag(FileAttributes.Archive)
-                || attrs.HasFlag(FileAttributes.ReadOnly)
-                || attrs.HasFlag(FileAttributes.Hidden);
-        }
-
-        // On Unix-like systems, FileAttributes alone does not distinguish a regular file from a FIFO or
-        // socket (both surface as FileAttributes.Normal). File.GetUnixFileMode throws
-        // PlatformNotSupportedException on Windows; on Unix-like it gives the stat mode, and an
-        // inaccessible target throws IOException / UnauthorizedAccessException. We treat any such
-        // failure as non-regular so the path records the sentinel rather than crashing.
-        try
-        {
-            return File.GetUnixFileMode(target) is not UnixFileMode.None;
-        }
-        catch (Exception ex) when (ex is IOException
-            or UnauthorizedAccessException
-            or ArgumentException
-            or NotSupportedException
-            or PlatformNotSupportedException)
-        {
-            return false;
-        }
     }
 
     /// <summary>
