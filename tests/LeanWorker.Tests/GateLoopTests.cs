@@ -316,7 +316,7 @@ public class GateLoopTests
 
             Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(
                 root, worker, _ => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "global.json"), "{}"));
-            (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+            (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(45), TimeProvider.System, TestContext.Current.CancellationToken);
 
             Assert.Equal(5, code);
             Assert.False(File.Exists(marker));

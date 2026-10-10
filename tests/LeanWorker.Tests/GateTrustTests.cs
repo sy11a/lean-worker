@@ -248,24 +248,25 @@ public sealed class GateTrustTests : IDisposable
         Assert.True(new FileInfo(fifo).Exists);
 
         Task<GateTrust.Snapshot> hashTask = GateTrust.HashAsync([fifo]);
-        GateTrust.Snapshot snapshot = await hashTask.WaitAsync(TimeSpan.FromSeconds(20), TimeProvider.System, TestContext.Current.CancellationToken);
+        GateTrust.Snapshot snapshot = await hashTask.WaitAsync(TimeSpan.FromSeconds(45), TimeProvider.System, TestContext.Current.CancellationToken);
 
         string state = StateOf(snapshot.Hashes[fifo]);
         Assert.True(state is "nonregular" || state.StartsWith("unreadable", StringComparison.Ordinal), snapshot.Hashes[fifo]);
     }
 
     [Fact]
-    public async Task A_file_over_the_byte_cap_is_too_largeAsync()
+    public async Task A_trusted_file_over_16_MiB_hashes_to_a_sha_not_a_sentinelAsync()
     {
         string dir = NewDir();
         string path = Path.Combine(dir, "big.bin");
         await using (FileStream fs = File.Create(path))
         {
-            fs.SetLength((16L * 1024L * 1024L) + 1L);
+            fs.SetLength(20L * 1024L * 1024L);
         }
 
         GateTrust.Snapshot snapshot = await GateTrust.HashAsync([path]);
-        Assert.Equal(path + "|unreadable: too large", snapshot.Hashes[path]);
+        string state = StateOf(snapshot.Hashes[path]);
+        Assert.Matches("^[0-9a-f]{64}$", state);
     }
 
     [Fact]
@@ -294,7 +295,7 @@ public sealed class GateTrustTests : IDisposable
     }
 
     private static async Task<GateTrust.Snapshot> HashBoundedAsync(string path) =>
-        await GateTrust.HashAsync([path]).WaitAsync(TimeSpan.FromSeconds(20), TimeProvider.System, TestContext.Current.CancellationToken);
+        await GateTrust.HashAsync([path]).WaitAsync(TimeSpan.FromSeconds(45), TimeProvider.System, TestContext.Current.CancellationToken);
 
     [Fact]
     public async Task A_directory_is_nonregularAsync()

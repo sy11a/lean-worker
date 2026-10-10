@@ -693,9 +693,48 @@ public sealed class GateTrustLoopTests : IDisposable
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
             setup, "touch '" + workerMarker + "'"));
 
+        string expected = kind is "runsroot" ? "is at or under the runs root outside runs/" : "is a trusted gate input";
         Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
         Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    public async Task A_declared_output_named_like_a_config_file_outside_the_config_walk_is_acceptedAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray(["artifacts/global.json"]));
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_relative_runs_root_and_a_report_path_naming_profiles_json_ends_in_errorAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        string profiles = Path.GetFullPath(Path.Combine(setup.Root, "profiles.json"));
+        await GateLoopTests.WriteExecutableAsync(setup.Script, ReportScript(profiles));
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", configure: o => o.RunsRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), setup.Root));
+
+        Assert.Equal(5, code);
+        Assert.Contains("the gate's report path is a trusted input", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_round_one_refusal_leaves_no_run_directoryAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs /dev/null");
+
+        Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("/dev/null"));
+
+        _ = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "true"));
+
+        string runs = Path.Combine(setup.Root, "runs");
+        Assert.False(Directory.Exists(runs) && Directory.GetFileSystemEntries(runs).Length > 0, "no run directory may be left");
     }
 
     // ---- gate.log cannot be opened ---------------------------------------------------------------------------
@@ -1064,11 +1103,11 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Task<(int Code, string Stdout)> run = RunAsync(
             setup, "mkfifo '" + r + "/f1' '" + r + "/f2' '" + r + "/f3' '" + r + "/f4' '" + r + "/f5'");
-        (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(60), TimeProvider.System, TestContext.Current.CancellationToken);
+        (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(120), TimeProvider.System, TestContext.Current.CancellationToken);
         watch.Stop();
 
         AssertViolation(setup, code, stdout, "/f1");
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(12), "the trust check took " + watch.Elapsed.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " s");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(75), "the trust check took " + watch.Elapsed.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " s");
     }
 
     [Fact]

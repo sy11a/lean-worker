@@ -279,6 +279,26 @@ public class GateSpecTests
         Assert.Contains("gate.outputs[1]", ex.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("/abs/out.sarif")]
+    [InlineData("/abs/../out.sarif")]
+    public void An_absolute_gate_outputs_entry_is_kept_as_given(string entry)
+    {
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = new JsonArray([entry]);
+        GateSpec spec = GateSpec.FromProfile(Profile(gate))!;
+        Assert.Equal([entry], spec.Outputs, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public void A_relative_gate_outputs_entry_with_an_inner_dotdot_is_refused()
+    {
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = new JsonArray(["a/../b"]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void A_non_string_gate_outputs_entry_throws_naming_its_index()
     {
