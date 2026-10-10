@@ -162,6 +162,78 @@ public sealed class GateTrustLoopTests : IDisposable
         AssertViolation(setup, code, stdout, exe);
     }
 
+    // A gate on PATH whose real executable is only in dirB; the worker plants a clean-printing file of the
+    // same name in dirA, which comes first on PATH. The gate that runs must be dirB's, found in round 1.
+    [Fact]
+    public async Task A_worker_that_plants_an_executable_in_an_earlier_PATH_directory_does_not_replace_the_gateAsync()
+    {
+        const string name = "lw-gate-t53m-tool";
+        string dirA = _dirs.Create("lw-gate-patha");
+        string dirB = _dirs.Create("lw-gate-pathb");
+        string exeA = Path.Combine(dirA, name);
+        string exeB = Path.Combine(dirB, name);
+        Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray([name]));
+        string plantedMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "planted-ran");
+        await GateLoopTests.WriteExecutableAsync(
+            exeB,
+            "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nR=\"$(dirname \"$0\")/rep.json\"\n" +
+            "printf '{\"runs\":[{\"results\":[1,2]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 1\n");
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '#!/bin/sh\\ntouch \"" + plantedMarker + "\"\\necho 0 findings\\nexit 0\\n' > '" + exeA + "'\nchmod +x '" + exeA + "'",
+            () => Environment.SetEnvironmentVariable(
+                "PATH", dirA + Path.PathSeparator + dirB + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")));
+
+        Assert.True(File.Exists(setup.Marker), "dirB's gate should have run");
+        Assert.False(File.Exists(plantedMarker), "the planted gate must not run");
+        Assert.NotEqual(0, code);
+        Assert.DoesNotContain("gate:     clean", stdout, StringComparison.Ordinal);
+
+        string runDir = RunAsyncGolden.RunDirFrom(stdout);
+        string log = await File.ReadAllTextAsync(Path.Combine(runDir, "gate.log"), TestContext.Current.CancellationToken);
+        Assert.Contains("argv0=" + exeB, log, StringComparison.Ordinal);
+        Assert.DoesNotContain(exeA, log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_gate_argv0_that_cannot_be_resolved_is_a_launch_error_before_the_workerAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["lw-gate-t53m-does-not-exist"]));
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+
+        Assert.Contains("lw-gate-t53m-does-not-exist", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_relative_gate_argv0_with_a_directory_runs_the_working_directorys_script_by_absolute_pathAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "a shell script needs a Unix shell");
+
+        Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["./tools/gate.sh"]));
+        string expected = string.Empty;
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () =>
+            {
+                string cwd = Directory.GetCurrentDirectory();
+                string script = Path.Combine(cwd, "tools", "gate.sh");
+                _ = Directory.CreateDirectory(Path.GetDirectoryName(script)!);
+                File.WriteAllText(script, "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nexit 0\n");
+                File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                expected = script;
+            });
+
+        AssertClean(setup, code, stdout);
+        string log = await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.log"), TestContext.Current.CancellationToken);
+        Assert.Contains("argv0=" + expected, log, StringComparison.Ordinal);
+    }
+
     // ---- gate.trust ----------------------------------------------------------------------------------------
 
     [Fact]
@@ -710,6 +782,41 @@ public sealed class GateTrustLoopTests : IDisposable
         AssertClean(setup, code, stdout);
     }
 
+    [Theory]
+    [InlineData("inbox")]
+    [InlineData("system")]
+    public async Task A_declared_output_under_the_runs_root_inbox_or_system_is_acceptedAsync(string folder)
+    {
+        Setup setup = await NewSetupAsync();
+        string output = Path.Combine(setup.Root, folder, "x.sarif");
+        JsonObject profile = GateLoopTests.GateProfile(setup.Script);
+        profile["gate"]!["outputs"] = new JsonArray([output]);
+        RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task An_absolute_declared_output_with_dot_dot_is_normalised_and_matches_the_argv_entryAsync()
+    {
+        string dir = _dirs.Create("lw-gate-dotdot");
+        string actual = Path.Combine(dir, "out.sarif");
+        await File.WriteAllTextAsync(actual, "old", TestContext.Current.CancellationToken);
+        Setup setup = await NewSetupAsync(
+            gate =>
+            {
+                gate["outputs"] = new JsonArray([dir + "/sub/../out.sarif"]);
+                gate["command"]!.AsArray().Add(actual);
+            },
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
     [Fact]
     public async Task A_relative_runs_root_and_a_report_path_naming_profiles_json_ends_in_errorAsync()
     {
@@ -1107,7 +1214,7 @@ public sealed class GateTrustLoopTests : IDisposable
         watch.Stop();
 
         AssertViolation(setup, code, stdout, "/f1");
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(75), "the trust check took " + watch.Elapsed.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " s");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(25), "the trust check took " + watch.Elapsed.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " s");
     }
 
     [Fact]
