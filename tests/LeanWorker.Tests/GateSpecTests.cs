@@ -264,7 +264,6 @@ public class GateSpecTests
 
     [Theory]
     [InlineData("")]
-    [InlineData("/etc/passwd")]
     [InlineData("..")]
     [InlineData("../outside.sarif")]
     [InlineData("out/../../outside.sarif")]

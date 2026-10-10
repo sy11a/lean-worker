@@ -614,9 +614,105 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () => Assert.False(
+                Path.GetFullPath(setup.Script).StartsWith(Directory.GetCurrentDirectory() + Path.DirectorySeparatorChar, StringComparison.Ordinal),
+                "the gate script must live outside the working directory"));
 
         AssertClean(setup, code, stdout);
+    }
+
+    // ---- an absolute declared output outside the repository ----------------------------------------------------
+
+    [Fact]
+    public async Task A_pre_existing_absolute_declared_output_outside_the_repository_survives_into_round_twoAsync()
+    {
+        string report = Path.Combine(_dirs.Create("lw-gate-abs-out"), "r.sarif");
+        await File.WriteAllTextAsync(report, "old", TestContext.Current.CancellationToken);
+        Setup setup = await NewSetupAsync(
+            gate =>
+            {
+                gate["outputs"] = new JsonArray([report]);
+                gate["command"]!.AsArray().Add(report);
+            },
+            RewritingGateScript);
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        Assert.True(code is 0, stdout);
+        Assert.Contains("gate:     clean after 2 round(s), findings 3→0", stdout, StringComparison.Ordinal);
+        Assert.Equal(2, GateLoopTests.RunDirNames(setup.Root).Length);
+    }
+
+    [Fact]
+    public async Task An_absolute_declared_output_that_is_a_trusted_input_is_a_launch_errorAsync()
+    {
+        string prices = Path.Combine(_dirs.Create("lw-gate-abs-prices"), "my-prices.json");
+        await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
+        Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray([prices]));
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
+            setup, "touch '" + workerMarker + "'", configure: o => o.PricesFile = prices));
+
+        Assert.Contains("gate.outputs[0] '" + prices + "' is a trusted gate input", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+    }
+
+    // ---- bad trusted values that already exist at round 1 ----------------------------------------------------
+
+    [Fact]
+    public async Task A_non_regular_argv_file_is_a_launch_error_before_the_worker_runsAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs /dev/null");
+
+        Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("/dev/null"));
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+
+        Assert.Contains("/dev/null", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    // ---- declared outputs that would trip a later round --------------------------------------------------------
+
+    [Theory]
+    [InlineData("runsroot")]
+    [InlineData("global.json")]
+    public async Task A_declared_output_the_trust_check_would_collect_is_a_launch_error_even_when_absentAsync(string kind)
+    {
+        Setup setup = await NewSetupAsync();
+        string output = kind is "runsroot" ? Path.Combine(setup.Root, "reports", "x.sarif") : "global.json";
+        JsonObject profile = GateLoopTests.GateProfile(setup.Script);
+        profile["gate"]!["outputs"] = new JsonArray([output]);
+        RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
+            setup, "touch '" + workerMarker + "'"));
+
+        Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    // ---- gate.log cannot be opened ---------------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_gate_log_that_cannot_be_opened_ends_in_error_without_running_the_gateAsync()
+    {
+        Setup setup = await NewSetupAsync();
+
+        (int code, string stdout) = await RunAsync(
+            setup, "for d in '" + setup.Root + "'/runs/*/; do mkdir \"${d%/}/gate.log\"; done");
+
+        Assert.Equal(5, code);
+        Assert.Contains("gate:     ERROR: the gate could not be run", stdout, StringComparison.Ordinal);
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+        string error = RunAsyncGolden.Summary(RunAsyncGolden.RunDirFrom(stdout))["gate"]!["error"]!.GetValue<string>();
+        Assert.StartsWith("the gate could not be run", error, StringComparison.Ordinal);
     }
 
     // ---- a report path is normalised before the run-directory and trusted-source checks ------------------------
@@ -827,14 +923,15 @@ public sealed class GateTrustLoopTests : IDisposable
     [Theory]
     [InlineData("directory")]
     [InlineData("dangling")]
-    public async Task A_pre_existing_non_regular_trusted_path_ends_in_error_naming_the_pathAsync(string kind)
+    public async Task A_pre_existing_non_regular_trusted_path_is_a_launch_error_before_the_worker_naming_the_pathAsync(string kind)
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
 
         Setup setup = await NewSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
         string expected = string.Empty;
 
-        (int code, string stdout) = await RunAsync(setup, "true", () =>
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'", () =>
         {
             expected = Path.Combine(Directory.GetCurrentDirectory(), "global.json");
             if (kind is "directory")
@@ -845,12 +942,12 @@ public sealed class GateTrustLoopTests : IDisposable
             {
                 _ = File.CreateSymbolicLink(expected, Path.Combine(Directory.GetCurrentDirectory(), "lw-missing-target"));
             }
-        });
+        }));
 
-        Assert.Equal(5, code);
+        Assert.Contains("trusted path '" + expected + "' (", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("is not a regular file", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
         Assert.False(File.Exists(setup.Marker), "the gate must not run against a non-regular trusted path");
-        Assert.Contains("trusted path '" + expected + "' is not a regular file", stdout, StringComparison.Ordinal);
-        Assert.DoesNotContain("the worker changed files", stdout, StringComparison.Ordinal);
     }
 
     // ---- tampering between rounds ----------------------------------------------------------------------------
