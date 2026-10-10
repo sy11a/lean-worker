@@ -18,8 +18,7 @@
 // exist records "unreadable: dangling link" under the link path; a read that returned fewer bytes
 // than the length reported at open time records "<target>|unreadable: length mismatch"; any
 // IOException or UnauthorizedAccessException records "<target>|unreadable: <ExceptionType>"; an open
-// that hangs on a FIFO without a writer records "<target>|unreadable: timeout"; a file larger than
-// the per-file byte cap records "<target>|unreadable: too large". The chain treats any
+// that hangs on a FIFO without a writer records "<target>|unreadable: timeout". The chain treats any
 // "nonregular" or "unreadable" entry that appears after the worker as a trust violation.
 //
 // .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in .NET 9), so the guard on this
@@ -32,10 +31,10 @@
 //   - FileStream.CanSeek on the opened handle (FIFOs, sockets, character devices are non-seekable)
 //   - the bytes-read vs. fs.Length check at the end of HashCoreAsync (a mismatch reports
 //     "unreadable: length mismatch" and refuses to hash)
-//   - the 5-second open/read bound (catches a FIFO blocking in open with no writer)
-//   - the 16 MiB byte cap (bounds a read off a misclassified device)
+//   - the 30-second open/read bound (catches a FIFO blocking in open with no writer, and bounds a
+//     large regular file's hash)
 // Block devices may still look regular and seekable on this runtime; a normal user cannot open them
-// (the open fails → unreadable → trust violation), and the size cap bounds a read. No P/Invoke.
+// (the open fails → unreadable → trust violation). No P/Invoke.
 
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -52,10 +51,10 @@ internal static class GateTrust
     /// Values have the shape final-target bar hash-or-sentinel: the SHA-256 (lower hex) for a
     /// regular file's bytes; <c>nonregular</c> when the final target is a directory, device, reparse
     /// point, or path under <c>/dev/</c>, <c>/proc/</c>, <c>/sys/</c>; <c>unreadable: reason</c>
-    /// when reading was bounded by the per-file time limit (<c>timeout</c>), the per-file byte cap
-    /// (<c>too large</c>), a length mismatch reported at open time (<c>length mismatch</c>), the
-    /// link pointed at a missing target (<c>dangling link</c>, recorded under the link path), or
-    /// any I/O or permission failure (the exception type). The sentinel <c>-</c> (no value after
+    /// when reading was bounded by the per-file time limit (<c>timeout</c>), a length mismatch
+    /// reported at open time (<c>length mismatch</c>), the link pointed at a missing target
+    /// (<c>dangling link</c>, recorded under the link path), or any I/O or permission failure
+    /// (the exception type). The sentinel <c>-</c> (no value after
     /// the bar) marks a path that does not exist at hash time and is not a symlink. A file the
     /// worker created between the two hashes shows up as a new key just like a content change; a
     /// nonregular/unreadable state appearing in the after-worker snapshot is itself a trust
@@ -115,8 +114,7 @@ internal static class GateTrust
     /// the bar so a retargeted link shows up as a value change. A symlink whose target is unreachable
     /// records <c>"unreadable: dangling link"</c> under the link path. Hashing never blocks or throws:
     /// a hang on a FIFO without a writer is bounded by a per-file timeout (the open + read run on the
-    /// thread pool and the wait is capped at <see cref="_hashTimeout"/>), and an unbounded file is
-    /// bounded by a per-file byte cap (<see cref="MaxHashBytes"/>).
+    /// thread pool and the wait is capped at <see cref="_hashTimeout"/>).
     /// </summary>
     public static async Task<Snapshot> HashAsync(IEnumerable<string> paths)
     {
@@ -132,16 +130,12 @@ internal static class GateTrust
     /// <summary>
     /// Time budget for opening a file and hashing its bytes. A FIFO without a writer parks the open
     /// call in the kernel until a writer appears, and a character device like <c>/dev/zero</c> never
-    /// returns EOF. The trust check must fail closed rather than hang the chain, so the open + read
-    /// run on the thread pool and the wait is capped at this value.
+    /// returns EOF; a large regular file (a single-binary gate executable can run to hundreds of MB)
+    /// simply needs the time to stream through the hash. The trust check must fail closed rather
+    /// than hang the chain, so the open + read run on the thread pool and the wait is capped at this
+    /// value — generous enough for a real executable of that size, still short enough to fail closed.
     /// </summary>
-    private static readonly TimeSpan _hashTimeout = TimeSpan.FromSeconds(5);
-
-    /// <summary>
-    /// Byte cap for a single file hash. Inputs larger than this record "<c>unreadable: too large</c>"
-    /// rather than streaming the whole file into memory.
-    /// </summary>
-    private const long MaxHashBytes = 16L * 1024L * 1024L;
+    private static readonly TimeSpan _hashTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Buffer used by every file hash. 80 KiB matches the typical kernel pipe / file-copy granularity
@@ -307,7 +301,7 @@ internal static class GateTrust
         // .NET 8 cannot tell a FIFO / socket / character device from a regular file through
         // FileAttributes (UnixFileMode.TypeMask lands in .NET 9). The portable guard on this
         // runtime is FileStream.CanSeek on the same handle: the kernel reports pipes, sockets and
-        // character devices as non-seekable, so the seek check plus the 5-second timeout (which
+        // character devices as non-seekable, so the seek check plus the 30-second timeout (which
         // catches a FIFO with a writer that hangs the read) is the complete classification. A
         // directory throws on open; that exception is classified by Directory.Exists below.
         try
@@ -340,11 +334,6 @@ internal static class GateTrust
                     }
 
                     return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-                }
-
-                if (total + n > MaxHashBytes)
-                {
-                    return "unreadable: too large";
                 }
 
                 hash.AppendData(buffer, 0, n);
@@ -669,24 +658,29 @@ internal static class GateTrust
 
     private static void AddRunsRootFiles(string runsRoot, Action<string> add)
     {
-        if (!Directory.Exists(runsRoot))
+        // Walk keys are absolute, like every other trust key (trust entries, argv entries and
+        // declared outputs all resolve to full paths): the report-path rule and the collision check
+        // compare absolute paths, so a relative --runs-root must not record keys such as
+        // ".lean-worker/profiles.json" that no absolute comparison can ever match.
+        string root = Path.GetFullPath(runsRoot);
+        if (!Directory.Exists(root))
         {
             return;
         }
 
-        string ledger = Path.Combine(runsRoot, "runs.jsonl");
+        string ledger = Path.Combine(root, "runs.jsonl");
 
         // The launcher's own bookkeeping lives under runs/, inbox/ and system/ and is never a gate
         // input, and runs.jsonl is the ledger (one record per run, append-only): do not descend
         // into those subtrees, so a planted or unreadable directory under them cannot stall the walk.
         HashSet<string> skip = new(StringComparer.Ordinal)
         {
-            Path.Combine(runsRoot, "runs"),
-            Path.Combine(runsRoot, "inbox"),
-            Path.Combine(runsRoot, "system"),
+            Path.Combine(root, "runs"),
+            Path.Combine(root, "inbox"),
+            Path.Combine(root, "system"),
         };
 
-        foreach (string file in WalkFiles(runsRoot, dir => skip.Contains(dir)))
+        foreach (string file in WalkFiles(root, dir => skip.Contains(dir)))
         {
             if (!string.Equals(file, ledger, StringComparison.Ordinal))
             {

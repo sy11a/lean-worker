@@ -157,6 +157,7 @@ internal sealed class LaunchRun
         ApplyModelTraits();
         await ResolveRepoTokenAsync().ConfigureAwait(false);
         ResolveMode();
+        await SnapshotTrustAsync().ConfigureAwait(false);
         await PrepareTaskAsync().ConfigureAwait(false);
         await WriteSystemAsync().ConfigureAwait(false);
         await ExecuteAsync().ConfigureAwait(false);
@@ -657,8 +658,6 @@ internal sealed class LaunchRun
         bool capKilled;
         try
         {
-            await SnapshotGateTrustAsync().ConfigureAwait(false);
-
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes, line => runtime.Record(line), line =>
@@ -698,7 +697,7 @@ internal sealed class LaunchRun
         return u is not null && meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
     }
 
-    private async Task SnapshotGateTrustAsync()
+    private async Task SnapshotTrustAsync()
     {
         if (_gate is null)
         {
@@ -729,11 +728,16 @@ internal sealed class LaunchRun
             return;
         }
 
-        // Round 1: hash the trusted files before the worker runs. The fixed part of the list
-        // (gate.trust globs, argv entries, the resolved executable) is resolved once and reused for
-        // every later hash in the whole chain. RunGateAsync hashes again before and after the gate
-        // and refuses the gate if anything changed (a worker could otherwise swap the gate command
-        // or its report path).
+        // Round 1: hash the trusted files before the worker runs — and before the run directory is
+        // created, so an exit-2 refusal below (a declared output that is a trusted input, a bad
+        // trusted value) leaves no half-made run directory behind. Nothing the launcher writes
+        // until the worker starts is in the trust set anyway: task.md, system.md and command.txt
+        // live in the run directory, the content-addressed system notes under system/, and the
+        // runs-root walk skips runs/ and system/. The fixed part of the list (gate.trust globs,
+        // argv entries, the resolved executable) is resolved once and reused for every later hash
+        // in the whole chain. RunGateAsync hashes again before and after the gate and refuses the
+        // gate if anything changed (a worker could otherwise swap the gate command or its report
+        // path).
         TrustPaths = await CollectFixedPathsAsync().ConfigureAwait(false);
         (List<string> snapshotPaths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> snapshotSources) =
             await CollectCheckPathsAsync(_noExclusions).ConfigureAwait(false);
@@ -877,7 +881,7 @@ internal sealed class LaunchRun
     /// <summary>
     /// Refuses a round-1 snapshot value in a bad state (<see cref="GateTrust.IsBadValue"/>: nonregular
     /// or unreadable) — a directory, a device such as <c>/dev/null</c> named in the argv, a dangling
-    /// link, a file over the per-file hash cap, one the open could not read in time. The chain would
+    /// link, one the open could not read in time. The chain would
     /// refuse it at the pre-gate check anyway ("is not a regular file", exit 5) — after a full worker
     /// run, on every launch. It is a configuration mistake, not tampering, so it fails here as a
     /// launch error (exit 2) naming the path and the trust sources it came from, before the worker
@@ -917,16 +921,18 @@ internal sealed class LaunchRun
     /// Refuses a declared output that is also a trusted gate input from any source other than an
     /// argv entry: the resolved executable, a gate.trust literal or glob match, the prices file, a
     /// config-walk file (<c>global.json</c>, <c>nuget.config</c>, <c>dotnet-tools.json</c>,
-    /// <c>.config/dotnet-tools.json</c>) or a runs-root file. Two more refusals apply whether or not
-    /// the file exists yet — the moment the gate creates such a file, a later round's volatile walks
-    /// (runs-root walk, config walk) pick it up and the pre-gate check fails on the launcher's own
-    /// tree: an output at or under the runs root outside <c>runs/</c>, and an output whose file name
-    /// is one the config walk collects. An argv entry is allowed as a trusted input: the operator
-    /// may pin the very file the gate writes to (e.g. <c>sh gate.sh artifacts/check.sarif</c> with
-    /// the path in the argv and in <c>gate.outputs</c>) — it is compared before the gate, and only
-    /// the after-gate comparison excludes it. Runs at the round-1 fixed-list collection, before the
-    /// worker: a collision is a profile mistake, so it fails as a launch error (exit 2), not as a
-    /// trust violation.
+    /// <c>.config/dotnet-tools.json</c>) or a runs-root file. The config walk adds its candidate
+    /// paths whether or not they exist, so a declared output with a config-walk file name is
+    /// already refused by that check — no file-name rule is needed on top. The one refusal that
+    /// applies whether or not the file is in the trusted set yet is the runs-root one: the moment
+    /// the gate creates an output at or under the runs root outside <c>runs/</c>, a later round's
+    /// runs-root walk picks it up and the pre-gate check fails on the launcher's own tree. An argv
+    /// entry is allowed as a trusted input: the operator may pin the very file the gate writes to
+    /// (e.g. <c>sh gate.sh artifacts/check.sarif</c> with the path in the argv and in
+    /// <c>gate.outputs</c>) — it is compared before the gate, and only the after-gate comparison
+    /// excludes it. Runs with the round-1 snapshot, before the run directory is created: a
+    /// collision is a profile mistake, so it fails as a launch error (exit 2), not as a trust
+    /// violation.
     /// </summary>
     private async Task ValidateDeclaredOutputsAsync(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
     {
@@ -952,20 +958,8 @@ internal sealed class LaunchRun
             {
                 throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is at or under the runs root outside runs/");
             }
-
-            if (IsConfigWalkFileName(Path.GetFileName(full)))
-            {
-                throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' has a file name the config walk collects");
-            }
         }
     }
-
-    // The file names the config walk collects at every level (GateTrust.AddConfigFiles): a declared
-    // output with one of these names lands in the trusted set the moment it exists, so the chain ends
-    // in a trust violation no matter what the profile meant. global.json and the three handled
-    // NuGet-config casings, dotnet-tools.json (which covers .config/dotnet-tools.json by name).
-    private static bool IsConfigWalkFileName(string fileName) =>
-        fileName is "global.json" or "nuget.config" or "NuGet.Config" or "NuGet.config" or "dotnet-tools.json";
 
     private string Status()
     {
