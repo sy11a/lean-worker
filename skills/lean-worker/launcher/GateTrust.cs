@@ -1083,14 +1083,19 @@ internal static class GateTrust
 
     /// <summary>
     /// The canonical form of <paramref name="path"/> with realpath(3) semantics, in pure managed
-    /// code: the path is made absolute, then walked component by component from the root; each
-    /// existing component that is a symlink (its <see cref="FileSystemInfo.LinkTarget"/>) replaces
-    /// the walked prefix with its link target — made absolute against the prefix, itself walked —
-    /// and the walk continues; <c>.</c> and <c>..</c> collapse against the already-resolved prefix,
-    /// which is what makes <c>link/..</c> resolve to the link target's parent, not the link's. A
-    /// non-existent tail is appended as-is, lexically normalised. Expansion stops at
-    /// <see cref="MaxLinkExpansions"/> with <c>unreadable: too many links</c>. No P/Invoke: one
-    /// <see cref="FileSystemInfo.LinkTarget"/> read per component.
+    /// code: the path is made absolute without a lexical "." / ".." collapse, then walked over a
+    /// stack of resolved components and a queue of pending raw components. A component that is a
+    /// symlink (its <see cref="FileSystemInfo.LinkTarget"/>) queues its raw target — split into
+    /// components without normalising — in front of the pending walk: a relative target resolves
+    /// against the stack already walked, an absolute target clears the stack and restarts at the
+    /// target's own root (a different drive or UNC share resets the walk to that root), and a
+    /// target rooted on a drive whose current directory the walk cannot know ("C:foo") leaves the
+    /// resolution <c>unreadable</c>. "." is dropped and ".." pops the resolved stack (never above
+    /// the root) when they are processed — after any link expansions queued ahead of them — so
+    /// <c>link/..</c> climbs out of the link target, not the link. A non-existent tail is appended
+    /// as-is, lexically normalised. Expansion stops at <see cref="MaxLinkExpansions"/> with
+    /// <c>unreadable: too many links</c>. No P/Invoke: one <see cref="FileSystemInfo.LinkTarget"/>
+    /// read per component.
     /// </summary>
     internal static CanonicalPath Canonical(string path)
     {
@@ -1110,7 +1115,10 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// The component walk over an already absolute path (<see cref="Canonical"/>'s body).
+    /// The component walk over an already absolute path (<see cref="Canonical"/>'s body): a stack
+    /// of resolved, link-free components and a queue of pending raw components. A link expansion
+    /// queues its target's raw components in front of the tail that followed the link, so they are
+    /// processed — and any ".." in them resolved against real directories — before the tail.
     /// </summary>
     private static CanonicalPath Canonicalize(string absolute)
     {
@@ -1120,8 +1128,7 @@ internal static class GateTrust
         List<string> links = [];
         while (pending.Count > 0)
         {
-            // The stack's top is the front of the path still to walk; a link expansion pushes its
-            // target's components so they are walked before the tail that followed the link.
+            // The queue's head is the next component to walk.
             string name = Pop(pending);
             if (name is ".")
             {
@@ -1130,8 +1137,10 @@ internal static class GateTrust
 
             if (name is "..")
             {
-                // Everything below holds resolved, link-free names, so popping is the physical
-                // parent; the filesystem root clamps, like realpath.
+                // Everything on the stack holds resolved, link-free names, so popping is the
+                // physical parent; the filesystem root clamps, like realpath. A ".." that follows
+                // a link is processed after the target's components (they were queued in front of
+                // it), so it climbs out of the link target, not the link.
                 if (resolved.Count > 0)
                 {
                     resolved.RemoveAt(resolved.Count - 1);
@@ -1156,7 +1165,7 @@ internal static class GateTrust
             }
 
             links.Add(candidate);
-            if (PushLinkTarget(pending, Compose(root, resolved), target, root) is { } unreadable)
+            if (PushLinkTarget(pending, resolved, ref root, target) is { } unreadable)
             {
                 return new CanonicalPath(Compose(root, resolved), links) { Unreadable = unreadable };
             }
@@ -1166,40 +1175,68 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Pops the front of the walk (the stack's top).
+    /// Pops the front of the walk (the queue's head).
     /// </summary>
     private static string Pop(List<string> pending)
     {
-        string name = pending[^1];
-        pending.RemoveAt(pending.Count - 1);
+        string name = pending[0];
+        pending.RemoveAt(0);
         return name;
     }
 
     /// <summary>
-    /// The components of one path segment still to walk, front of the path on top of the stack.
+    /// The components of one path segment still to walk, in walk order.
     /// </summary>
     private static List<string> ComponentsToWalk(string segment)
     {
         return
         [
-            .. segment
-                .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
-                .Reverse(),
+            .. segment.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries),
         ];
     }
 
     /// <summary>
-    /// Pushes a link target's components onto the front of the walk: the target resolves against
-    /// the prefix already walked (link-free), so its own "." and ".." collapse against real
-    /// directories, and its components are resolved like any other. Returns the unreadable
-    /// sentinel when the target cannot be made absolute, null when it was pushed.
+    /// Queues a link target's raw components at the front of the walk without normalising them:
+    /// its "." and ".." resolve against real directories when they are processed, and its own
+    /// components are resolved like any other — a nested link expands where the walk meets it. A
+    /// relative target resolves against the stack already walked; a rooted target restarts the
+    /// walk at its own root, so a different drive or UNC share resets the walk to that root. A
+    /// target rooted on a drive without a usable root ("C:foo") bases on that drive's own current
+    /// directory, which this walk cannot reconstruct: the unreadable sentinel is returned so
+    /// callers fail closed rather than guess. Returns the unreadable sentinel, or null when the
+    /// target was queued.
     /// </summary>
-    private static string? PushLinkTarget(List<string> pending, string prefix, string target, string root)
+    private static string? PushLinkTarget(List<string> pending, List<string> resolved, ref string root, string target)
     {
         try
         {
-            string absoluteTarget = Path.GetFullPath(Path.Combine(prefix, target));
-            pending.AddRange(ComponentsToWalk(absoluteTarget[root.Length..]));
+            string? targetRoot = Path.GetPathRoot(target);
+            if (targetRoot is { Length: > 0 } && target.StartsWith(targetRoot, PathComparison))
+            {
+                // A root that ends in a separator names its own tree ("/", "C:\", "\\s\c\"): the
+                // walk restarts there. A bare drive ("C:") does not: that target is relative to
+                // the drive's current directory, which nothing in the walk can know.
+                if (!targetRoot.EndsWith(Path.DirectorySeparatorChar) && !targetRoot.EndsWith(Path.AltDirectorySeparatorChar))
+                {
+                    return $"unreadable: {nameof(ArgumentException)}";
+                }
+
+                resolved.Clear();
+                root = targetRoot;
+                pending.InsertRange(0, ComponentsToWalk(target[targetRoot.Length..]));
+                return null;
+            }
+
+            if (Path.IsPathRooted(target))
+            {
+                // Rooted on the walked root itself ("\foo"): restart from the root, keep the root.
+                resolved.Clear();
+                pending.InsertRange(0, ComponentsToWalk(target.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
+                return null;
+            }
+
+            // Relative: the target's components resolve against the walked prefix.
+            pending.InsertRange(0, ComponentsToWalk(target));
             return null;
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
