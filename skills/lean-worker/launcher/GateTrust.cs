@@ -18,6 +18,12 @@
 // the working directory or the runs root is refused before the worker (exit 2) — the worker could
 // write the gate's own PATH there — and so is a symlink entry whose final target lies there: the
 // worker could rewrite what the link resolves to while the PATH directory's listing stays intact.
+// Every such "inside the working tree" comparison runs on canonical paths (Canonical, with
+// realpath(3) semantics): a PATH entry through a symlinked directory, a git root reached through a
+// symlinked home, or a final target behind a link in a parent directory compares against the files
+// the paths really name — and a link on the way to a PATH directory or to a final target is refused
+// in its own right when the link path itself sits in the tree, since the worker can retarget it no
+// matter where it points today.
 // Each directory on that PATH is trusted as listed: at round 1 the launcher records the entries
 // directly in each directory (no recursion, no hashing) — name, length, last write time (UTC),
 // whether the entry is a symlink and, for a symlink, its link target plus the chain's final
@@ -68,6 +74,23 @@ namespace LeanWorker;
 
 internal static class GateTrust
 {
+    /// <summary>
+    /// How two trust paths are compared: ordinal on Linux, case-insensitive on macOS and Windows,
+    /// whose filesystems answer to both casings of the same file. Every comparison of two trust
+    /// paths — roots against candidates, snapshot keys, listing names, declared outputs — goes
+    /// through this one place, so the rule cannot drift between checks.
+    /// </summary>
+    internal static readonly StringComparison PathComparison =
+        OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+    /// <summary>
+    /// <see cref="PathComparison"/> as a comparer, for the dictionaries and sets keyed by trust
+    /// paths and listing names.
+    /// </summary>
+    internal static readonly StringComparer PathComparer = StringComparer.FromComparison(PathComparison);
+
     /// <summary>
     /// One set of trusted files and their SHA-256 of the bytes. Snapshot keys are always the trusted
     /// path the operator configured (a symlink is recorded under its own path, not its target).
@@ -142,7 +165,7 @@ internal static class GateTrust
     /// </summary>
     public static async Task<Snapshot> HashAsync(IEnumerable<string> paths)
     {
-        Dictionary<string, string> hashes = new(StringComparer.Ordinal);
+        Dictionary<string, string> hashes = new(PathComparer);
         foreach (string path in paths)
         {
             await HashOneAsync(hashes, path).ConfigureAwait(false);
@@ -264,9 +287,10 @@ internal static class GateTrust
 
     private static bool IsPseudoFileSystem(string target)
     {
-        return target.StartsWith("/dev/", StringComparison.Ordinal)
-            || target.StartsWith("/proc/", StringComparison.Ordinal)
-            || target.StartsWith("/sys/", StringComparison.Ordinal);
+        // Path prefixes, so PathComparison — on a case-insensitive filesystem /DEV/ names /dev/.
+        return target.StartsWith("/dev/", PathComparison)
+            || target.StartsWith("/proc/", PathComparison)
+            || target.StartsWith("/sys/", PathComparison);
     }
 
     private static bool HasNonRegularAttributes(string target)
@@ -392,10 +416,10 @@ internal static class GateTrust
     /// </summary>
     public static List<string> SetDifferences(Snapshot before, IReadOnlyList<string> paths, IReadOnlySet<string>? exclusions = null)
     {
-        HashSet<string> now = new(paths, StringComparer.Ordinal);
+        HashSet<string> now = new(paths, PathComparer);
         IEnumerable<string> added = paths.Where(p => exclusions?.Contains(p) is not true && !before.Hashes.ContainsKey(p));
         IEnumerable<string> removed = before.Hashes.Keys.Where(p => exclusions?.Contains(p) is not true && !now.Contains(p));
-        return [.. added.Concat(removed).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
+        return [.. added.Concat(removed).Distinct(PathComparer).Order(StringComparer.Ordinal)];
     }
 
     /// <summary>
@@ -422,8 +446,13 @@ internal static class GateTrust
         }
 
         // The report path arrives resolved to an absolute path (Gate resolves it against the working
-        // directory); the run directory may still be relative to it.
-        if (runDirectory is { Length: > 0 } && IsAtOrUnder(reportPath, Path.GetFullPath(runDirectory)))
+        // directory); the run directory may still be relative to it. Both sides are canonicalised so
+        // the exemption matches a report path that reaches the run directory through a symlink — the
+        // resolution's expansion bound failing leaves the exemption unverified and the rule applies.
+        if (runDirectory is { Length: > 0 }
+            && Canonical(reportPath) is { Resolved: true } reportCanonical
+            && Canonical(runDirectory) is { Resolved: true } runDirCanonical
+            && IsAtOrUnder(reportCanonical.Path, runDirCanonical.Path))
         {
             return null;
         }
@@ -454,7 +483,7 @@ internal static class GateTrust
     {
         foreach (string path in paths)
         {
-            Dictionary<string, string> hashes = new(StringComparer.Ordinal);
+            Dictionary<string, string> hashes = new(PathComparer);
             await HashOneAsync(hashes, path).ConfigureAwait(false);
             string value = hashes[path];
             if (!before.Hashes.TryGetValue(path, out string? expected) || value != expected)
@@ -531,7 +560,7 @@ internal static class GateTrust
     public static IReadOnlyList<string> GatePathDirectories()
     {
         List<string> dirs = [];
-        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        HashSet<string> dedupe = new(PathComparer);
         foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
             string dir = entry.Trim('"');
@@ -597,7 +626,7 @@ internal static class GateTrust
     /// </summary>
     public static PathNamesSnapshot SnapshotPathNames(IReadOnlyList<string> directories)
     {
-        Dictionary<string, PathNameListing> listings = new(StringComparer.Ordinal);
+        Dictionary<string, PathNameListing> listings = new(PathComparer);
         foreach (string dir in directories)
         {
             listings[dir] = ListPathDirectory(dir);
@@ -615,7 +644,7 @@ internal static class GateTrust
 
         try
         {
-            Dictionary<string, PathEntry> entries = new(StringComparer.Ordinal);
+            Dictionary<string, PathEntry> entries = new(PathComparer);
             // One enumeration; the transform reads the FileSystemEntry the walk already holds (name,
             // length, last write time, link flag), resolves a symlink's target with one call, and
             // follows the chain to the final target with one more. _pathListOptions, not _walkOptions:
@@ -694,7 +723,7 @@ internal static class GateTrust
         }
     }
 
-    private static readonly IReadOnlyDictionary<string, PathEntry> _emptyEntries = new Dictionary<string, PathEntry>(StringComparer.Ordinal);
+    private static readonly IReadOnlyDictionary<string, PathEntry> _emptyEntries = new Dictionary<string, PathEntry>(PathComparer);
 
     /// <summary>
     /// The gate PATH listing violations right now, against round 1's frozen listing: a name added to
@@ -793,12 +822,12 @@ internal static class GateTrust
         }
         else if (was.IsSymlink)
         {
-            if (!string.Equals(was.LinkTarget, now.LinkTarget, StringComparison.Ordinal))
+            if (!string.Equals(was.LinkTarget, now.LinkTarget, PathComparison))
             {
                 changes.Add($"changed its link target from '{was.LinkTarget}' to '{now.LinkTarget}'");
             }
 
-            if (!string.Equals(was.FinalTarget, now.FinalTarget, StringComparison.Ordinal))
+            if (!string.Equals(was.FinalTarget, now.FinalTarget, PathComparison))
             {
                 changes.Add($"changed its final target from '{was.FinalTarget}' to '{now.FinalTarget}'");
             }
@@ -847,7 +876,7 @@ internal static class GateTrust
         Dictionary<string, HashSet<TrustSource>>? sources = null, string? resolvedExecutable = null)
     {
         List<string> paths = [];
-        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        HashSet<string> dedupe = new(PathComparer);
         void Add(string p)
         {
             if (!dedupe.Add(p))
@@ -897,7 +926,7 @@ internal static class GateTrust
         Dictionary<string, HashSet<TrustSource>>? sources = null)
     {
         List<string> paths = [];
-        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        HashSet<string> dedupe = new(PathComparer);
         void Add(string p)
         {
             if (!dedupe.Add(p))
@@ -1023,17 +1052,204 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Whether <paramref name="path"/> is <paramref name="root"/> or lies under it (ordinal).
+    /// The bound on symlink expansions in one resolution (<see cref="Canonical"/>), where
+    /// realpath(3) gives up with ELOOP: 40 expansions cover any real path and stop a link loop from
+    /// walking forever.
+    /// </summary>
+    private const int MaxLinkExpansions = 40;
+
+    /// <summary>
+    /// A path resolved with realpath(3) semantics by <see cref="Canonical"/>: the absolute path with
+    /// every symlink component expanded, plus <see cref="Links"/>, every link path the resolution
+    /// expanded, in expansion order — a link on the way can be refused even when the resolved path
+    /// itself is harmless, because the worker can retarget a link it can write no matter where the
+    /// resolution lands today.
+    /// </summary>
+    internal sealed record CanonicalPath(string Path, IReadOnlyList<string> Links)
+    {
+        /// <summary>
+        /// Null when the resolution completed; otherwise the sentinel for why it stopped —
+        /// <c>unreadable: too many links</c> at the expansion bound, or the exception type when the
+        /// path or a link target could not be made absolute. <see cref="Path"/> then holds the
+        /// resolution reached so far, and callers that must not guess treat it as unresolved.
+        /// </summary>
+        public string? Unreadable { get; init; }
+
+        /// <summary>
+        /// Whether the resolution completed.
+        /// </summary>
+        public bool Resolved => Unreadable is null;
+    }
+
+    /// <summary>
+    /// The canonical form of <paramref name="path"/> with realpath(3) semantics, in pure managed
+    /// code: the path is made absolute, then walked component by component from the root; each
+    /// existing component that is a symlink (its <see cref="FileSystemInfo.LinkTarget"/>) replaces
+    /// the walked prefix with its link target — made absolute against the prefix, itself walked —
+    /// and the walk continues; <c>.</c> and <c>..</c> collapse against the already-resolved prefix,
+    /// which is what makes <c>link/..</c> resolve to the link target's parent, not the link's. A
+    /// non-existent tail is appended as-is, lexically normalised. Expansion stops at
+    /// <see cref="MaxLinkExpansions"/> with <c>unreadable: too many links</c>. No P/Invoke: one
+    /// <see cref="FileSystemInfo.LinkTarget"/> read per component.
+    /// </summary>
+    internal static CanonicalPath Canonical(string path)
+    {
+        // Make the path absolute without a lexical "." / ".." collapse: those must resolve against
+        // what the components really are, so "/link/.." climbs out of the link's target. Only forms
+        // that are not fully qualified go through GetFullPath (they need the current directory or
+        // drive to become absolute, and GetFullPath collapses their ".." lexically — the walk still
+        // resolves whatever symlink components remain).
+        try
+        {
+            return Canonicalize(Path.IsPathFullyQualified(path) ? path : Path.GetFullPath(path));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
+        {
+            return new CanonicalPath(path, []) { Unreadable = $"unreadable: {ex.GetType().Name}" };
+        }
+    }
+
+    /// <summary>
+    /// The component walk over an already absolute path (<see cref="Canonical"/>'s body).
+    /// </summary>
+    private static CanonicalPath Canonicalize(string absolute)
+    {
+        string root = Path.GetPathRoot(absolute) ?? string.Empty;
+        List<string> pending = ComponentsToWalk(absolute[root.Length..]);
+        List<string> resolved = [];
+        List<string> links = [];
+        while (pending.Count > 0)
+        {
+            // The stack's top is the front of the path still to walk; a link expansion pushes its
+            // target's components so they are walked before the tail that followed the link.
+            string name = Pop(pending);
+            if (name is ".")
+            {
+                continue;
+            }
+
+            if (name is "..")
+            {
+                // Everything below holds resolved, link-free names, so popping is the physical
+                // parent; the filesystem root clamps, like realpath.
+                if (resolved.Count > 0)
+                {
+                    resolved.RemoveAt(resolved.Count - 1);
+                }
+
+                continue;
+            }
+
+            string candidate = Compose(root, [.. resolved, name]);
+            string? target = ReadLinkTarget(candidate);
+            if (string.IsNullOrEmpty(target))
+            {
+                // Not a link — including a component that does not exist: from here on the tail is
+                // appended as-is.
+                resolved.Add(name);
+                continue;
+            }
+
+            if (links.Count >= MaxLinkExpansions)
+            {
+                return new CanonicalPath(Compose(root, resolved), links) { Unreadable = "unreadable: too many links" };
+            }
+
+            links.Add(candidate);
+            if (PushLinkTarget(pending, Compose(root, resolved), target, root) is { } unreadable)
+            {
+                return new CanonicalPath(Compose(root, resolved), links) { Unreadable = unreadable };
+            }
+        }
+
+        return new CanonicalPath(Compose(root, resolved), links);
+    }
+
+    /// <summary>
+    /// Pops the front of the walk (the stack's top).
+    /// </summary>
+    private static string Pop(List<string> pending)
+    {
+        string name = pending[^1];
+        pending.RemoveAt(pending.Count - 1);
+        return name;
+    }
+
+    /// <summary>
+    /// The components of one path segment still to walk, front of the path on top of the stack.
+    /// </summary>
+    private static List<string> ComponentsToWalk(string segment)
+    {
+        return
+        [
+            .. segment
+                .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+                .Reverse(),
+        ];
+    }
+
+    /// <summary>
+    /// Pushes a link target's components onto the front of the walk: the target resolves against
+    /// the prefix already walked (link-free), so its own "." and ".." collapse against real
+    /// directories, and its components are resolved like any other. Returns the unreadable
+    /// sentinel when the target cannot be made absolute, null when it was pushed.
+    /// </summary>
+    private static string? PushLinkTarget(List<string> pending, string prefix, string target, string root)
+    {
+        try
+        {
+            string absoluteTarget = Path.GetFullPath(Path.Combine(prefix, target));
+            pending.AddRange(ComponentsToWalk(absoluteTarget[root.Length..]));
+            return null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
+        {
+            return $"unreadable: {ex.GetType().Name}";
+        }
+    }
+
+    /// <summary>
+    /// Joins the root (which always ends in a separator) with the resolved component stack.
+    /// </summary>
+    private static string Compose(string root, IReadOnlyList<string> parts) =>
+        parts.Count is 0 ? root : root + string.Join(Path.DirectorySeparatorChar, parts);
+
+    /// <summary>
+    /// The symlink target of <paramref name="path"/>, or null when the path is not a link (or its
+    /// target cannot be read — the component then stays as written, and a link the trust check
+    /// cannot read cannot redirect it either). <see cref="FileSystemInfo.LinkTarget"/> reads the
+    /// link itself without following it and reports a dangling link's target like any other; the
+    /// file/directory distinction only picks the <see cref="FileSystemInfo"/> kind, which matters
+    /// on Windows.
+    /// </summary>
+    private static string? ReadLinkTarget(string path)
+    {
+        try
+        {
+            FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
+            return info.LinkTarget;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is <paramref name="root"/> or lies under it, compared with
+    /// <see cref="PathComparison"/>. Callers pass canonical paths (<see cref="Canonical"/>) on both
+    /// sides: a lexical prefix test can only be trusted when neither side hides a symlinked
+    /// directory under an innocent-looking name.
     /// </summary>
     internal static bool IsAtOrUnder(string path, string root)
     {
-        if (string.Equals(path, root, StringComparison.Ordinal))
+        if (string.Equals(path, root, PathComparison))
         {
             return true;
         }
 
         string prefix = root[^1] == Path.DirectorySeparatorChar ? root : root + Path.DirectorySeparatorChar;
-        return path.StartsWith(prefix, StringComparison.Ordinal);
+        return path.StartsWith(prefix, PathComparison);
     }
 
     private static void AddRunsRootFiles(string runsRoot, Action<string> add)
@@ -1053,7 +1269,7 @@ internal static class GateTrust
         // The launcher's own bookkeeping lives under runs/, inbox/ and system/ and is never a gate
         // input, and runs.jsonl is the ledger (one record per run, append-only): do not descend
         // into those subtrees, so a planted or unreadable directory under them cannot stall the walk.
-        HashSet<string> skip = new(StringComparer.Ordinal)
+        HashSet<string> skip = new(PathComparer)
         {
             Path.Combine(root, "runs"),
             Path.Combine(root, "inbox"),
@@ -1062,7 +1278,7 @@ internal static class GateTrust
 
         foreach (string file in WalkFiles(root, dir => skip.Contains(dir)))
         {
-            if (!string.Equals(file, ledger, StringComparison.Ordinal))
+            if (!string.Equals(file, ledger, PathComparison))
             {
                 add(file);
             }
@@ -1079,17 +1295,17 @@ internal static class GateTrust
         while (current is not null)
         {
             AddConfigFiles(add, current);
-            if (string.Equals(current, toDir, StringComparison.Ordinal))
+            if (string.Equals(current, toDir, PathComparison))
             {
                 break;
             }
 
             string? parent = Path.GetDirectoryName(current);
-            if (parent is null || string.Equals(parent, current, StringComparison.Ordinal))
+            if (parent is null || string.Equals(parent, current, PathComparison))
             {
                 // Reached the filesystem root before reaching the git root; emit one last set so the
                 // top-level git root config files are still trusted.
-                if (!string.Equals(current, toDir, StringComparison.Ordinal))
+                if (!string.Equals(current, toDir, PathComparison))
                 {
                     AddConfigFiles(add, toDir);
                 }
@@ -1330,13 +1546,18 @@ internal static class GateTrust
     /// root's own top-level <c>.git</c> — the metadata store is walked for names only and a glob
     /// such as **/*.json would otherwise match files git itself created and trip every run. A
     /// directory named <c>.git</c> deeper in the tree is an ordinary directory and stays in the walk.
+    /// The runs-root comparison runs on canonical paths: the walk never descends into a symlinked
+    /// directory, but the anchor itself can sit behind symlinks, and only the canonical form of both
+    /// sides names the same tree. A side that cannot be resolved keeps the directory in the walk.
     /// </summary>
     private static bool SkipWalkedDirectory(string dir, string anchor, string skipRunsRoot)
     {
         return (Path.GetFileName(dir) is ".git"
             && Path.GetDirectoryName(dir) is { } parent
-            && string.Equals(Path.TrimEndingDirectorySeparator(parent), Path.TrimEndingDirectorySeparator(anchor), StringComparison.Ordinal))
-            || IsAtOrUnder(dir, skipRunsRoot);
+            && string.Equals(Path.TrimEndingDirectorySeparator(parent), Path.TrimEndingDirectorySeparator(anchor), PathComparison))
+            || (Canonical(dir) is { Resolved: true } dirCanonical
+                && Canonical(skipRunsRoot) is { Resolved: true } runsCanonical
+                && IsAtOrUnder(dirCanonical.Path, runsCanonical.Path));
     }
 
     private static void AddPricesFile(string? pricesFile, Action<string> add)

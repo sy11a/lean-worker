@@ -829,21 +829,36 @@ internal sealed class LaunchRun
     /// spawns) write the gate's own PATH, and a symlink entry whose final target lies there lets it
     /// rewrite what the link resolves to while the PATH directory's listing stays intact — the
     /// listing check would only notice after a full worker run, and the restore-mtime gap can hide
-    /// it altogether. Like every other round-1 refusal this is a launch error (exit 2), thrown
-    /// before the run directory is created; the frozen listing the later rounds compare against
-    /// exists only when this check passed.
+    /// it altogether. Both sides of every comparison are canonicalised (<see cref="GateTrust.Canonical"/>),
+    /// so a PATH entry through a symlinked directory or a git root behind a symlinked home is judged
+    /// by the files the paths really name, and a link on the way to a PATH directory or to a final
+    /// target is refused in its own right when the link path itself sits in the tree: the worker can
+    /// retarget it even though the resolution lands outside today. Like every other round-1 refusal
+    /// this is a launch error (exit 2), thrown before the run directory is created; the frozen
+    /// listing the later rounds compare against exists only when this check passed.
     /// </summary>
     private void RefuseGatePathInsideWorkingTree(string gitRoot, string workingDirectory)
     {
+        // The three roots, canonicalised once for this check: every comparison below runs against
+        // the same resolved trees.
+        string gitRootCanonical = CanonicalRootOrRefuse(gitRoot, $"git root '{gitRoot}'").Path;
+        string workingDirectoryCanonical = CanonicalRootOrRefuse(workingDirectory, $"working directory '{workingDirectory}'").Path;
+        string runsRootCanonical = CanonicalRootOrRefuse(Path.GetFullPath(_runsRoot), $"runs root '{Path.GetFullPath(_runsRoot)}'").Path;
         string? gatePath = NonNull(_gate).GatePath;
-        string runsRoot = Path.GetFullPath(_runsRoot);
         if (gatePath is not null)
         {
             foreach (string dir in GateTrust.SplitGatePath(gatePath))
             {
-                if (GateTrust.IsAtOrUnder(dir, gitRoot) || GateTrust.IsAtOrUnder(dir, workingDirectory) || GateTrust.IsAtOrUnder(dir, runsRoot))
+                GateTrust.CanonicalPath canonical = GateTrust.Canonical(dir);
+                RefuseUnresolvedCanonical(canonical, $"gate PATH directory '{dir}'");
+                if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
                 {
                     throw new LaunchException($"gate PATH directory '{dir}' is inside the working tree");
+                }
+
+                if (canonical.Links.FirstOrDefault(link => InsideWorkingTree(link, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical)) is { } via)
+                {
+                    throw new LaunchException($"gate PATH directory '{dir}' resolves into the working tree via '{via}'");
                 }
             }
         }
@@ -867,12 +882,55 @@ internal sealed class LaunchRun
                     continue;
                 }
 
-                if (GateTrust.IsAtOrUnder(target, gitRoot) || GateTrust.IsAtOrUnder(target, workingDirectory) || GateTrust.IsAtOrUnder(target, runsRoot))
+                string entryPath = Path.Combine(listing.Key, entry.Key);
+                GateTrust.CanonicalPath canonical = GateTrust.Canonical(target);
+                RefuseUnresolvedCanonical(canonical, $"gate PATH entry '{entryPath}'");
+                if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
                 {
-                    throw new LaunchException($"gate PATH entry '{Path.Combine(listing.Key, entry.Key)}' links into the working tree: {target}");
+                    throw new LaunchException($"gate PATH entry '{entryPath}' links into the working tree: {target}");
+                }
+
+                if (canonical.Links.FirstOrDefault(link => InsideWorkingTree(link, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical)) is { } via)
+                {
+                    throw new LaunchException($"gate PATH entry '{entryPath}' resolves into the working tree via '{via}'");
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> (canonical) is at or under any of the three canonical roots
+    /// the round-1 refusal judges the gate PATH by.
+    /// </summary>
+    private static bool InsideWorkingTree(string path, string gitRoot, string workingDirectory, string runsRoot)
+    {
+        return GateTrust.IsAtOrUnder(path, gitRoot)
+            || GateTrust.IsAtOrUnder(path, workingDirectory)
+            || GateTrust.IsAtOrUnder(path, runsRoot);
+    }
+
+    /// <summary>
+    /// The canonical form of a root for the round-1 refusals, or a launch error when the resolution
+    /// gives up (a link loop): the check must not guess from a half-resolved path.
+    /// </summary>
+    private static GateTrust.CanonicalPath CanonicalRootOrRefuse(string path, string what)
+    {
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(path);
+        RefuseUnresolvedCanonical(canonical, what);
+        return canonical;
+    }
+
+    /// <summary>
+    /// The launch error for a path whose canonical resolution gives up (<see cref="GateTrust.CanonicalPath.Unreadable"/>).
+    /// </summary>
+    private static void RefuseUnresolvedCanonical(GateTrust.CanonicalPath canonical, string what)
+    {
+        if (canonical.Resolved)
+        {
+            return;
+        }
+
+        throw new LaunchException($"{what} {canonical.Unreadable}");
     }
 
     /// <summary>
@@ -894,7 +952,7 @@ internal sealed class LaunchRun
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
         List<string> warnings = [];
-        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(GateTrust.PathComparer);
         List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, gate.ResolvedExecutable);
         FixedSources = sources;
         if (warnings.Count > 0)
@@ -922,7 +980,7 @@ internal sealed class LaunchRun
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
-        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(StringComparer.Ordinal);
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(GateTrust.PathComparer);
         foreach (KeyValuePair<string, HashSet<GateTrust.TrustSource>> entry in NonNull(FixedSources))
         {
             sources[entry.Key] = [.. entry.Value];
@@ -930,7 +988,7 @@ internal sealed class LaunchRun
 
         List<string> volatilePaths = GateTrust.CollectVolatilePaths(_runsRoot, cwd, root, sources);
         List<string> paths = [];
-        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        HashSet<string> dedupe = new(GateTrust.PathComparer);
         foreach (string path in NonNull(TrustPaths).Concat(volatilePaths))
         {
             if (!exclusions.Contains(path) && dedupe.Add(path))
@@ -949,7 +1007,7 @@ internal sealed class LaunchRun
     /// is neither argv[0] nor argv[1] and carries no execute bit, so guessing was dropped in favour
     /// of the profile's explicit <c>gate.outputs</c> declaration.
     /// </summary>
-    private static readonly IReadOnlySet<string> _noExclusions = new HashSet<string>(StringComparer.Ordinal);
+    private static readonly IReadOnlySet<string> _noExclusions = new HashSet<string>(GateTrust.PathComparer);
 
     /// <summary>
     /// The profile's declared <c>gate.outputs</c>, resolved against the git root (or the working
@@ -983,7 +1041,7 @@ internal sealed class LaunchRun
     private async Task<IReadOnlySet<string>> DeclaredOutputExclusionsAsync()
     {
         List<string> outputs = await DeclaredOutputPathsAsync().ConfigureAwait(false);
-        return outputs.Count is 0 ? _noExclusions : new HashSet<string>(outputs, StringComparer.Ordinal);
+        return outputs.Count is 0 ? _noExclusions : new HashSet<string>(outputs, GateTrust.PathComparer);
     }
 
     // gitRoot ?? cwd: the anchor CollectFixedPathsAsync resolved the fixed trust list against, so a
@@ -1077,10 +1135,15 @@ internal sealed class LaunchRun
 
         string anchor = await OutputAnchorAsync().ConfigureAwait(false);
         string runsRoot = Path.GetFullPath(_runsRoot);
+        // Both sides of the runs-root comparison are canonicalised: a declared output that reaches
+        // the runs root through a symlink — or a bookkeeping subtree (runs/, inbox/, system/)
+        // someone replaced with a symlink pointing out of the root — is judged by where the paths
+        // really resolve.
+        GateTrust.CanonicalPath runsRootCanonical = CanonicalRootOrRefuse(runsRoot, $"runs root '{runsRoot}'");
+        GateTrust.CanonicalPath runsDirCanonical = CanonicalRootOrRefuse(Path.Combine(runsRoot, "runs"), $"runs root subtree '{Path.Combine(runsRoot, "runs")}'");
+        GateTrust.CanonicalPath inboxDirCanonical = CanonicalRootOrRefuse(Path.Combine(runsRoot, "inbox"), $"runs root subtree '{Path.Combine(runsRoot, "inbox")}'");
+        GateTrust.CanonicalPath systemDirCanonical = CanonicalRootOrRefuse(Path.Combine(runsRoot, "system"), $"runs root subtree '{Path.Combine(runsRoot, "system")}'");
         // The same subtrees AddRunsRootFiles never descends into: the launcher's own bookkeeping.
-        string runsDir = Path.Combine(runsRoot, "runs");
-        string inboxDir = Path.Combine(runsRoot, "inbox");
-        string systemDir = Path.Combine(runsRoot, "system");
         for (int i = 0; i < gate.Outputs.Count; i++)
         {
             string full = ResolveOutputEntry(gate.Outputs[i], anchor);
@@ -1090,10 +1153,12 @@ internal sealed class LaunchRun
                 throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is a trusted gate input");
             }
 
-            if (GateTrust.IsAtOrUnder(full, runsRoot)
-                && !GateTrust.IsAtOrUnder(full, runsDir)
-                && !GateTrust.IsAtOrUnder(full, inboxDir)
-                && !GateTrust.IsAtOrUnder(full, systemDir))
+            GateTrust.CanonicalPath fullCanonical = GateTrust.Canonical(full);
+            RefuseUnresolvedCanonical(fullCanonical, $"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}'");
+            if (GateTrust.IsAtOrUnder(fullCanonical.Path, runsRootCanonical.Path)
+                && !GateTrust.IsAtOrUnder(fullCanonical.Path, runsDirCanonical.Path)
+                && !GateTrust.IsAtOrUnder(fullCanonical.Path, inboxDirCanonical.Path)
+                && !GateTrust.IsAtOrUnder(fullCanonical.Path, systemDirCanonical.Path))
             {
                 throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is at or under the runs root outside runs/");
             }
@@ -1328,7 +1393,7 @@ internal sealed class LaunchRun
     /// </summary>
     private static GateTrust.Snapshot MergePostGateOutputs(GateTrust.Snapshot baseline, GateTrust.Snapshot postGate)
     {
-        Dictionary<string, string> merged = new(baseline.Hashes, StringComparer.Ordinal);
+        Dictionary<string, string> merged = new(baseline.Hashes, GateTrust.PathComparer);
         foreach (KeyValuePair<string, string> entry in postGate.Hashes)
         {
             merged[entry.Key] = entry.Value;
