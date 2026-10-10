@@ -124,6 +124,52 @@ if [ $claude_only = 0 ] || [ -n "${LW_OPENCODE_MODEL:-}" ]; then
     cwd="$saved"
 fi
 
+echo "== 14. gate loop with a fake gate (claude, haiku)"
+# mkgate <name> <findings in round 1> <findings in later rounds> <exit code override or "">: a fake gate script in
+# the scratch directory (outside the working directory and the runs root) with a round counter and a small SARIF.
+mkgate() {
+    cat > "$scratch/gate-$1.sh" <<EOF
+d="$scratch"
+n=0
+[ -f "\$d/round-$1" ] && read n < "\$d/round-$1"
+n=\$((n + 1))
+echo "\$n" > "\$d/round-$1"
+if [ "\$n" = 1 ]; then c=$2; else c=$3; fi
+r="" sep=""
+i=0
+while [ "\$i" -lt "\$c" ]; do r="\$r\$sep{\"ruleId\":\"R\$i\",\"message\":{\"text\":\"finding \$i\"}}"; sep=","; i=\$((i + 1)); done
+echo "{\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"fake\"}},\"results\":[\$r]}]}" > "\$d/sarif-$1-\$n.json"
+echo "fake gate round \$n: \$c finding(s)"
+echo "sarif: \$d/sarif-$1-\$n.json"
+[ -n "$4" ] && exit $4
+[ "\$c" -gt 0 ] && exit 1
+exit 0
+EOF
+}
+mkgate gated 2 0 ""
+mkgate stuck 3 3 ""
+mkgate broken 1 1 2
+jq -n --arg g1 "$scratch/gate-gated.sh" --arg g2 "$scratch/gate-stuck.sh" --arg g3 "$scratch/gate-broken.sh" '
+    def p($g): {model: "claude-haiku-4-5", effort: "low", tools: ["Glob"], maxBudgetUsd: 0.05, gate: {command: ["sh", $g]}};
+    {profiles: {gated: p($g1), stuck: p($g2), broken: p($g3)}}' > "$rr/profiles.json"
+nruns() { ls "$rr/runs" | wc -l; }
+
+before="$(nruns)"
+run --task "$count" --profile gated --no-project-notes
+second="$last"; first="$(ls -d "$rr"/runs/* | tail -2 | head -1)"
+check "gate clean: exit 0, two run directories, the second named ...-gate2" '[ $code = 0 ] && [ "$(( $(nruns) - before ))" = 2 ] && [[ "$second" == *-gate2 ]]'
+check "the second task.md has the gate report heading" 'grep -q "^## Gate report (lean-worker)" "$second/task.md"'
+check "result shows the chain clean after 2 rounds, findings 2→0" 'grep -q "gate:     clean after 2 round(s), findings 2→0" "$scratch/out.txt"'
+check "gate.json in both run directories, last decision clean" '[ -f "$first/gate.json" ] && [ -f "$second/gate.json" ] && [ "$(field .gate.decision)" = clean ]'
+
+before="$(nruns)"
+run --task "$count" --profile stuck --gate-max-rounds 2 --no-project-notes
+check "a gate that always finds 3: exit 4 and a STUCK line" '[ $code = 4 ] && grep -q "STUCK" "$scratch/out.txt"'
+
+before="$(nruns)"
+run --task "$count" --profile broken --no-project-notes
+check "a gate that exits 2: exit 5, one worker run" '[ $code = 5 ] && [ "$(( $(nruns) - before ))" = 1 ]'
+
 echo "== 13. the ledger's schema and stats --json"
 cmd stats --json
 check "rows carry schema_version 1 and stats --json has groups" '[ "$(tail -1 "$rr/runs.jsonl" | jq .schema_version)" = 1 ] && jq -e ".schema_version == 1 and (.groups | length) > 0" "$scratch/out.txt" >/dev/null'
