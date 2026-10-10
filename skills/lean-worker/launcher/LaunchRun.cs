@@ -877,7 +877,9 @@ internal sealed class LaunchRun
     /// say <c>unreadable</c> — so a worker that can write it could plant a tool the gate would still
     /// run; a missing directory the gate never sees entries from is fine), and a readable
     /// directory's symlink entries are judged like the directories themselves: a final target at or
-    /// under the working tree, or reached through a link that sits there, is refused.
+    /// under the working tree, or reached through a link that sits there, is refused — and so is an
+    /// entry whose own canonical resolution gives up (a link loop, too many links), which like an
+    /// unreadable directory is invisible to the later entry comparison.
     /// </summary>
     private void RefuseGatePathListingDangers(string gitRootCanonical, string workingDirectoryCanonical, string runsRootCanonical)
     {
@@ -900,14 +902,21 @@ internal sealed class LaunchRun
 
             foreach (KeyValuePair<string, GateTrust.PathEntry> entry in listing.Value.Entries)
             {
-                if (entry.Value.FinalTarget is not { } target || target is "dangling" || target.StartsWith("unreadable", StringComparison.Ordinal))
+                // A merely dangling link (its canonical path resolves, the target does not exist)
+                // stays recorded, not refused: a stale link in a system PATH directory is common,
+                // and a target appearing later is caught by the entry comparison.
+                if (entry.Value.FinalTarget is not { } target || target is "dangling")
                 {
                     continue;
                 }
 
                 string entryPath = Path.Combine(listing.Key, entry.Key);
                 GateTrust.CanonicalPath canonical = GateTrust.Canonical(entryPath);
-                RefuseUnresolvedCanonical(canonical, $"gate PATH entry '{entryPath}'");
+                if (!canonical.Resolved)
+                {
+                    throw new LaunchException($"gate PATH entry '{entryPath}' cannot be resolved: {canonical.Unreadable}");
+                }
+
                 if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
                 {
                     throw new LaunchException($"gate PATH entry '{entryPath}' links into the working tree: {target}");
