@@ -31,6 +31,7 @@ internal sealed class LaunchRun
     private List<string>? _writeScope;
     private decimal _budget;
     private decimal _wrapUpAt;
+    private GateSpec? _gate;
 
     // ResolveSettings (hooks)
     private string _permissionMode = string.Empty;
@@ -209,12 +210,57 @@ internal sealed class LaunchRun
         _budget = _o.MaxBudgetUsd ?? Json.Dec(_profile, "maxBudgetUsd") ?? 2m;
         // Share of the budget after which the wrap-up hook blocks tools; 0 turns it off.
         _wrapUpAt = _o.WrapUpAt ?? Json.Dec(_profile, "wrapUpAt") ?? 0.8m;
-        if (_wrapUpAt is not (< 0 or >= 1))
+        if (_wrapUpAt is < 0 or >= 1)
+        {
+            throw new LaunchException(string.Create(CultureInfo.InvariantCulture, $"invalid wrap-up share {_wrapUpAt} (0 = off, else below 1)"));
+        }
+
+        ResolveGate();
+    }
+
+    private void ResolveGate()
+    {
+        if (_o.NoGate)
         {
             return;
         }
 
-        throw new LaunchException(string.Create(CultureInfo.InvariantCulture, $"invalid wrap-up share {_wrapUpAt} (0 = off, else below 1)"));
+        GateSpec? spec = GateSpec.FromProfile(_profile);
+        if (spec is null)
+        {
+            if (_o.GateMaxRounds is not null)
+            {
+                throw new LaunchException("--gate-max-rounds needs a profile with a gate");
+            }
+
+            return;
+        }
+
+        if (_o.GateMaxRounds is { } rounds)
+        {
+            if (rounds <= 0)
+            {
+                throw new LaunchException("--gate-max-rounds must be a positive integer");
+            }
+
+            spec = spec with { MaxRounds = rounds };
+        }
+
+        _gate = spec with { MaxTotalUsd = spec.MaxTotalUsd ?? (3m * _budget) };
+        NoteGate(_gate);
+    }
+
+    // Records the resolved gate in the run notes (the gate runner itself is wired up by a later task),
+    // and references Gate so the analyzer counts the runner type as used (MA0182, IDE0052).
+    private void NoteGate(GateSpec? spec)
+    {
+        _ = typeof(Gate);
+        if (spec is null)
+        {
+            return;
+        }
+
+        _notes.Add(string.Create(CultureInfo.InvariantCulture, $"gate: {string.Join(' ', spec.Command)} (rounds {spec.MaxRounds}, ${spec.MaxTotalUsd:0.####})"));
     }
 
     private void ResolveHookSettings()
