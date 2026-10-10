@@ -268,7 +268,7 @@ internal sealed class LaunchRun
                 return;
             }
 
-            GateSpec? fromProfile = GateSpec.FromProfile(_profile);
+            GateSpec? fromProfile = GateSpec.FromProfile(_profile, Directory.GetCurrentDirectory());
             if (fromProfile is null)
             {
                 if (_o.GateMaxRounds is not null)
@@ -692,7 +692,7 @@ internal sealed class LaunchRun
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
-        return GateTrust.CollectPaths(_runsRoot, root, gate.Command);
+        return GateTrust.CollectPaths(_runsRoot, root, cwd, gate.Command);
     }
 
     private string Status()
@@ -743,10 +743,19 @@ internal sealed class LaunchRun
         }
 
         // Trust boundary: hash the gate's trusted inputs again and refuse the gate if anything differs
-        // from the snapshot taken before the worker ran.
+        // from the snapshot taken before the worker ran. A nonregular or unreadable state in the
+        // after-worker snapshot is itself a trust violation (a worker may have left a FIFO/device in
+        // place of a file the gate reads), so the violation check covers that case first.
         if (_gateTrustBefore is not null)
         {
             GateTrust.Snapshot after = GateTrust.Hash(await CollectGateTrustPathsAsync().ConfigureAwait(false));
+            string? badState = FindBadState(after);
+            if (badState is not null)
+            {
+                await FinishTrustViolationAsync([badState]).ConfigureAwait(false);
+                return;
+            }
+
             List<string> changed = GateTrust.Changed(_gateTrustBefore, after);
             if (changed.Count > 0)
             {
@@ -791,6 +800,24 @@ internal sealed class LaunchRun
         Counts = countsIncludingThis;
         ChainCostUsd = chainCostIncludingThis;
         LastGate = new GateOutcome(GateChain.Error, result, RunDir, countsIncludingThis, chainCostIncludingThis, StuckReason: null);
+    }
+
+    /// <summary>
+    /// Returns the first path whose state in <paramref name="after"/> is <c>nonregular</c> or
+    /// <c>unreadable: ...</c>, or null when no such entry exists. The chain treats any such entry in
+    /// the after-worker snapshot as a trust violation regardless of the before-worker state.
+    /// </summary>
+    private static string? FindBadState(GateTrust.Snapshot after)
+    {
+        foreach (KeyValuePair<string, string> kv in after.Hashes)
+        {
+            if (kv.Value is "nonregular" || kv.Value.StartsWith("unreadable", StringComparison.Ordinal))
+            {
+                return kv.Key;
+            }
+        }
+
+        return null;
     }
 
     private async Task ComputeSummaryStatsAsync()

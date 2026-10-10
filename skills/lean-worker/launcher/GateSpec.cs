@@ -6,6 +6,7 @@
 // group 1 first; if that is empty it falls back to the first named group (excluding group 0), so a regex
 // that uses a named capture for its only group — like the default `^sarif: (?<report>.+)$` — still works.
 
+using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -28,8 +29,20 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     /// <summary>
     /// Returns null when the profile has no gate key. Any other value (a string, number, array, object
     /// other than the gate spec) throws so a mis-spelled gate key fails fast with a precise message.
+    /// Uses the current process's working directory as the gate's working directory for the
+    /// directory-refusal check on <c>gate.command</c> entries.
     /// </summary>
-    public static GateSpec? FromProfile(JsonObject? profile)
+    public static GateSpec? FromProfile(JsonObject? profile) => FromProfile(profile, Directory.GetCurrentDirectory());
+
+    /// <summary>
+    /// Returns null when the profile has no gate key. Any other value (a string, number, array, object
+    /// other than the gate spec) throws so a mis-spelled gate key fails fast with a precise message.
+    /// </summary>
+    /// <param name="profile">The profile JSON object (or null for "no profile").</param>
+    /// <param name="gateWorkingDirectory">Directory the gate process will be started in
+    /// (<c>ProcessStartInfo.WorkingDirectory</c>); argv entries are resolved against this directory for the
+    /// directory-refusal check.</param>
+    public static GateSpec? FromProfile(JsonObject? profile, string gateWorkingDirectory)
     {
         JsonNode? node = profile?["gate"];
         if (node is null)
@@ -42,7 +55,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             throw new LaunchException("profile gate must be an object");
         }
 
-        List<string> command = ReadCommand(gate);
+        List<string> command = ReadCommand(gate, gateWorkingDirectory);
         Regex reportFromLastLine = ReadReportRegex(gate);
         string countPath = ReadCountPath(gate);
         int feedbackMaxChars = ReadPositiveInt(gate, "feedbackMaxChars", 8000, "profile gate.feedbackMaxChars");
@@ -54,7 +67,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env);
     }
 
-    private static List<string> ReadCommand(JsonObject gate)
+    private static List<string> ReadCommand(JsonObject gate, string gateWorkingDirectory)
     {
         if (gate["command"] is not JsonArray arr || arr.Count is 0)
         {
@@ -62,11 +75,29 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         }
 
         List<string> command = new(arr.Count);
-        foreach (JsonNode? node in arr)
+        for (int i = 0; i < arr.Count; i++)
         {
+            JsonNode? node = arr[i];
             if (node is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
             {
                 throw new LaunchException("profile gate.command must be a non-empty array of non-empty strings");
+            }
+
+            string resolved;
+            try
+            {
+                resolved = Path.IsPathRooted(s)
+                    ? Path.GetFullPath(s)
+                    : Path.GetFullPath(Path.Combine(gateWorkingDirectory, s));
+            }
+            catch (ArgumentException ex)
+            {
+                throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is invalid: {ex.Message}");
+            }
+
+            if (Directory.Exists(resolved))
+            {
+                throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is a directory: {resolved}");
             }
 
             command.Add(s);
