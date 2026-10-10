@@ -124,7 +124,7 @@ if [ $claude_only = 0 ] || [ -n "${LW_OPENCODE_MODEL:-}" ]; then
     cwd="$saved"
 fi
 
-echo "== 14. gate loop with a fake gate (claude, haiku)"
+echo "== 15. gate loop with a fake gate (claude, haiku)"
 # mkgate <name> <findings in round 1> <findings in later rounds> <exit code override or "">: a fake gate script in
 # the scratch directory (outside the working directory and the runs root) with a round counter and a small SARIF.
 mkgate() {
