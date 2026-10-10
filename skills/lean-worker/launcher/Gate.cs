@@ -55,7 +55,19 @@ internal static class Gate
         StdoutBuffer stdout = new();
         List<string> envNames = [];
 
-        ProcessStartInfo psi = BuildStartInfo(spec, cwd, envNames);
+        ProcessStartInfo psi;
+        try
+        {
+            psi = BuildStartInfo(spec, cwd, envNames);
+        }
+        catch (LaunchException ex)
+        {
+            // BuildStartInfo throws when the gate's argv[0] does not resolve on PATH (a launcher-
+            // level decision that Process.Start cannot safely make: on Unix, .NET would then also
+            // search the launcher's directory and the working directory). The message is precise,
+            // so just turn it into a start failure.
+            return await BuildStartFailureResultAsync(ex.Message, started, gateJsonPath, spec, envNames).ConfigureAwait(false);
+        }
 
         Process? childProcess;
         try
@@ -149,13 +161,16 @@ internal static class Gate
         List<string> cmd = spec.Command;
         string first = cmd[0];
         // The executable: PATH lookup only when there's no directory part (a path with a directory is used as given).
+        // A bare command the launcher cannot resolve on PATH must not reach Process.Start, which on
+        // Unix also searches the launcher's directory and the working directory (the tree the worker
+        // controls). Fail the start so the gate records "error" with a precise, named message.
         bool hasDir = first.Contains(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
                    || first.Contains(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal);
-        string fileName = hasDir ? first : (Launcher.FindOnPath(first) ?? first);
+        string resolved = hasDir ? first : (Launcher.FindOnPath(first) ?? throw new LaunchException($"gate executable '{first}' not found on PATH"));
 
         ProcessStartInfo psi = new()
         {
-            FileName = fileName,
+            FileName = resolved,
             WorkingDirectory = cwd,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -243,7 +258,7 @@ internal static class Gate
     private static async Task<GateResult> DriveProcessAsync(Process process, GateSpec spec, string logPath, string gateJsonPath,
         DateTimeOffset started, string cwd, StdoutBuffer stdoutBuf, IReadOnlyList<string> envNames, CancellationToken token)
     {
-        StreamWriter log = new(logPath, append: false, Json.Utf8);
+        StreamWriter log = Launcher.CreateWriter(logPath, Json.Utf8);
         await using ConfiguredAsyncDisposable logDisposal = log.ConfigureAwait(false);
         object logLock = new();
         int feedbackCap = spec.FeedbackMaxChars + 1;
@@ -351,7 +366,7 @@ internal static class Gate
     private static async Task<GateResult> FinishResultAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, string cwd, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames, int exitCode)
     {
         string feedback = JoinStdout(stdout, spec.FeedbackMaxChars, logPath);
-        CountResolution resolution = TryResolveCount(stdout, cwd, spec);
+        CountResolution resolution = await TryResolveCountAsync(stdout, cwd, spec).ConfigureAwait(false);
         GateResult result = BuildResult(exitCode, spec, feedback, resolution, duration);
         await WriteGateJsonAsync(gateJsonPath, result, spec, envNames).ConfigureAwait(false);
         return result;
@@ -435,7 +450,7 @@ internal static class Gate
 
     private readonly record struct CountResolution(int? Count, string? ReportPath, string? Error);
 
-    private static CountResolution TryResolveCount(StdoutBuffer stdout, string cwd, GateSpec spec)
+    private static async Task<CountResolution> TryResolveCountAsync(StdoutBuffer stdout, string cwd, GateSpec spec)
     {
         string? last;
         lock (stdout.Lock)
@@ -464,7 +479,7 @@ internal static class Gate
             return new CountResolution(Count: null, ReportPath: null, Error: $"report path regex did not match the last stdout line '{Trim(last)}'");
         }
 
-        if (reportPath is null)
+        if (string.IsNullOrWhiteSpace(reportPath))
         {
             return new CountResolution(Count: null, ReportPath: null, Error: "report path was empty");
         }
@@ -479,13 +494,13 @@ internal static class Gate
             return new CountResolution(Count: null, ReportPath: null, Error: $"report path '{reportPath}' is invalid: {ex.Message}");
         }
 
-        return TryReadReportFile(full, spec.CountPath);
+        return await TryReadReportFileAsync(full, spec.CountPath).ConfigureAwait(false);
     }
 
     /// <summary>
     /// The first usable capture in <paramref name="m"/>: group 1; otherwise the first named group
-    /// other than 0 and 1. Returns null when there is no usable capture (so the caller can produce an
-    /// "empty" or "no capture group" error).
+    /// other than 0 and 1. Returns the empty string when every capture is empty or whitespace (so the
+    /// caller can produce a "report path was empty" error before resolving it as the working directory).
     /// </summary>
     private static string? ExtractReportPath(Match m)
     {
@@ -513,25 +528,23 @@ internal static class Gate
             }
         }
 
-        return null;
+        return string.Empty;
     }
 
-    private static CountResolution TryReadReportFile(string full, string countPath)
+    private static async Task<CountResolution> TryReadReportFileAsync(string full, string countPath)
     {
-        if (!File.Exists(full))
+        // The report path is a path the gate (a worker-controlled process) prints. Read it through
+        // the same guarded reader the trust check uses: a planted symlink to /dev/zero would
+        // otherwise run the launcher out of memory; a FIFO at the path blocks the read forever.
+        // Refusals become a `CountResolution` error so the gate reports `error` with a precise
+        // message naming the path.
+        BoundedReadResult read = await BoundedReadReportAsync(full).ConfigureAwait(false);
+        if (read.Error is not null)
         {
-            return new CountResolution(Count: null, ReportPath: full, Error: $"report file '{full}' does not exist");
+            return new CountResolution(Count: null, ReportPath: full, Error: read.Error);
         }
 
-        string text;
-        try
-        {
-            text = File.ReadAllText(full, Json.Utf8);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return new CountResolution(Count: null, ReportPath: full, Error: $"report file '{full}' could not be read: {ex.Message}");
-        }
+        string text = read.Text!;
 
         JsonNode root;
         try
@@ -559,6 +572,271 @@ internal static class Gate
         }
 
         return new CountResolution(Count: arr.Count, ReportPath: full, Error: null);
+    }
+
+    /// <summary>
+    /// Per-file time bound for reading the gate's report. A FIFO at the report path parks the read
+    /// in the kernel until a writer appears; the bound matches the trust check's open-read timeout so
+    /// the gate and the trust check fail in a comparable time.
+    /// </summary>
+    private static readonly TimeSpan _reportReadTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Largest report the launcher will read into memory. Reports larger than this are refused (a
+    /// gate that genuinely needs more can stream; a planted symlink to <c>/dev/zero</c> cannot).
+    /// </summary>
+    private const long MaxReportBytes = 64L * 1024L * 1024L;
+
+    private sealed record BoundedReadResult(string? Text, string? Error);
+
+    /// <summary>
+    /// Reads a regular file the gate named on its last stdout line. Refuses symlinks (a worker can
+    /// plant one to swap the read into <c>/dev/</c>, <c>/proc/</c>, <c>/sys/</c>, a FIFO, or
+    /// elsewhere), targets that are not a regular file (including pseudo-filesystem entries), reads
+    /// that exceed the per-file time bound or byte cap, and any I/O / permission failure. Each
+    /// refusal is a precise <c>CountResolution</c> error naming <paramref name="full"/>.
+    /// </summary>
+    private static async Task<BoundedReadResult> BoundedReadReportAsync(string full)
+    {
+        BoundedReadResult? preflight = PreflightReport(full);
+        if (preflight is not null)
+        {
+            return preflight;
+        }
+
+        using CancellationTokenSource cts = new(_reportReadTimeout, TimeProvider.System);
+        CancellationToken token = cts.Token;
+
+        // Abandoned-task fault observation: see the equivalent comment in GateTrust's HashFileAsync. A read
+        // that gets stuck on a FIFO open() leak is acceptable for a short-lived launcher, but a fault
+        // surfaced after we have returned must not surface later as an unobserved exception.
+        // StartNew hands the open off to the thread pool, otherwise the FileStream ctor can park the
+        // caller's thread on a FIFO with no writer and the WhenAny timer never gets a chance to win.
+        Task<BoundedReadResult> readTask = ReadOffPoolAsync(full, token);
+        _ = readTask.ContinueWith(static t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
+        Task<BoundedReadResult> timer = BoundedReadTimeoutAsync(_reportReadTimeout, TimeProvider.System, token);
+        Task<BoundedReadResult> winner = await Task.WhenAny(readTask, timer).ConfigureAwait(false);
+        if (winner == readTask)
+        {
+            return await readTask.ConfigureAwait(false);
+        }
+
+        return new BoundedReadResult(Text: null, Error: $"report file '{full}' could not be read in time");
+    }
+
+    private static BoundedReadResult? PreflightReport(string full)
+    {
+        if (!File.Exists(full))
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' does not exist");
+        }
+
+        return CheckLinkReport(full) ?? CheckAttributesReport(full);
+    }
+
+    private static BoundedReadResult? CheckLinkReport(string full)
+    {
+        // A symlink at the report path is refused outright so a worker cannot swap the read into
+        // another file (the gate, after all, just told us where to look).
+        string? linkTarget;
+        try
+        {
+            linkTarget = new FileInfo(full).LinkTarget;
+        }
+        catch (Exception ex) when (ex is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PlatformNotSupportedException
+            or ObjectDisposedException
+            or InvalidOperationException)
+        {
+            // ReadLink failed for an I/O / platform reason; treat as a non-link and rely on the
+            // attribute / open checks below to classify it.
+            return null;
+        }
+
+        return linkTarget is not null
+            ? new BoundedReadResult(Text: null, Error: $"report file '{full}' is not a regular file")
+            : null;
+    }
+
+    private static BoundedReadResult? CheckAttributesReport(string full)
+    {
+        // Attribute pre-check: directories, devices, reparse points, and /dev/, /proc/, /sys/ paths
+        // are not regular files the launcher reads.
+        FileAttributes attrs;
+        try
+        {
+            attrs = File.GetAttributes(full);
+        }
+        catch (Exception ex) when (ex is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PlatformNotSupportedException
+            or ObjectDisposedException
+            or InvalidOperationException)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' is not a regular file: {ex.Message}");
+        }
+
+        if (attrs.HasFlag(FileAttributes.Directory)
+            || attrs.HasFlag(FileAttributes.Device)
+            || attrs.HasFlag(FileAttributes.ReparsePoint))
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' is not a regular file");
+        }
+
+        // Pseudo-filesystem refusal: /dev/, /proc/, /sys/ are kernel-generated surfaces. /dev/null
+        // passes every other guard and would otherwise read empty content; refuse at the path.
+        return full.StartsWith("/dev/", StringComparison.Ordinal)
+            || full.StartsWith("/proc/", StringComparison.Ordinal)
+            || full.StartsWith("/sys/", StringComparison.Ordinal)
+            ? new BoundedReadResult(Text: null, Error: $"report file '{full}' is not a regular file")
+            : null;
+    }
+
+    private static async Task<BoundedReadResult> ReadReportCoreAsync(string full, CancellationToken token)
+    {
+        try
+        {
+            return await ReadOpenReportAsync(full, token).ConfigureAwait(false);
+        }
+        catch (OpenReportFailedException ex)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' could not be read: {ex.Message}");
+        }
+    }
+
+    private static async Task<BoundedReadResult> ReadOpenReportAsync(string full, CancellationToken token)
+    {
+        FileStream fs = OpenReportOrThrow(full);
+        await using (fs.ConfigureAwait(false))
+        {
+            return await DrainReportStreamAsync(full, fs, token).ConfigureAwait(false);
+        }
+    }
+
+    private static FileStream OpenReportOrThrow(string full)
+    {
+        // FileMode.Open + FileAccess.Read throws on a missing or unreadable file; the caller maps
+        // the exception into a `report file could not be read` sentinel after the `using`
+        // disposes any half-open handle.
+        try
+        {
+            return new(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            throw new OpenReportFailedException(ex.Message);
+        }
+    }
+
+    private sealed class OpenReportFailedException : Exception
+    {
+        public OpenReportFailedException(string message) : base(message) { }
+    }
+
+    private static async Task<BoundedReadResult> DrainReportStreamAsync(string full, FileStream fs, CancellationToken token)
+    {
+        BoundedReadResult? preflight = PreflightReportStream(full, fs);
+        if (preflight is not null)
+        {
+            return preflight;
+        }
+
+        byte[] buffer = new byte[80 * 1024];
+        MemoryStream ms = new();
+        while (true)
+        {
+            BoundedReadResult? chunk = await ReadReportChunkAsync(full, fs, buffer, ms, token).ConfigureAwait(false);
+            if (chunk is not null)
+            {
+                return chunk;
+            }
+
+            if (ms.Length > MaxReportBytes)
+            {
+                return new BoundedReadResult(Text: null, Error: $"report file '{full}' is too large");
+            }
+        }
+    }
+
+    private static BoundedReadResult? PreflightReportStream(string full, FileStream fs)
+    {
+        // CanSeek guards FIFOs, sockets, and character devices on .NET 8 (UnixFileMode.TypeMask lands
+        // in .NET 9 and is not available here).
+        if (!fs.CanSeek)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' is not a regular file");
+        }
+
+        return fs.Length > MaxReportBytes
+            ? new BoundedReadResult(Text: null, Error: $"report file '{full}' is too large")
+            : null;
+    }
+
+    private static async Task<BoundedReadResult?> ReadReportChunkAsync(string full, FileStream fs, byte[] buffer, MemoryStream ms, CancellationToken token)
+    {
+        int n;
+        try
+        {
+            n = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' could not be read in time");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' could not be read: {ex.Message}");
+        }
+
+        if (n is 0)
+        {
+            return DecodeReportBuffer(full, ms);
+        }
+
+        await ms.WriteAsync(buffer.AsMemory(0, n), token).ConfigureAwait(false);
+        return ms.Length > MaxReportBytes
+            ? new BoundedReadResult(Text: null, Error: $"report file '{full}' is too large")
+            : null;
+    }
+
+    private static BoundedReadResult DecodeReportBuffer(string full, MemoryStream ms)
+    {
+        try
+        {
+            string text = Json.Utf8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
+            return new BoundedReadResult(Text: text, Error: null);
+        }
+        catch (Exception ex) when (ex is System.Text.DecoderFallbackException)
+        {
+            return new BoundedReadResult(Text: null, Error: $"report file '{full}' is not valid UTF-8: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// A timed-out delay that returns a <see cref="BoundedReadResult"/> when the limit is reached. Used
+    /// alongside <see cref="ReadReportCoreAsync"/> in <see cref="Task.WhenAny{TResult}(Task{TResult}[])"/>
+    /// to bound how long the report read can run.
+    /// </summary>
+    private static async Task<BoundedReadResult> BoundedReadTimeoutAsync(TimeSpan timeout, TimeProvider timeProvider, CancellationToken token)
+    {
+        await Task.Delay(timeout, timeProvider, token).ConfigureAwait(false);
+        return new BoundedReadResult(Text: null, Error: "timeout");
+    }
+
+    private static async Task<BoundedReadResult> ReadOffPoolAsync(string full, CancellationToken token)
+    {
+        // StartNew with Func<object, Task<...>> returns Task<Task<...>> and takes a TaskScheduler
+        // (satisfies CA2008/VSTHRD105). Unwrap exposes the inner Task<BoundedReadResult>; awaiting
+        // it gives the inner result, the async method's signature wraps that back into Task<...>
+        // for the caller's WhenAny with a timer.
+        Task<Task<BoundedReadResult>> wrapped = Task.Factory.StartNew(async _ => await ReadReportCoreAsync(full, token).ConfigureAwait(false), state: null, token, TaskCreationOptions.RunContinuationsAsynchronously, TaskScheduler.Default);
+        return await wrapped.Unwrap().ConfigureAwait(false);
     }
 
     private static GateResult BuildResult(int exitCode, GateSpec spec, string feedback, CountResolution resolution, TimeSpan duration)
@@ -599,17 +877,19 @@ internal static class Gate
             ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
             ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
         };
-        await File.WriteAllTextAsync(path, o.ToJsonString(Json.Indented), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(path, o.ToJsonString(Json.Indented)).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Records an error gate result for the trust-boundary case (a worker changed a file the gate
-    /// trusts). Writes <c>gate.json</c> and returns the <see cref="GateResult"/> that the chain decision
-    /// uses.
+    /// trusts, or the gate ended with bad state). Writes <c>gate.json</c> and returns the
+    /// <see cref="GateResult"/> that the chain decision uses. <c>ExitCode</c> is <c>-1</c> because
+    /// no gate process ran (mirrors the build-start failure / timeout / cancellation codepath, which
+    /// also records <c>-1</c>; a trust violation must not be reported as a gate exit code).
     /// </summary>
     internal static async Task<GateResult> WriteFailureAsync(string runDir, GateSpec spec, string errorMessage)
     {
-        GateResult result = new(Outcome: "error", ExitCode: 5, Count: null, ReportPath: null,
+        GateResult result = new(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
             Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero);
         await WriteGateJsonAsync(Path.Combine(runDir, "gate.json"), result, spec, envNames: []).ConfigureAwait(false);
         return result;

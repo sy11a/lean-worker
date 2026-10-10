@@ -347,4 +347,32 @@ internal static class Launcher
         }
         finally { try { File.Delete(temp); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { } }
     }
+
+    /// <summary>
+    /// Deletes anything at <paramref name="path"/> (a file, a dangling link, an existing symlink) and
+    /// writes <paramref name="content"/> in its place. A worker can plant a symlink at the run-dir
+    /// writes the launcher owns; <see cref="File.WriteAllTextAsync(string,string,System.Text.Encoding,CancellationToken)"/>
+    /// follows the symlink and ends up writing outside the run directory. Removing the entry first
+    /// makes the write target the regular file the launcher just created.
+    /// </summary>
+    internal static async Task WritePlainAsync(string path, string content)
+    {
+        try { File.Delete(path); }
+        catch (Exception ex) when (ex is DirectoryNotFoundException or IOException or UnauthorizedAccessException) { }
+
+        await File.WriteAllTextAsync(path, content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for writing like <c>new StreamWriter(path, append: false, encoding)</c>,
+    /// but after removing any entry already at <paramref name="path"/>. See
+    /// <see cref="WritePlainAsync"/> for the rationale (a planted symlink must not be followed).
+    /// </summary>
+    internal static StreamWriter CreateWriter(string path, System.Text.Encoding encoding)
+    {
+        try { File.Delete(path); }
+        catch (Exception ex) when (ex is DirectoryNotFoundException or IOException or UnauthorizedAccessException) { }
+
+        return new StreamWriter(path, append: false, encoding);
+    }
 }

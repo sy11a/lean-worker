@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can
@@ -63,8 +63,9 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         int maxRounds = ReadPositiveInt(gate, "maxRounds", 5, "profile gate.maxRounds");
         decimal? maxTotalUsd = ReadMaxTotalUsd(gate);
         List<string> env = ReadEnv(gate);
+        List<string> trust = ReadTrust(gate);
 
-        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env);
+        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env, trust);
     }
 
     private static List<string> ReadCommand(JsonObject gate, string gateWorkingDirectory)
@@ -83,27 +84,39 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
                 throw new LaunchException("profile gate.command must be a non-empty array of non-empty strings");
             }
 
-            string resolved;
-            try
+            // The directory refusal is an operator rule on later arguments; argv[0] without a directory
+            // separator is a bare command the runner resolves on PATH at start (it may resolve to a
+            // directory like `dotnet/` when the working directory happens to contain one).
+            if (i is not 0 || HasDirectorySeparator(s))
             {
-                resolved = Path.IsPathRooted(s)
-                    ? Path.GetFullPath(s)
-                    : Path.GetFullPath(Path.Combine(gateWorkingDirectory, s));
-            }
-            catch (ArgumentException ex)
-            {
-                throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is invalid: {ex.Message}");
-            }
+                string resolved;
+                try
+                {
+                    resolved = Path.IsPathRooted(s)
+                        ? Path.GetFullPath(s)
+                        : Path.GetFullPath(Path.Combine(gateWorkingDirectory, s));
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is invalid: {ex.Message}");
+                }
 
-            if (Directory.Exists(resolved))
-            {
-                throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is a directory: {resolved}");
+                if (Directory.Exists(resolved))
+                {
+                    throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is a directory: {resolved}");
+                }
             }
 
             command.Add(s);
         }
 
         return command;
+    }
+
+    private static bool HasDirectorySeparator(string s)
+    {
+        return s.Contains(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+            || s.Contains(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal);
     }
 
     private static Regex ReadReportRegex(JsonObject gate)
@@ -224,5 +237,61 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         }
 
         return env;
+    }
+
+    /// <summary>
+    /// Reads <c>gate.trust</c>: an optional list of repo-relative paths or globs the operator wants
+    /// added to the trust set (the same paths the gate chain hashes). Entries are kept for
+    /// <see cref="GateTrust.CollectPaths"/> to resolve relative to the git root (or the gate working
+    /// directory when not in git) at start time, exactly like the gate command's arguments.
+    /// </summary>
+    private static List<string> ReadTrust(JsonObject gate)
+    {
+        if (!gate.TryGetPropertyValue("trust", out JsonNode? n) || n is null)
+        {
+            return [];
+        }
+
+        if (n is not JsonArray arr)
+        {
+            throw new LaunchException("profile gate.trust must be an array of repo-relative paths or globs");
+        }
+
+        List<string> trust = new(arr.Count);
+        for (int i = 0; i < arr.Count; i++)
+        {
+            JsonNode? item = arr[i];
+            // A non-empty string is required so the matcher can rely on the prefix-relative shape
+            // (an empty entry would match every directory above the root, which is not what the
+            // operator asked for).
+            if (item is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
+            {
+                throw new LaunchException($"profile gate.trust[{i.ToString(CultureInfo.InvariantCulture)}] must be a non-empty string");
+            }
+
+            string normalized = s.Replace('\\', '/');
+            // Absolute entries (any flavour of root) defeat the point of repo-relative paths: they
+            // cannot cross the repo boundary on their own, but a worker that follows an absolute
+            // path has a free channel for changing arbitrary system files. Reject up-front so the
+            // error is at profile-load time, not during a trust check.
+            if (Path.IsPathRooted(normalized) || normalized.StartsWith('/'))
+            {
+                throw new LaunchException($"profile gate.trust[{i.ToString(CultureInfo.InvariantCulture)}] must be a relative path: {s}");
+            }
+
+            // No parent traversal: ".." would let an operator accidentally (or via a malformed
+            // entry) trust files outside the repo, defeating the boundary.
+            foreach (string segment in normalized.Split('/'))
+            {
+                if (segment is "..")
+                {
+                    throw new LaunchException($"profile gate.trust[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
+                }
+            }
+
+            trust.Add(normalized);
+        }
+
+        return trust;
     }
 }

@@ -742,29 +742,39 @@ internal sealed class LaunchRun
             return;
         }
 
-        // Trust boundary: hash the gate's trusted inputs again and refuse the gate if anything differs
-        // from the snapshot taken before the worker ran. A nonregular or unreadable state in the
-        // after-worker snapshot is itself a trust violation (a worker may have left a FIFO/device in
-        // place of a file the gate reads), so the violation check covers that case first.
+        // Trust boundary (pre-gate): a worker may have swapped a trusted input between the
+        // before-worker snapshot and now. The check refuses the gate with a precise list of changed
+        // paths so the chain ends in `error` instead of running the gate against tampered inputs.
         if (_gateTrustBefore is not null)
         {
-            GateTrust.Snapshot after = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
-            string? badState = FindBadState(after);
-            if (badState is not null)
+            List<string> preGateChanges = await CheckTrustedInputsChangedAsync().ConfigureAwait(false);
+            if (preGateChanges is { Count: > 0 })
             {
-                await FinishTrustViolationAsync([badState]).ConfigureAwait(false);
-                return;
-            }
-
-            List<string> changed = GateTrust.Changed(_gateTrustBefore, after);
-            if (changed.Count > 0)
-            {
-                await FinishTrustViolationAsync(changed).ConfigureAwait(false);
+                await FinishTrustViolationAsync(preGateChanges, "the worker changed files the gate trusts: ").ConfigureAwait(false);
                 return;
             }
         }
 
         Gate.GateResult result = await Gate.RunAsync(_gate, RunDir, CancellationToken.None).ConfigureAwait(false);
+
+        // Trust boundary (post-gate, finding 2): a process the worker detached can survive the
+        // worker's exit and rewrite a trusted file between the pre-gate check and the gate's end.
+        // The pre-gate check is not enough; we hash a third time after the gate exits and refuse
+        // the chain on any difference from the before-worker snapshot (or a bad state).
+        //
+        // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a file between the
+        // third hash and the launcher's write of gate.json/summary.json can still escape. Killing
+        // the worker's process group would close that gap; the launcher does not take that step.
+        if (_gateTrustBefore is not null)
+        {
+            List<string> postGateChanges = await CheckTrustedInputsChangedAsync().ConfigureAwait(false);
+            if (postGateChanges is { Count: > 0 })
+            {
+                await FinishTrustViolationAsync(postGateChanges, "trusted files changed while the gate ran: ").ConfigureAwait(false);
+                return;
+            }
+        }
+
         GateResult = result;
 
         List<int> countsIncludingThis = GateContext is null
@@ -784,10 +794,22 @@ internal sealed class LaunchRun
         LastGate = new GateOutcome(decision, result, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason);
     }
 
-    private async Task FinishTrustViolationAsync(List<string> changed)
+    private async Task<List<string>> CheckTrustedInputsChangedAsync()
+    {
+        GateTrust.Snapshot after = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
+        string? badState = FindBadState(after);
+        if (badState is not null)
+        {
+            return [badState];
+        }
+
+        return GateTrust.Changed(_gateTrustBefore!, after);
+    }
+
+    private async Task FinishTrustViolationAsync(List<string> changed, string prefix)
     {
         GateSpec gate = NonNull(_gate);
-        string message = $"the worker changed files the gate trusts: {string.Join(", ", changed)}";
+        string message = $"{prefix}{string.Join(", ", changed)}";
         Gate.GateResult result = await Gate.WriteFailureAsync(RunDir, gate, message).ConfigureAwait(false);
         GateResult = result;
 
@@ -805,13 +827,29 @@ internal sealed class LaunchRun
     /// <summary>
     /// Returns the first path whose state in <paramref name="after"/> is <c>nonregular</c> or
     /// <c>unreadable: ...</c>, or null when no such entry exists. The chain treats any such entry in
-    /// the after-worker snapshot as a trust violation regardless of the before-worker state.
+    /// the after-worker snapshot as a trust violation regardless of the before-worker state. Absent
+    /// entries (the sentinel <c>-</c>) are not a violation on their own: a config file that did not
+    /// exist before the worker and still does not exist is not a tampering signal.
     /// </summary>
     private static string? FindBadState(GateTrust.Snapshot after)
     {
         foreach (KeyValuePair<string, string> kv in after.Hashes)
         {
-            if (kv.Value is "nonregular" || kv.Value.StartsWith("unreadable", StringComparison.Ordinal))
+            if (kv.Value is "-")
+            {
+                continue;
+            }
+
+            // Values are "<target>|<sha-or-sentinel>", but "unreadable: dangling link" omits the
+            // target (the target is unreachable, so we record under the link's own path).
+            if (kv.Value is "unreadable: dangling link")
+            {
+                return kv.Key;
+            }
+
+            int sep = kv.Value.IndexOf('|', StringComparison.Ordinal);
+            string right = sep >= 0 ? kv.Value[(sep + 1)..] : kv.Value;
+            if (right is "nonregular" || right.StartsWith("unreadable", StringComparison.Ordinal))
             {
                 return kv.Key;
             }
@@ -933,8 +971,8 @@ internal sealed class LaunchRun
 
     private async Task WriteSummaryAsync()
     {
-        await File.WriteAllTextAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-        await File.WriteAllTextAsync(Path.Combine(RunDir, "report.md"), _report, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented)).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(Path.Combine(RunDir, "report.md"), _report).ConfigureAwait(false);
         await File.AppendAllTextAsync(Path.Combine(_runsRoot, "runs.jsonl"), _summary.ToJsonString() + Environment.NewLine, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
 
