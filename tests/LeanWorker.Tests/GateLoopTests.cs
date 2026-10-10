@@ -295,6 +295,52 @@ public class GateLoopTests
     }
 
     [Fact]
+    public async Task A_worker_that_replaces_global_json_with_a_fifo_trips_the_trust_check_without_hangingAsync()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        const string worker = "rm -f global.json\nmkfifo global.json\n" + RunAsyncGolden.SuccessStream;
+
+        Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(
+            root, worker, _ => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "global.json"), "{}"));
+        (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(marker));
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("global.json", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_replaces_global_json_with_a_directory_trips_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        const string worker = "rm -f global.json\nmkdir global.json\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(
+            root, worker, _ => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "global.json"), "{}"));
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(marker));
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("global.json", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_worker_that_creates_nuget_config_in_the_working_directory_trips_the_trust_checkAsync()
     {
         string root = RunAsyncGolden.NewRoot();
