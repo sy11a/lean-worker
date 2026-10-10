@@ -100,9 +100,12 @@ internal sealed class LaunchRun
     public string OriginalName { get; private set; } = string.Empty;
     public GateSpec? InitialGateSpec { get; private set; }
 
-    // Trust-boundary snapshot of the files the gate treats as trusted inputs; compared against a second
-    // hash in RunGateAsync so a worker that changed one of them between rounds is caught.
-    private GateTrust.Snapshot? _gateTrustBefore;
+    // Trust boundary. Round 1 collects the fixed part of the trust set (gate.trust globs, argv file
+    // entries, the resolved gate executable, the prices file) and hashes everything before its worker;
+    // both are frozen into GateContext, and every later round compares against round 1's snapshot
+    // (before its worker, before its gate, after its gate).
+    public GateTrust.Snapshot? TrustSnapshot { get; private set; }
+    public IReadOnlyList<string>? TrustPaths { get; private set; }
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -686,18 +689,81 @@ internal sealed class LaunchRun
             return;
         }
 
-        // Hash the trusted files before the worker runs. RunGateAsync hashes them again and refuses the
-        // gate if anything changed (a worker could otherwise swap the gate command or its report path).
-        _gateTrustBefore = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
+        if (GateContext is not null)
+        {
+            // Round N+1: compare against round 1's before-worker snapshot and reuse its fixed path
+            // list, so whatever a tampering process left on disk when this round started cannot
+            // become the new baseline. Only the walks meant to catch new files (runs root, config
+            // walk) are re-collected, inside RunGateAsync's checks.
+            TrustSnapshot = GateContext.TrustSnapshot;
+            TrustPaths = GateContext.TrustPaths;
+            return;
+        }
+
+        // Round 1: hash the trusted files before the worker runs. The fixed part of the list
+        // (gate.trust globs, argv entries, the resolved executable) is resolved once and reused for
+        // every later hash in the whole chain. RunGateAsync hashes again before and after the gate
+        // and refuses the gate if anything changed (a worker could otherwise swap the gate command
+        // or its report path).
+        TrustPaths = await CollectFixedPathsAsync().ConfigureAwait(false);
+        TrustSnapshot = await GateTrust.HashAsync(await CollectCheckPathsAsync(ReportPathExclusions()).ConfigureAwait(false)).ConfigureAwait(false);
     }
 
-    private async Task<List<string>> CollectGateTrustPathsAsync()
+    /// <summary>
+    /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
+    /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
+    /// once, before round 1's worker, so glob matches and argv entries never pick up files the
+    /// worker or the gate create later.
+    /// </summary>
+    private async Task<List<string>> CollectFixedPathsAsync()
     {
         GateSpec gate = NonNull(_gate);
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
-        return GateTrust.CollectPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile);
+        return GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile);
+    }
+
+    /// <summary>
+    /// The paths for one trust check: the chain's fixed list plus the volatile walks re-collected now
+    /// (runs-root files and the config-file walk, which are meant to catch new files), minus the
+    /// report paths the gate named — gate output, not a trusted input.
+    /// </summary>
+    private async Task<List<string>> CollectCheckPathsAsync(IReadOnlySet<string> exclusions)
+    {
+        string cwd = Directory.GetCurrentDirectory();
+        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
+        string root = gitRoot ?? cwd;
+        List<string> paths = [];
+        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        foreach (string path in NonNull(TrustPaths).Concat(GateTrust.CollectVolatilePaths(_runsRoot, cwd, root)))
+        {
+            if (!exclusions.Contains(path) && dedupe.Add(path))
+            {
+                paths.Add(path);
+            }
+        }
+
+        return paths;
+    }
+
+    /// <summary>
+    /// The report paths the gate named, excluded from trust checks: they are gate output, not a
+    /// trusted input. The gate (re)wrote its report while it ran, and a later round must not treat
+    /// the previous round's gate output as a worker change against round 1's snapshot.
+    /// </summary>
+    private static IReadOnlySet<string> ReportPathExclusions(params string?[] reportPaths)
+    {
+        HashSet<string> exclusions = new(StringComparer.Ordinal);
+        foreach (string? reportPath in reportPaths)
+        {
+            if (reportPath is { Length: > 0 })
+            {
+                exclusions.Add(reportPath);
+            }
+        }
+
+        return exclusions;
     }
 
     private string Status()
@@ -747,39 +813,14 @@ internal sealed class LaunchRun
             return;
         }
 
-        // Trust boundary (pre-gate): a worker may have swapped a trusted input between the
-        // before-worker snapshot and now. The check refuses the gate with a precise list of changed
-        // paths so the chain ends in `error` instead of running the gate against tampered inputs.
-        if (_gateTrustBefore is not null)
+        (string? violation, Gate.GateResult? gateRan) = await RunTrustedGateAsync().ConfigureAwait(false);
+        if (violation is not null)
         {
-            List<string> preGateChanges = await CheckTrustedInputsChangedAsync().ConfigureAwait(false);
-            if (preGateChanges is { Count: > 0 })
-            {
-                await FinishTrustViolationAsync(preGateChanges, "the worker changed files the gate trusts: ").ConfigureAwait(false);
-                return;
-            }
+            await FinishTrustViolationAsync(violation, gateRan).ConfigureAwait(false);
+            return;
         }
 
-        Gate.GateResult result = await Gate.RunAsync(_gate, RunDir, CancellationToken.None).ConfigureAwait(false);
-
-        // Trust boundary (post-gate, finding 2): a process the worker detached can survive the
-        // worker's exit and rewrite a trusted file between the pre-gate check and the gate's end.
-        // The pre-gate check is not enough; we hash a third time after the gate exits and refuse
-        // the chain on any difference from the before-worker snapshot (or a bad state).
-        //
-        // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a file between the
-        // third hash and the launcher's write of gate.json/summary.json can still escape. Killing
-        // the worker's process group would close that gap; the launcher does not take that step.
-        if (_gateTrustBefore is not null)
-        {
-            List<string> postGateChanges = await CheckTrustedInputsChangedAsync().ConfigureAwait(false);
-            if (postGateChanges is { Count: > 0 })
-            {
-                await FinishTrustViolationAsync(postGateChanges, "trusted files changed while the gate ran: ").ConfigureAwait(false);
-                return;
-            }
-        }
-
+        Gate.GateResult result = gateRan!;
         GateResult = result;
 
         List<int> countsIncludingThis = GateContext is null
@@ -799,23 +840,96 @@ internal sealed class LaunchRun
         LastGate = new GateOutcome(decision, result, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason);
     }
 
-    private async Task<List<string>> CheckTrustedInputsChangedAsync()
+    /// <summary>
+    /// Runs the gate between the two trust checks. Both compare against round 1's before-worker
+    /// snapshot, never against a fresh baseline: a later round must not accept whatever is on disk
+    /// when it starts, or a tampering process that survives into it would hide. Returns the trust
+    /// violation message (null when clean) and the gate result when the gate ran.
+    /// </summary>
+    private async Task<(string? Violation, Gate.GateResult? GateRan)> RunTrustedGateAsync()
     {
-        GateTrust.Snapshot after = await GateTrust.HashAsync(await CollectGateTrustPathsAsync().ConfigureAwait(false)).ConfigureAwait(false);
-        string? badState = FindBadState(after);
-        if (badState is not null)
+        string? violation = null;
+        Gate.GateResult? gateRan = null;
+        try
         {
-            return [badState];
+            // Pre-gate: a worker may have swapped a trusted input between round 1's before-worker
+            // snapshot and now. The check refuses the gate with a precise list of changed paths so
+            // the chain ends in `error` instead of running the gate against tampered inputs.
+            if (TrustSnapshot is not null)
+            {
+                violation = await TrustViolationMessageAsync(ReportPathExclusions(GateContext?.Feedback.ReportPath),
+                    "the worker changed files the gate trusts: ").ConfigureAwait(false);
+            }
+
+            if (violation is null)
+            {
+                Gate.GateResult result = await Gate.RunAsync(NonNull(_gate), RunDir, CancellationToken.None).ConfigureAwait(false);
+                gateRan = result;
+
+                // Post-gate: a process the worker detached can survive the worker's exit and rewrite
+                // a trusted file between the pre-gate check and the gate's end. The pre-gate check
+                // is not enough; we hash a third time after the gate exits and refuse the chain on
+                // any difference from round 1's before-worker snapshot (or a bad state). The report
+                // file the gate named is excluded: it is gate output, rewritten by the gate itself.
+                //
+                // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted
+                // file between two hashes and restores it before the next hash escapes the check.
+                // Killing the worker's process group would shrink that window; the launcher does
+                // not take that step.
+                if (TrustSnapshot is not null)
+                {
+                    violation = await TrustViolationMessageAsync(ReportPathExclusions(result.ReportPath, GateContext?.Feedback.ReportPath),
+                        "trusted files changed while the gate ran: ").ConfigureAwait(false);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A trust check that cannot read the tree fails closed as a trust violation (outcome
+            // `error`, exit 5) rather than crashing the launch with exit 2.
+            violation = $"the trusted inputs could not be checked: {ex.Message}";
         }
 
-        return GateTrust.Changed(_gateTrustBefore!, after);
+        return (violation, gateRan);
     }
 
-    private async Task FinishTrustViolationAsync(List<string> changed, string prefix)
+    /// <summary>
+    /// Runs one trust check against round 1's before-worker snapshot: compare the path sets first
+    /// (a file that appeared or vanished is reported before anything is hashed), then hash the
+    /// stable list and stop at the first entry that differs or sits in a bad state, so a planted
+    /// FIFO cannot cost a timeout per entry. Returns null when the tree is clean; otherwise the
+    /// error message for the chain's trust violation.
+    /// </summary>
+    private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string changedPrefix)
+    {
+        GateTrust.Snapshot before = NonNull(TrustSnapshot);
+        List<string> paths = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
+
+        List<string> setDiff = GateTrust.SetDifferences(before, paths);
+        if (setDiff.Count > 0)
+        {
+            return $"{changedPrefix}{string.Join(", ", setDiff)}";
+        }
+
+        GateTrust.TrustDiff? diff = await GateTrust.FirstDiffAsync(before, paths).ConfigureAwait(false);
+        if (diff is null)
+        {
+            return null;
+        }
+
+        // A bad state that round 1's snapshot already had is a configuration problem, not something
+        // the worker or the gate did: word the error accordingly instead of accusing a change.
+        return diff.IsBad && before.Hashes.TryGetValue(diff.Path, out string? expected) && expected == diff.Value
+            ? $"trusted path '{diff.Path}' is not a regular file"
+            : $"{changedPrefix}{diff.Path}";
+    }
+
+    private async Task FinishTrustViolationAsync(string message, Gate.GateResult? gateRan = null)
     {
         GateSpec gate = NonNull(_gate);
-        string message = $"{prefix}{string.Join(", ", changed)}";
-        Gate.GateResult result = await Gate.WriteFailureAsync(RunDir, gate, message).ConfigureAwait(false);
+        // When the gate already ran, keep its real exit code, count and duration in gate.json and
+        // the summary; replace only the outcome and the error.
+        Gate.GateResult result = await Gate.WriteFailureAsync(RunDir, gate, message, gateRan).ConfigureAwait(false);
         GateResult = result;
 
         List<int> countsIncludingThis = GateContext is null
@@ -827,40 +941,6 @@ internal sealed class LaunchRun
         Counts = countsIncludingThis;
         ChainCostUsd = chainCostIncludingThis;
         LastGate = new GateOutcome(GateChain.Error, result, RunDir, countsIncludingThis, chainCostIncludingThis, StuckReason: null);
-    }
-
-    /// <summary>
-    /// Returns the first path whose state in <paramref name="after"/> is <c>nonregular</c> or
-    /// <c>unreadable: ...</c>, or null when no such entry exists. The chain treats any such entry in
-    /// the after-worker snapshot as a trust violation regardless of the before-worker state. Absent
-    /// entries (the sentinel <c>-</c>) are not a violation on their own: a config file that did not
-    /// exist before the worker and still does not exist is not a tampering signal.
-    /// </summary>
-    private static string? FindBadState(GateTrust.Snapshot after)
-    {
-        foreach (KeyValuePair<string, string> kv in after.Hashes)
-        {
-            if (kv.Value is "-")
-            {
-                continue;
-            }
-
-            // Values are "<target>|<sha-or-sentinel>", but "unreadable: dangling link" omits the
-            // target (the target is unreachable, so we record under the link's own path).
-            if (kv.Value is "unreadable: dangling link")
-            {
-                return kv.Key;
-            }
-
-            int sep = kv.Value.IndexOf('|', StringComparison.Ordinal);
-            string right = sep >= 0 ? kv.Value[(sep + 1)..] : kv.Value;
-            if (right is "nonregular" || right.StartsWith("unreadable", StringComparison.Ordinal))
-            {
-                return kv.Key;
-            }
-        }
-
-        return null;
     }
 
     private async Task ComputeSummaryStatsAsync()

@@ -41,6 +41,8 @@ internal static class Launcher
         int code = await run.RunAsync().ConfigureAwait(false);
         while (run.LastGate is { Decision: GateChain.Continue })
         {
+            // The next round compares against round 1's before-worker trust snapshot and its fixed
+            // path list, so nothing that changed on disk since then can become the new baseline.
             GateContext nextContext = new(
                 ChainId: run.ChainId,
                 Round: run.Round + 1,
@@ -49,7 +51,9 @@ internal static class Launcher
                 OriginalTask: run.OriginalTask,
                 OriginalName: run.OriginalName,
                 Feedback: run.LastGate.Result,
-                Spec: run.InitialGateSpec ?? throw new LaunchException("gate chain has no spec"));
+                Spec: run.InitialGateSpec ?? throw new LaunchException("gate chain has no spec"),
+                TrustSnapshot: run.TrustSnapshot ?? throw new LaunchException("gate chain has no trust snapshot"),
+                TrustPaths: run.TrustPaths ?? throw new LaunchException("gate chain has no trust paths"));
             run = new LaunchRun(o, gateContext: nextContext);
             code = await run.RunAsync().ConfigureAwait(false);
         }

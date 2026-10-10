@@ -23,9 +23,8 @@
 //
 // .NET 8 has no portable file-type check (UnixFileMode.TypeMask lands in .NET 9), so the guard on this
 // runtime is layered:
-//   - the LinkTarget check at the top of HashOneAsync (a path whose LinkTarget is non-null and whose
-//     target does not exist as a file or directory is a dangling link → "unreadable: dangling link"
-//     under the link path)
+//   - the ResolveLinkTarget check at the top of HashOneAsync (a path whose final link target does not
+//     exist as a file or directory is a dangling link → "unreadable: dangling link" under the link path)
 //   - the final-target refusal for /dev/, /proc/, /sys/ (kernel surfaces whose contents are generated
 //     on read; /dev/null passes every other guard and would otherwise hash the empty SHA-256)
 //   - the FileAttributes pre-check below (catches directories, devices where reported, reparse points)
@@ -111,24 +110,10 @@ internal static class GateTrust
         string key = path;
         try
         {
-            string? linkTarget = TryReadLinkTarget(path);
-            string target = ResolveLinkTarget(path, linkTarget);
-
-            // Dangling link: the path is a symlink whose target does not exist as a file or a
-            // directory. Record the sentinel under the link path so the error message names a
-            // path the operator actually configured.
-            if (linkTarget is not null && !PathExists(target))
+            (string? sentinel, string target) = ResolveFinal(path);
+            if (sentinel is not null)
             {
-                hashes[key] = "unreadable: dangling link";
-                return;
-            }
-
-            // Absent path: nothing at the path (and not a link whose target would resolve). The
-            // sentinel is "-" so the trust check can ignore absent entries rather than treating
-            // every missing config file as a kernel failure.
-            if (linkTarget is null && !PathExists(target))
-            {
-                hashes[key] = "-";
+                hashes[key] = sentinel;
                 return;
             }
 
@@ -160,46 +145,49 @@ internal static class GateTrust
         }
     }
 
-    private static string? TryReadLinkTarget(string path)
+    /// <summary>
+    /// Resolves <paramref name="path"/> through its symlink chain. Returns a sentinel when the entry
+    /// must not be hashed (a dangling link, or an absent path — <c>-</c>), or null with the final
+    /// target path when hashing can proceed.
+    /// </summary>
+    private static (string? Sentinel, string Target) ResolveFinal(string path)
     {
+        // ReadLink first (a dangling link still reports its target), then File.ResolveLinkTarget,
+        // which follows the whole chain (a link to a link to a file resolves to the file), so a
+        // chained link like /usr/bin/java → /etc/alternatives/java → a JVM is never classified via
+        // an intermediate link. Null means the path is not a link.
+        string? linkTarget = new FileInfo(path).LinkTarget;
+        FileSystemInfo? final;
         try
         {
-            // FileSystemInfo.LinkTarget returns the link's ReadLink target whenever the path is
-            // itself a symlink (including dangling links), and null otherwise.
-            return new FileInfo(path).LinkTarget;
+            final = File.ResolveLinkTarget(path, returnFinalTarget: true);
         }
-        catch (Exception ex) when (ex is IOException
-            or UnauthorizedAccessException
-            or ArgumentException
-            or NotSupportedException
-            or PlatformNotSupportedException
-            or ObjectDisposedException
-            or InvalidOperationException)
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {
-            // Best-effort ReadLink: classify the path with whatever we can still see below.
-            return null;
-        }
-    }
-
-    private static string ResolveLinkTarget(string path, string? linkTarget)
-    {
-        // FileSystemInfo.LinkTarget returns the raw ReadLink result, so /usr/bin/sh -> bash reports
-        // "bash" rather than "/usr/bin/bash"; checking PathExists("bash") against the caller's cwd
-        // would then misclassify the link as dangling. Resolve a relative target against the link's
-        // directory (POSIX); an absolute target is the final target as-is; no link means the path
-        // itself is the target.
-        if (linkTarget is null)
-        {
-            return path;
+            // Nothing at the path: ResolveLinkTarget reports a missing path as an exception rather
+            // than null. A path that is itself a link is a dangling link; otherwise the entry is
+            // absent and the sentinel "-" tells the trust check to ignore it.
+            return (linkTarget is not null ? "unreadable: dangling link" : "-", path);
         }
 
-        if (Path.IsPathRooted(linkTarget))
+        string target = final?.FullName ?? path;
+
+        // Dangling link: the path is a symlink (or a chain of symlinks) whose final target does not
+        // exist as a file or a directory. Recorded under the link path so the error message names a
+        // path the operator actually configured.
+        if (final is not null && !PathExists(target))
         {
-            return linkTarget;
+            return ("unreadable: dangling link", target);
         }
 
-        string? parent = Path.GetDirectoryName(path);
-        return Path.GetFullPath(Path.Combine(parent ?? string.Empty, linkTarget));
+        // Absent path (and not a link whose target would resolve): the sentinel "-" lets the trust
+        // check ignore absent entries instead of treating every missing config file as a failure.
+        if (final is null && !PathExists(target))
+        {
+            return ("-", target);
+        }
+
+        return (null, target);
     }
 
     private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
@@ -340,22 +328,149 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// The paths the gate chain treats as trusted inputs: every file under <paramref name="runsRoot"/>
-    /// (recursively, except the launcher-owned subtrees <c>runs/</c>, <c>inbox/</c>, <c>system/</c> and
-    /// the ledger <c>runs.jsonl</c>), <c>dotnet-tools.json</c>, <c>.config/dotnet-tools.json</c>,
-    /// <c>global.json</c> and the three <c>NuGet.config</c>/<c>NuGet.Config</c>/<c>nuget.config</c>
-    /// casings at every directory from <paramref name="gateWorkingDirectory"/> up to
-    /// <paramref name="gitRoot"/> (deduped), the resolved gate executable (argv[0]: PATH when the
-    /// entry has no directory part, else resolved against <paramref name="gateWorkingDirectory"/> —
-    /// wherever it lives, inside the repo or not), every remaining argv entry that is an existing
-    /// file path under <paramref name="gitRoot"/> (resolved against <paramref name="gateWorkingDirectory"/>),
-    /// any <paramref name="extraTrust"/> paths or globs the operator pinned (literal entries
-    /// included even when absent, glob matches limited to files that exist before the worker runs),
-    /// and the price book file at <paramref name="extraPricesFile"/> whenever one is given (even
-    /// under <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl).
+    /// Paths that are in one of the two sets but not the other, in ordinal order: a file that appeared
+    /// in, or vanished from, the trusted set since <paramref name="before"/> was taken. Comparing the
+    /// path sets needs no hashing (the walk only names paths), so callers run it before
+    /// <see cref="FirstDiffAsync"/> and report new or missing files without paying a per-file timeout
+    /// for entries that never have to be hashed.
+    /// </summary>
+    public static List<string> SetDifferences(Snapshot before, IReadOnlyList<string> paths)
+    {
+        HashSet<string> now = new(paths, StringComparer.Ordinal);
+        IEnumerable<string> added = paths.Where(p => !before.Hashes.ContainsKey(p));
+        IEnumerable<string> removed = before.Hashes.Keys.Where(p => !now.Contains(p));
+        return [.. added.Concat(removed).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
+    }
+
+    /// <summary>
+    /// One checked path: its value in the new snapshot and whether that value is a bad state
+    /// (nonregular or unreadable — the chain treats these as trust violations).
+    /// </summary>
+    internal sealed record TrustDiff(string Path, string Value, bool IsBad);
+
+    /// <summary>
+    /// Hashes <paramref name="paths"/> one at a time against <paramref name="before"/> and stops at
+    /// the first entry whose value differs from the snapshot's or that sits in a bad state, so a
+    /// planted FIFO or a tampered file ends the check without hashing the rest (a FIFO without a
+    /// writer costs a timeout per hashed entry). Returns null when every entry matches its snapshot
+    /// value and none is bad. Callers compare the path sets first (<see cref="SetDifferences"/>), so
+    /// every path here has a snapshot value; a path without one is reported as changed.
+    /// </summary>
+    public static async Task<TrustDiff?> FirstDiffAsync(Snapshot before, IReadOnlyList<string> paths)
+    {
+        foreach (string path in paths)
+        {
+            Dictionary<string, string> hashes = new(StringComparer.Ordinal);
+            await HashOneAsync(hashes, path).ConfigureAwait(false);
+            string value = hashes[path];
+            if (!before.Hashes.TryGetValue(path, out string? expected) || value != expected)
+            {
+                return new TrustDiff(path, value, IsBadValue(value));
+            }
+
+            if (IsBadValue(value))
+            {
+                return new TrustDiff(path, value, IsBad: true);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether a snapshot value is a bad state: any nonregular or unreadable sentinel. Absent paths
+    /// (the sentinel <c>-</c>) are not bad on their own: a config file that did not exist before the
+    /// worker and still does not exist is not a tampering signal.
+    /// </summary>
+    public static bool IsBadValue(string value)
+    {
+        if (value is "-")
+        {
+            return false;
+        }
+
+        // Values are "<target>|<sha-or-sentinel>", but "unreadable: dangling link" omits the
+        // target (the target is unreachable, so it is recorded under the link's own path).
+        if (value is "unreadable: dangling link")
+        {
+            return true;
+        }
+
+        int sep = value.IndexOf('|', StringComparison.Ordinal);
+        string right = sep >= 0 ? value[(sep + 1)..] : value;
+        return right is "nonregular" || right.StartsWith("unreadable", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The paths the gate chain treats as trusted inputs (the composition of
+    /// <see cref="CollectChainPaths"/> and <see cref="CollectVolatilePaths"/>): every file under
+    /// <paramref name="runsRoot"/> (recursively, except the launcher-owned subtrees <c>runs/</c>,
+    /// <c>inbox/</c>, <c>system/</c> and the ledger <c>runs.jsonl</c>), <c>dotnet-tools.json</c>,
+    /// <c>.config/dotnet-tools.json</c>, <c>global.json</c> and the three
+    /// <c>NuGet.config</c>/<c>NuGet.Config</c>/<c>nuget.config</c> casings at every directory from
+    /// <paramref name="gateWorkingDirectory"/> up to <paramref name="gitRoot"/> (deduped), the
+    /// resolved gate executable (argv[0]: PATH when the entry has no directory part, else resolved
+    /// against <paramref name="gateWorkingDirectory"/> — wherever it lives, inside the repo or not),
+    /// every remaining argv entry that is an existing file path under <paramref name="gitRoot"/>
+    /// (resolved against <paramref name="gateWorkingDirectory"/>), any <paramref name="extraTrust"/>
+    /// paths or globs the operator pinned (literal entries included even when absent, glob matches
+    /// limited to files that exist before the worker runs), and the price book file at
+    /// <paramref name="extraPricesFile"/> whenever one is given (even under
+    /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl).
     /// </summary>
     public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
         IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
+    {
+        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile);
+        HashSet<string> dedupe = new(paths, StringComparer.Ordinal);
+        foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot))
+        {
+            if (dedupe.Add(path))
+            {
+                paths.Add(path);
+            }
+        }
+
+        return paths;
+    }
+
+    /// <summary>
+    /// The part of the trust set that is fixed for a whole gate chain: the resolved gate executable,
+    /// the existing argv file entries, and the <c>gate.trust</c> entries (literal paths and glob
+    /// matches). The launcher resolves this list once, before round 1's worker runs, and reuses it
+    /// for every later hash, so glob matches and argv entries never pick up files the worker or the
+    /// gate created later. The glob walk skips <c>.git</c> and the runs root.
+    /// </summary>
+    public static List<string> CollectChainPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
+        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null)
+    {
+        List<string> paths = [];
+        HashSet<string> dedupe = new(StringComparer.Ordinal);
+        void Add(string p)
+        {
+            if (!dedupe.Add(p))
+            {
+                return;
+            }
+
+            paths.Add(p);
+        }
+
+        AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => Add(p));
+        AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => Add(p));
+        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => Add(p));
+        AddPricesFile(extraPricesFile, p => Add(p));
+        return paths;
+    }
+
+    /// <summary>
+    /// The part of the trust set the launcher re-collects before every hash: the runs-root files and
+    /// the config-file walk (working directory up to the git root). These are meant to catch new
+    /// files, so they are walked again each time — unlike the fixed chain paths
+    /// (<see cref="CollectChainPaths"/>), whose glob matches and argv entries would otherwise pick up
+    /// files the worker or the gate created.
+    /// </summary>
+    public static List<string> CollectVolatilePaths(string runsRoot, string gateWorkingDirectory, string gitRoot)
     {
         List<string> paths = [];
         HashSet<string> dedupe = new(StringComparer.Ordinal);
@@ -371,11 +486,85 @@ internal static class GateTrust
 
         AddRunsRootFiles(runsRoot, p => Add(p));
         AddConfigFileWalk(p => Add(p), gateWorkingDirectory, gitRoot);
-        AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => Add(p));
-        AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => Add(p));
-        AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, p => Add(p));
-        AddPricesFile(extraPricesFile, p => Add(p));
         return paths;
+    }
+
+    /// <summary>
+    /// Options for every recursive walk the trust set builds: recurse, skip directories the walk
+    /// cannot read (a missing entry drops out of the walk and the path-set comparison reports it,
+    /// so this fails closed), and never follow reparse points (a symlinked directory must not pull
+    /// a tree outside the walked root into the trust set). Recursion is done by
+    /// <see cref="WalkFiles"/> so subtrees can also be skipped by name.
+    /// </summary>
+    private static readonly EnumerationOptions _walkOptions = new()
+    {
+        RecurseSubdirectories = false,
+        IgnoreInaccessible = true,
+        AttributesToSkip = FileAttributes.ReparsePoint,
+    };
+
+    /// <summary>
+    /// Enumerates every file under <paramref name="root"/> without throwing: unreadable directories
+    /// are skipped (<see cref="EnumerationOptions.IgnoreInaccessible"/>), a directory that vanishes
+    /// mid-walk ends just that directory's listing, symlinked directories and files are skipped
+    /// (never followed), and <paramref name="skipDirectory"/> prunes subtrees by name.
+    /// </summary>
+    private static IEnumerable<string> WalkFiles(string root, Func<string, bool>? skipDirectory)
+    {
+        if (!Directory.Exists(root))
+        {
+            yield break;
+        }
+
+        Stack<string> pending = new();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            string dir = pending.Pop();
+            List<string> files = [];
+            List<string> subDirs = [];
+            try
+            {
+                files.AddRange(Directory.EnumerateFiles(dir, "*", _walkOptions));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The directory vanished mid-walk; nothing under it can be hashed anyway.
+            }
+
+            try
+            {
+                subDirs.AddRange(Directory.EnumerateDirectories(dir, "*", _walkOptions));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+
+            foreach (string file in files)
+            {
+                yield return file;
+            }
+
+            foreach (string sub in subDirs)
+            {
+                if (skipDirectory?.Invoke(sub) is not true)
+                {
+                    pending.Push(sub);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is <paramref name="root"/> or lies under it (ordinal).
+    /// </summary>
+    private static bool IsAtOrUnder(string path, string root)
+    {
+        if (string.Equals(path, root, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        string prefix = root[^1] == Path.DirectorySeparatorChar ? root : root + Path.DirectorySeparatorChar;
+        return path.StartsWith(prefix, StringComparison.Ordinal);
     }
 
     private static void AddRunsRootFiles(string runsRoot, Action<string> add)
@@ -385,46 +574,24 @@ internal static class GateTrust
             return;
         }
 
-        HashSet<string> skipDirs = new(StringComparer.Ordinal);
-        foreach (string sub in new[] { "runs", "inbox", "system" })
-        {
-            skipDirs.Add(Path.Combine(runsRoot, sub));
-        }
-
         string ledger = Path.Combine(runsRoot, "runs.jsonl");
 
-        // Walk recursively; the launcher's own bookkeeping lives under runs/, inbox/ and system/ and
-        // is never a gate input, and runs.jsonl is the ledger (one record per run, append-only).
-        foreach (string file in Directory.EnumerateFiles(runsRoot, "*", SearchOption.AllDirectories))
+        // The launcher's own bookkeeping lives under runs/, inbox/ and system/ and is never a gate
+        // input, and runs.jsonl is the ledger (one record per run, append-only): do not descend
+        // into those subtrees, so a planted or unreadable directory under them cannot stall the walk.
+        HashSet<string> skip = new(StringComparer.Ordinal)
         {
-            if (string.Equals(file, ledger, StringComparison.Ordinal))
+            Path.Combine(runsRoot, "runs"),
+            Path.Combine(runsRoot, "inbox"),
+            Path.Combine(runsRoot, "system"),
+        };
+
+        foreach (string file in WalkFiles(runsRoot, dir => skip.Contains(dir)))
+        {
+            if (!string.Equals(file, ledger, StringComparison.Ordinal))
             {
-                continue;
+                add(file);
             }
-
-            string? parent = Path.GetDirectoryName(file);
-            while (parent is not null)
-            {
-                if (skipDirs.Contains(parent))
-                {
-                    break;
-                }
-
-                if (string.Equals(parent, runsRoot, StringComparison.Ordinal))
-                {
-                    parent = null;
-                    break;
-                }
-
-                parent = Path.GetDirectoryName(parent);
-            }
-
-            if (parent is not null && skipDirs.Contains(parent))
-            {
-                continue;
-            }
-
-            add(file);
         }
     }
 
@@ -558,7 +725,7 @@ internal static class GateTrust
     /// characters) are added as-is, even when the file does not exist; glob matches are limited to
     /// files that exist before the worker runs (WriteScope.InScope-style matching).
     /// </summary>
-    private static void AddExtraTrust(IReadOnlyList<string>? entries, string gitRoot, string gateWorkingDirectory, Action<string> add)
+    private static void AddExtraTrust(IReadOnlyList<string>? entries, string gitRoot, string gateWorkingDirectory, string runsRoot, Action<string> add)
     {
         if (entries is null || entries.Count is 0)
         {
@@ -568,6 +735,7 @@ internal static class GateTrust
         // Trust entries are repo-relative; the git root takes precedence when it is usable, the gate
         // working directory is the fallback so a non-git launch can still pin files.
         string anchor = Directory.Exists(gitRoot) ? gitRoot : gateWorkingDirectory;
+        string skipRunsRoot = Path.GetFullPath(runsRoot);
 
         foreach (string entry in entries)
         {
@@ -590,7 +758,10 @@ internal static class GateTrust
 
             // Glob: enumerate every file under <anchor> and add the ones the glob matches that exist
             // before the worker runs (Absence here is not a violation on its own; the trust check
-            // also catches "present and later gone").
+            // also catches "present and later gone"). The walk skips .git and the launcher's own
+            // runs root: both are walked for names only, and a glob such as **/*.json would
+            // otherwise match files the launcher or git itself created (for example this run's
+            // gate.json) and trip every run.
             Regex matcher;
             try
             {
@@ -606,7 +777,7 @@ internal static class GateTrust
                 continue;
             }
 
-            foreach (string file in Directory.EnumerateFiles(anchor, "*", SearchOption.AllDirectories))
+            foreach (string file in WalkFiles(anchor, dir => Path.GetFileName(dir) is ".git" || IsAtOrUnder(dir, skipRunsRoot)))
             {
                 string rel = Path.GetRelativePath(anchor, file).Replace('\\', '/');
                 if (matcher.IsMatch(rel))

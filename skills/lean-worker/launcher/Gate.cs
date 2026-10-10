@@ -883,14 +883,19 @@ internal static class Gate
     /// <summary>
     /// Records an error gate result for the trust-boundary case (a worker changed a file the gate
     /// trusts, or the gate ended with bad state). Writes <c>gate.json</c> and returns the
-    /// <see cref="GateResult"/> that the chain decision uses. <c>ExitCode</c> is <c>-1</c> because
-    /// no gate process ran (mirrors the build-start failure / timeout / cancellation codepath, which
-    /// also records <c>-1</c>; a trust violation must not be reported as a gate exit code).
+    /// <see cref="GateResult"/> that the chain decision uses. When <paramref name="gateRan"/> is
+    /// null (the violation was found before the gate ran), <c>ExitCode</c> is <c>-1</c> because no
+    /// gate process ran (mirrors the build-start failure / timeout / cancellation codepath, which
+    /// also records <c>-1</c>; a trust violation must not be reported as a gate exit code). When the
+    /// gate already ran, only the outcome and the error are replaced: the gate's real exit code,
+    /// count, report path, feedback and duration stay in <c>gate.json</c> and the summary.
     /// </summary>
-    internal static async Task<GateResult> WriteFailureAsync(string runDir, GateSpec spec, string errorMessage)
+    internal static async Task<GateResult> WriteFailureAsync(string runDir, GateSpec spec, string errorMessage, GateResult? gateRan = null)
     {
-        GateResult result = new(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
-            Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero);
+        GateResult result = gateRan is null
+            ? new GateResult(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
+                Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero)
+            : gateRan with { Outcome = "error", Error = errorMessage };
         await WriteGateJsonAsync(Path.Combine(runDir, "gate.json"), result, spec, envNames: []).ConfigureAwait(false);
         return result;
     }
