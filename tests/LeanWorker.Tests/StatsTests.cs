@@ -22,12 +22,26 @@ public class StatsTests
     }
 
     [Fact]
-    public void A_clean_gate_decision_counts_as_success_even_though_the_worker_already_succeeded()
+    public void A_clean_gate_decision_counts_as_success_whatever_the_worker_status_says()
+    {
+        // Status "error" would not count as a success without the gate rule, so this fails if the rule is dropped.
+        List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"error","total_cost_usd":1.0,"gate":{"decision":"clean"}}"""),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(1, row.Success);
+    }
+
+    [Fact]
+    public void Stuck_and_error_gate_decisions_are_not_successes_even_when_the_worker_status_is_success()
     {
         List<StatsRow> rows = Commands.StatsRows([
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"stuck"}}"""),
+            R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"error"}}"""),
             R(/*lang=json,strict*/ """{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"clean"}}"""),
         ]);
         StatsRow row = Assert.Single(rows);
+        Assert.Equal(3, row.Runs);
         Assert.Equal(1, row.Success);
     }
 

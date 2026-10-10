@@ -165,6 +165,84 @@ public class GateSpecTests
     }
 
     [Fact]
+    public void A_bare_argv0_named_like_a_directory_in_the_working_directory_is_accepted()
+    {
+        string workDir = Directory.CreateTempSubdirectory("lw-gatespec").FullName;
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(workDir, "dotnet"));
+            JsonObject gate = new() { ["command"] = new JsonArray(["dotnet", "build"]) };
+            GateSpec spec = GateSpec.FromProfile(Profile(gate), workDir)!;
+            Assert.Equal(["dotnet", "build"], spec.Command);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void An_argv0_with_a_directory_part_that_is_a_directory_is_still_refused()
+    {
+        string workDir = Directory.CreateTempSubdirectory("lw-gatespec").FullName;
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(workDir, "tools"));
+            JsonObject gate = new() { ["command"] = new JsonArray(["./tools"]) };
+            LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate), workDir));
+            Assert.Contains("gate.command[0]", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Gate_trust_defaults_to_empty_and_keeps_valid_entries_with_forward_slashes()
+    {
+        Assert.Empty(GateSpec.FromProfile(Profile(MinimalGate()))!.Trust!);
+
+        JsonObject gate = MinimalGate();
+        gate["trust"] = new JsonArray(["Directory.Build.props", "src\\**\\*.props", ".editorconfig"]);
+        GateSpec spec = GateSpec.FromProfile(Profile(gate))!;
+        Assert.Equal(["Directory.Build.props", "src/**/*.props", ".editorconfig"], spec.Trust);
+    }
+
+    [Fact]
+    public void Gate_trust_must_be_an_array()
+    {
+        JsonObject gate = MinimalGate();
+        gate["trust"] = "Directory.Build.props";
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.trust", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("/etc/passwd")]
+    [InlineData("..")]
+    [InlineData("../outside.props")]
+    [InlineData("src/../../outside.props")]
+    [InlineData("src\\..\\..\\outside.props")]
+    public void A_bad_gate_trust_entry_throws_naming_its_index(string entry)
+    {
+        JsonObject gate = MinimalGate();
+        gate["trust"] = new JsonArray(["fine.props", entry]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.trust[1]", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_non_string_gate_trust_entry_throws_naming_its_index()
+    {
+        JsonObject gate = MinimalGate();
+        gate["trust"] = new JsonArray(["fine.props", 7]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.trust[1]", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void No_gate_flag_parses()
     {
         Options o = Options.Parse(["--no-gate"]);

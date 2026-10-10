@@ -75,7 +75,8 @@ internal static partial class RunAsyncGolden
     /// <summary>
     /// Runs RunAsync with the stub on PATH; returns the exit code and stdout, or rethrows what RunAsync throws.
     /// </summary>
-    public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key")
+    public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key",
+        GateContext? gateContext = null)
     {
         string? oldPath = Environment.GetEnvironmentVariable("PATH");
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
@@ -91,7 +92,9 @@ internal static partial class RunAsyncGolden
             Console.SetOut(outWriter);
             Options o = new() { TaskFile = Path.Combine(root, "task.md"), RunsRoot = root, Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "golden" };
             configure?.Invoke(o);
-            int code = await Launcher.RunAsync(o);
+            // A gate context runs that one round directly (as the launcher's loop would build it), so a test can
+            // hand a later round a spec that differs from what profiles.json now says.
+            int code = gateContext is null ? await Launcher.RunAsync(o) : await new LaunchRun(o, gateContext).RunAsync();
             return (code, outWriter.ToString());
         }
         finally

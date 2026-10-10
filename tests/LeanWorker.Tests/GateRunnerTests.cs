@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.Versioning;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Xunit;
@@ -288,5 +289,177 @@ public partial class GateRunnerTests
         {
             Environment.SetEnvironmentVariable("LW_TEST_SECRET", oldSecret);
         }
+    }
+
+    private static readonly TimeSpan _bound = TimeSpan.FromSeconds(20);
+
+    [GeneratedRegex(@"^path\[(?<p>\s+)\]$", RegexOptions.None, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex WhitespaceCaptureRegex();
+
+    private static async Task<Gate.GateResult> RunBoundedAsync(string cwd, GateSpec spec, string runDir) =>
+        await RunInAsync(cwd, spec, runDir).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
+
+    [Fact]
+    public async Task A_report_path_that_is_a_symlink_to_dev_zero_is_an_error_without_hangingAsync()
+    {
+        Assert.SkipUnless(File.Exists("/dev/zero"), "no /dev/zero on this platform");
+
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string link = Path.Combine(dir, "rep.json");
+        _ = File.CreateSymbolicLink(link, "/dev/zero");
+        string script = WriteScript(dir, "echo 'sarif: rep.json'\nexit 1\n");
+
+        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Contains("not a regular file", r.Error, StringComparison.Ordinal);
+        Assert.Contains(link, r.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_report_path_that_is_a_fifo_is_an_error_without_hangingAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "mkfifo is Unix only");
+
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string script = WriteScript(dir, "mkfifo rep.fifo\necho 'sarif: rep.fifo'\nexit 1\n");
+
+        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Contains("rep.fifo", r.Error, StringComparison.Ordinal);
+        Assert.True(
+            r.Error!.Contains("not a regular file", StringComparison.Ordinal) || r.Error.Contains("could not be read in time", StringComparison.Ordinal),
+            r.Error);
+    }
+
+    [Fact]
+    public async Task A_report_over_64_MiB_is_an_errorAsync()
+    {
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        await using (FileStream fs = File.Create(Path.Combine(dir, "big.json")))
+        {
+            fs.SetLength((64L * 1024L * 1024L) + 1L);
+        }
+
+        string script = WriteScript(dir, "echo 'sarif: big.json'\nexit 1\n");
+
+        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Contains("is too large", r.Error, StringComparison.Ordinal);
+        Assert.Contains("big.json", r.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_whitespace_only_report_capture_is_an_empty_report_pathAsync()
+    {
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string script = WriteScript(dir, "echo 'path[   ]'\nexit 1\n");
+
+        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script, reportRegex: WhitespaceCaptureRegex()), dirs.Create("lw-gate"));
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Equal("gate exited 1 but report path was empty", r.Error);
+    }
+
+    [Fact]
+    public async Task A_bare_argv0_not_on_PATH_is_a_start_error_with_exit_code_minus_oneAsync()
+    {
+        using TempDirs dirs = new();
+        string runDir = dirs.Create("lw-gate");
+        GateSpec spec = new(["lw-gate-does-not-exist-xyz"], DefaultRegex(), "runs[0].results", 8000, 30, 5, 10m, []);
+
+        Gate.GateResult r = await Gate.RunAsync(spec, runDir, CancellationToken.None);
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Equal(-1, r.ExitCode);
+        Assert.Equal("gate executable 'lw-gate-does-not-exist-xyz' not found on PATH", r.Error);
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.Equal(-1, gateJson["exit_code"]!.GetValue<int>());
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_bare_argv0_is_not_searched_for_in_the_working_directoryAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "unix executable bit");
+
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string marker = Path.Combine(dir, "planted-ran");
+        string planted = Path.Combine(dir, "lw-planted-tool");
+        WriteFile(planted, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        File.SetUnixFileMode(planted, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        GateSpec spec = new(["lw-planted-tool"], DefaultRegex(), "runs[0].results", 8000, 30, 5, 10m, []);
+
+        Gate.GateResult r = await RunBoundedAsync(dir, spec, dirs.Create("lw-gate"));
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Contains("not found on PATH", r.Error, StringComparison.Ordinal);
+        Assert.False(File.Exists(marker));
+    }
+
+    [Fact]
+    public async Task Symlinks_planted_at_gate_log_and_gate_json_are_replaced_not_followedAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string runDir = dirs.Create("lw-gate");
+        string victimLog = Path.Combine(dir, "victim-log.txt");
+        string victimJson = Path.Combine(dir, "victim-json.txt");
+        WriteFile(victimLog, "untouched-log");
+        WriteFile(victimJson, "untouched-json");
+        _ = File.CreateSymbolicLink(Path.Combine(runDir, "gate.log"), victimLog);
+        _ = File.CreateSymbolicLink(Path.Combine(runDir, "gate.json"), victimJson);
+        string script = WriteScript(dir, "echo hello-from-the-gate\nexit 0\n");
+
+        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), runDir);
+
+        Assert.Equal("clean", r.Outcome);
+        Assert.Equal("untouched-log", await File.ReadAllTextAsync(victimLog, TestContext.Current.CancellationToken));
+        Assert.Equal("untouched-json", await File.ReadAllTextAsync(victimJson, TestContext.Current.CancellationToken));
+        Assert.Null(new FileInfo(Path.Combine(runDir, "gate.log")).LinkTarget);
+        Assert.Null(new FileInfo(Path.Combine(runDir, "gate.json")).LinkTarget);
+        string log = await File.ReadAllTextAsync(Path.Combine(runDir, "gate.log"), TestContext.Current.CancellationToken);
+        Assert.Contains("hello-from-the-gate", log, StringComparison.Ordinal);
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.Equal("clean", gateJson["outcome"]!.GetValue<string>());
+        Assert.DoesNotContain(Directory.GetFiles(runDir), f => Path.GetFileName(f).StartsWith(".tmp-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_cancelled_gate_is_an_error_and_the_process_is_killedAsync()
+    {
+        // The configured timeout is whole minutes (no knob below one), so the timeout path is not
+        // reachable in a unit test without a production hook; the caller's token takes the sibling
+        // path (same kill, a different error message).
+        using TempDirs dirs = new();
+        string dir = dirs.Create("lw-gate");
+        string script = WriteScript(dir, "sleep 60\nexit 0\n");
+        using CancellationTokenSource cts = new();
+        cts.CancelAfter(TimeSpan.FromSeconds(1));
+        string oldCwd = Directory.GetCurrentDirectory();
+        Gate.GateResult r;
+        try
+        {
+            Directory.SetCurrentDirectory(dir);
+            r = await Gate.RunAsync(Spec(script), dirs.Create("lw-gate"), cts.Token).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(oldCwd);
+        }
+
+        Assert.Equal("error", r.Outcome);
+        Assert.Equal(-1, r.ExitCode);
+        Assert.Equal("gate cancelled", r.Error);
+        Assert.True(r.Duration < _bound);
     }
 }

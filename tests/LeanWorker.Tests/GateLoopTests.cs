@@ -21,7 +21,7 @@ public class GateLoopTests
         await File.WriteAllTextAsync(path, doc.ToJsonString(), TestContext.Current.CancellationToken);
     }
 
-    private static async Task WriteExecutableAsync(string path, string body)
+    internal static async Task WriteExecutableAsync(string path, string body)
     {
         await File.WriteAllTextAsync(path, body, TestContext.Current.CancellationToken);
         if (OperatingSystem.IsWindows())
@@ -37,7 +37,7 @@ public class GateLoopTests
     /// <c>rounds[N-1].ExitCode</c> and (when ExitCode is 1 and Count &gt; 0) prints a "sarif: &lt;report&gt;"
     /// line for a report with that many results. Invocations past the list repeat the last entry.
     /// </summary>
-    private static async Task<string> WriteSequenceScriptAsync(string scratch, params (int ExitCode, int Count)[] rounds)
+    internal static async Task<string> WriteSequenceScriptAsync(string scratch, params (int ExitCode, int Count)[] rounds)
     {
         string counter = Path.Combine(scratch, "n");
         StringBuilder sb = new();
@@ -64,7 +64,7 @@ public class GateLoopTests
         return path;
     }
 
-    private static JsonObject GateProfile(string scriptPath, int? maxTotalUsd = null)
+    internal static JsonObject GateProfile(string scriptPath, int? maxTotalUsd = null)
     {
         return new()
         {
@@ -76,7 +76,7 @@ public class GateLoopTests
         };
     }
 
-    private static string[] RunDirNames(string root) =>
+    internal static string[] RunDirNames(string root) =>
         [.. Directory.GetDirectories(Path.Combine(root, "runs")).Select(d => Path.GetFileName(d) ?? string.Empty).Order(StringComparer.Ordinal)];
 
     private static int CountOccurrences(string haystack, string needle)
@@ -259,6 +259,11 @@ public class GateLoopTests
         JsonObject s = RunAsyncGolden.Summary(runDir);
         string error = s["gate"]!["error"]!.GetValue<string>();
         Assert.Contains("profiles.json", error, StringComparison.Ordinal);
+
+        // No gate process ran, so the record carries -1, not the launcher's own exit code 5.
+        Assert.Equal(-1, s["gate"]!["exit_code"]!.GetValue<int>());
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.Equal(-1, gateJson["exit_code"]!.GetValue<int>());
     }
 
     [Fact]
@@ -297,27 +302,32 @@ public class GateLoopTests
     [Fact]
     public async Task A_worker_that_replaces_global_json_with_a_fifo_trips_the_trust_check_without_hangingAsync()
     {
-        if (OperatingSystem.IsWindows())
-        {
-            return;
-        }
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "mkfifo is Unix only");
 
         string root = RunAsyncGolden.NewRoot();
         string scratch = NewScratch();
-        string marker = Path.Combine(scratch, "gate-ran");
-        string script = Path.Combine(scratch, "gate.sh");
-        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
-        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
-        const string worker = "rm -f global.json\nmkfifo global.json\n" + RunAsyncGolden.SuccessStream;
+        try
+        {
+            string marker = Path.Combine(scratch, "gate-ran");
+            string script = Path.Combine(scratch, "gate.sh");
+            await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+            RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+            const string worker = "rm -f global.json\nmkfifo global.json\n" + RunAsyncGolden.SuccessStream;
 
-        Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(
-            root, worker, _ => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "global.json"), "{}"));
-        (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+            Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(
+                root, worker, _ => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "global.json"), "{}"));
+            (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
 
-        Assert.Equal(5, code);
-        Assert.False(File.Exists(marker));
-        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
-        Assert.Contains("global.json", stdout, StringComparison.Ordinal);
+            Assert.Equal(5, code);
+            Assert.False(File.Exists(marker));
+            Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+            Assert.Contains("global.json", stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+            Directory.Delete(scratch, recursive: true);
+        }
     }
 
     [Fact]
@@ -382,27 +392,49 @@ public class GateLoopTests
     {
         string root = RunAsyncGolden.NewRoot();
         string scratch = NewScratch();
-        string scriptA = Path.Combine(scratch, "a.sh");
-        await File.WriteAllTextAsync(scriptA, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
-        GateSpec round1Spec = GateSpec.FromProfile(GateProfile(scriptA), scratch)!;
+        try
+        {
+            string scriptA = Path.Combine(scratch, "a.sh");
+            await WriteExecutableAsync(scriptA, "#!/bin/sh\necho output-of-script-A\nexit 0\n");
+            GateSpec round1Spec = GateSpec.FromProfile(GateProfile(scriptA), scratch)!;
 
-        string scriptB = Path.Combine(scratch, "b.sh");
-        await File.WriteAllTextAsync(scriptB, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
-        RunAsyncGolden.WriteProfile(root, "test", GateProfile(scriptB));
+            // profiles.json now names script B; round 2 must still run the spec round 1 resolved (script A).
+            string scriptB = Path.Combine(scratch, "b.sh");
+            await WriteExecutableAsync(scriptB, "#!/bin/sh\necho output-of-script-B\nexit 0\n");
+            RunAsyncGolden.WriteProfile(root, "test", GateProfile(scriptB));
 
-        Options o = new() { TaskFile = Path.Combine(root, "task.md"), RunsRoot = root, Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "golden" };
-        GateContext context = new(
-            ChainId: "chain1",
-            Round: 1,
-            Counts: [3],
-            ChainCostUsd: 0m,
-            OriginalTask: "do nothing",
-            OriginalName: "golden",
-            Feedback: new Gate.GateResult(Outcome: "findings", ExitCode: 1, Count: 3, ReportPath: null, Feedback: "feedback", Error: null, Duration: TimeSpan.Zero),
-            Spec: round1Spec);
-        LaunchRun run = new(o, context);
+            GateContext context = new(
+                ChainId: "chain1",
+                Round: 2,
+                Counts: [3],
+                ChainCostUsd: 0m,
+                OriginalTask: "do nothing",
+                OriginalName: "golden",
+                Feedback: new Gate.GateResult(Outcome: "findings", ExitCode: 1, Count: 3, ReportPath: null, Feedback: "feedback", Error: null, Duration: TimeSpan.Zero),
+                Spec: round1Spec);
 
-        Assert.Equal(round1Spec, run.InitialGateSpec);
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.SuccessStream, gateContext: context);
+
+            Assert.Equal(0, code);
+            string runDir = RunAsyncGolden.RunDirFrom(stdout);
+            Assert.EndsWith("-golden-gate2", runDir, StringComparison.Ordinal);
+
+            JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+            Assert.Equal(["sh", scriptA], gateJson["command"]!.AsArray().Select(n => n!.GetValue<string>()), StringComparer.Ordinal);
+            string log = await File.ReadAllTextAsync(Path.Combine(runDir, "gate.log"), TestContext.Current.CancellationToken);
+            Assert.Contains("output-of-script-A", log, StringComparison.Ordinal);
+            Assert.DoesNotContain("output-of-script-B", log, StringComparison.Ordinal);
+
+            JsonObject gate = RunAsyncGolden.Summary(runDir)["gate"]!.AsObject();
+            Assert.Equal(2, gate["round"]!.GetValue<int>());
+            Assert.Equal("chain1", gate["chain_id"]!.GetValue<string>());
+            Assert.Equal("clean", gate["decision"]!.GetValue<string>());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+            Directory.Delete(scratch, recursive: true);
+        }
     }
 
     [Fact]
