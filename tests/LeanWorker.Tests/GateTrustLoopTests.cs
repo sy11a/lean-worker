@@ -698,6 +698,133 @@ public sealed class GateTrustLoopTests : IDisposable
         AssertClean(setup, code, stdout);
     }
 
+    // ---- canonical paths for the working-tree refusals ------------------------------------------------------
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_entry_reached_through_a_symlink_to_the_working_directory_is_a_launch_error_before_the_workerAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string viaLink = Path.Combine(_dirs.Create("lw-gate-links"), "link-to-repo");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    string cwd = Directory.GetCurrentDirectory();
+                    _ = Directory.CreateDirectory(Path.Combine(cwd, "bin"));
+                    _ = Directory.CreateSymbolicLink(viaLink, cwd);
+                    SetPath(Path.Combine(viaLink, "bin"), dirA, dirB);
+                }));
+
+        Assert.Equal("gate PATH directory '" + Path.Combine(viaLink, "bin") + "' is inside the working tree", ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_working_directory_reached_through_a_symlinked_parent_still_refuses_a_PATH_directory_in_the_real_treeAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string parentLink = Path.Combine(_dirs.Create("lw-gate-links"), "parent-link");
+        string inside = string.Empty;
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    string real = Directory.GetCurrentDirectory();
+                    _ = Directory.CreateSymbolicLink(parentLink, Path.GetDirectoryName(real)!);
+                    inside = Path.Combine(real, "bin");
+                    _ = Directory.CreateDirectory(inside);
+                    Directory.SetCurrentDirectory(Path.Combine(parentLink, Path.GetFileName(real)));
+                    SetPath(inside, dirA, dirB);
+                }));
+
+        Assert.Equal("gate PATH directory '" + inside + "' is inside the working tree", ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_symlink_chain_whose_intermediate_link_is_in_the_working_tree_but_whose_final_target_is_outside_is_a_launch_errorAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "data");
+        string entry = Path.Combine(dirA, "lw-link");
+        string hop = string.Empty;
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
+            async () => await RunAsync(
+                setup,
+                "touch '" + workerMarker + "'",
+                () =>
+                {
+                    File.WriteAllText(target, "x");
+                    hop = Path.Combine(Directory.GetCurrentDirectory(), "hop");
+                    _ = File.CreateSymbolicLink(hop, target);
+                    _ = File.CreateSymbolicLink(entry, hop);
+                    SetPath(dirA, dirB);
+                }));
+
+        Assert.Equal("gate PATH entry '" + entry + "' resolves into the working tree via '" + hop + "'", ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_declared_output_under_the_runs_root_reached_through_a_symlink_is_still_a_launch_errorAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        Setup setup = await NewSetupAsync();
+        string rootLink = Path.Combine(_dirs.Create("lw-gate-links"), "root-link");
+        _ = Directory.CreateSymbolicLink(rootLink, setup.Root);
+        JsonObject profile = GateLoopTests.GateProfile(setup.Script);
+        profile["gate"]!["outputs"] = new JsonArray([Path.Combine(rootLink, "reports", "x.sarif")]);
+        RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
+            setup, "touch '" + workerMarker + "'"));
+
+        Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("is at or under the runs root outside runs/", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_PATH_directory_outside_the_tree_reached_through_an_outside_symlink_runs_cleanAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks and a shell script need a Unix shell");
+
+        (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
+        string dirBLink = Path.Combine(_dirs.Create("lw-gate-links"), "pathb-link");
+        _ = Directory.CreateSymbolicLink(dirBLink, dirB);
+
+        (int code, string stdout) = await RunAsync(setup, "true", () => SetPath(dirA, dirBLink));
+
+        AssertClean(setup, code, stdout);
+    }
+
     // ---- gate.trust ----------------------------------------------------------------------------------------
 
     [Fact]

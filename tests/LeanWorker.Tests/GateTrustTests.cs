@@ -537,4 +537,138 @@ public sealed class GateTrustTests : IDisposable
             Assert.DoesNotContain(file, paths, StringComparer.Ordinal);
         }
     }
+
+    // ---- Canonical: realpath(3) semantics ------------------------------------------------------------------
+
+    // A fresh directory under its own canonical name, so expectations hold wherever the temp root lives.
+    private string NewCanonicalDir() => GateTrust.Canonical(NewDir()).Path;
+
+    [Fact]
+    public void Canonical_of_a_plain_existing_path_is_the_path_itself_with_no_links()
+    {
+        string dir = NewCanonicalDir();
+        string sub = Path.Combine(dir, "a", "b");
+        _ = Directory.CreateDirectory(sub);
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(sub);
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(sub, canonical.Path);
+        Assert.Empty(canonical.Links);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public void Canonical_resolves_a_symlinked_parent_component()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string real = Path.Combine(dir, "real");
+        _ = Directory.CreateDirectory(Path.Combine(real, "bin"));
+        string link = Path.Combine(dir, "link");
+        _ = Directory.CreateSymbolicLink(link, real);
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(Path.Combine(link, "bin"));
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(real, "bin"), canonical.Path);
+        Assert.Equal([link], canonical.Links);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public void Canonical_follows_a_chain_of_two_links_and_lists_both_in_order()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string real = Path.Combine(dir, "real");
+        _ = Directory.CreateDirectory(real);
+        string first = Path.Combine(dir, "first");
+        string second = Path.Combine(dir, "second");
+        _ = Directory.CreateSymbolicLink(first, "real");
+        _ = Directory.CreateSymbolicLink(second, "first");
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(second);
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(real, canonical.Path);
+        Assert.Equal([second, first], canonical.Links);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public void Canonical_resolves_dot_dot_after_a_link_against_the_link_target()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string deep = Path.Combine(dir, "real", "deep");
+        _ = Directory.CreateDirectory(deep);
+        string link = Path.Combine(dir, "link");
+        _ = Directory.CreateSymbolicLink(link, deep);
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(link + "/../x");
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(dir, "real", "x"), canonical.Path);
+        Assert.False(string.Equals(Path.Combine(dir, "x"), canonical.Path, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Canonical_appends_a_non_existent_tail_lexically_normalised()
+    {
+        string dir = NewCanonicalDir();
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(dir + "/missing/./sub//x");
+
+        Assert.True(canonical.Resolved);
+        Assert.Equal(Path.Combine(dir, "missing", "sub", "x"), canonical.Path);
+        Assert.Empty(canonical.Links);
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public void Canonical_resolves_the_existing_prefix_of_a_path_with_a_non_existent_tail()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string real = Path.Combine(dir, "real");
+        _ = Directory.CreateDirectory(real);
+        string link = Path.Combine(dir, "link");
+        _ = Directory.CreateSymbolicLink(link, real);
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(Path.Combine(link, "not", "there"));
+
+        Assert.Equal(Path.Combine(real, "not", "there"), canonical.Path);
+        Assert.Equal([link], canonical.Links);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [UnsupportedOSPlatform("windows")]
+    public async Task Canonical_of_a_link_loop_fails_bounded_instead_of_hangingAsync(bool selfLink)
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need a Unix filesystem");
+
+        string dir = NewCanonicalDir();
+        string a = Path.Combine(dir, "a");
+        string b = Path.Combine(dir, "b");
+        _ = Directory.CreateSymbolicLink(a, selfLink ? "a" : "b");
+        if (!selfLink)
+        {
+            _ = Directory.CreateSymbolicLink(b, "a");
+        }
+
+        GateTrust.CanonicalPath canonical = await Task.Run(() => GateTrust.Canonical(Path.Combine(a, "tail")), TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+
+        Assert.False(canonical.Resolved);
+        Assert.Equal("unreadable: too many links", canonical.Unreadable);
+        Assert.NotEmpty(canonical.Links);
+        Assert.All(canonical.Links, l => Assert.True(l == a || l == b));
+    }
 }
