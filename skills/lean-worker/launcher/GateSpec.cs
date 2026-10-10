@@ -258,7 +258,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     /// <summary>
     /// Reads <c>gate.trust</c>: an optional list of repo-relative paths or globs the operator wants
     /// added to the trust set (the same paths the gate chain hashes). Entries are kept for
-    /// <see cref="GateTrust.CollectPaths"/> to resolve relative to the git root (or the gate working
+    /// <see cref="GateTrust.CollectChainPaths"/> to resolve relative to the git root (or the gate working
     /// directory when not in git) at start time, exactly like the gate command's arguments.
     /// </summary>
     private static List<string> ReadTrust(JsonObject gate)

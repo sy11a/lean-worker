@@ -76,11 +76,13 @@ internal static class GateTrust
     internal enum TrustSource
     {
         /// <summary>
-        /// An existing file path named in the gate's argv (after argv[0]), under the git root. No argv
-        /// entry is ever excluded from a trust comparison by default: the old runnable-position
-        /// heuristic missed wrappers such as <c>env VAR=1 sh gate.sh</c>, so a gate that writes a file
-        /// named in its argv needs that file declared in <c>gate.outputs</c> (or the run ends in a
-        /// trust violation when the report path is checked).
+        /// An existing file path named in the gate's argv (after argv[0]), wherever it lives — inside
+        /// the git root or not, exactly like argv[0]: a worker that can write the gate's script can
+        /// change what the gate runs, no matter where the script sits. No argv entry is ever excluded
+        /// from a trust comparison by default: the old runnable-position heuristic missed wrappers
+        /// such as <c>env VAR=1 sh gate.sh</c>, so a gate that writes a file named in its argv needs
+        /// that file declared in <c>gate.outputs</c> (or the run ends in a trust violation when the
+        /// report path is checked).
         /// </summary>
         ArgvEntry,
         /// <summary>
@@ -360,18 +362,6 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// Paths whose state differs between the two snapshots, in ordinal order. A path counts as changed
-    /// when it is in one snapshot but not the other, or when its value differs (a retargeted
-    /// symlink shows up as the same key with a different "target" half in its value).
-    /// </summary>
-    public static List<string> Changed(Snapshot before, Snapshot after)
-    {
-        return [.. before.Hashes.Keys.Union(after.Hashes.Keys, StringComparer.Ordinal)
-            .Where(p => !before.Hashes.TryGetValue(p, out string? a) || !after.Hashes.TryGetValue(p, out string? b) || a != b)
-            .Order(StringComparer.Ordinal),];
-    }
-
-    /// <summary>
     /// Paths that are in one of the two sets but not the other, in ordinal order: a file that appeared
     /// in, or vanished from, the trusted set since <paramref name="before"/> was taken.
     /// <paramref name="exclusions"/> (the report paths the gate named) is applied to both sides:
@@ -487,44 +477,6 @@ internal static class GateTrust
     }
 
     /// <summary>
-    /// The paths the gate chain treats as trusted inputs (the composition of
-    /// <see cref="CollectChainPaths"/> and <see cref="CollectVolatilePaths"/>): every file under
-    /// <paramref name="runsRoot"/> (recursively, except the launcher-owned subtrees <c>runs/</c>,
-    /// <c>inbox/</c>, <c>system/</c> and the ledger <c>runs.jsonl</c>), <c>dotnet-tools.json</c>,
-    /// <c>.config/dotnet-tools.json</c>, <c>global.json</c> and the three
-    /// <c>NuGet.config</c>/<c>NuGet.Config</c>/<c>nuget.config</c> casings at every directory from
-    /// <paramref name="gateWorkingDirectory"/> up to <paramref name="gitRoot"/> (deduped), the
-    /// resolved gate executable (argv[0]: PATH when the entry has no directory part, else resolved
-    /// against <paramref name="gateWorkingDirectory"/> — wherever it lives, inside the repo or not),
-    /// every remaining argv entry that is an existing file path under <paramref name="gitRoot"/>
-    /// (resolved against <paramref name="gateWorkingDirectory"/>), any <paramref name="extraTrust"/>
-    /// paths or globs the operator pinned (literal entries included even when absent, glob matches
-    /// limited to files that exist before the worker runs; a glob that matches no file adds
-    /// <c>gate.trust[&lt;i&gt;] '&lt;glob&gt;' matched no files</c> to <paramref name="warnings"/>
-    /// when that list is given), and the price book file at
-    /// <paramref name="extraPricesFile"/> whenever one is given (even under
-    /// <paramref name="runsRoot"/>, whose walk skips runs/, inbox/, system/ and runs.jsonl). When
-    /// <paramref name="sources"/> is given, every add records its <see cref="TrustSource"/> in it
-    /// (merged across collectors, so a path named twice is trusted from both).
-    /// </summary>
-    public static List<string> CollectPaths(string runsRoot, string gitRoot, string gateWorkingDirectory, IReadOnlyList<string> gateCommand,
-        IReadOnlyList<string>? extraTrust = null, string? extraPricesFile = null, List<string>? warnings = null,
-        Dictionary<string, HashSet<TrustSource>>? sources = null)
-    {
-        List<string> paths = CollectChainPaths(runsRoot, gitRoot, gateWorkingDirectory, gateCommand, extraTrust, extraPricesFile, warnings, sources);
-        HashSet<string> dedupe = new(paths, StringComparer.Ordinal);
-        foreach (string path in CollectVolatilePaths(runsRoot, gateWorkingDirectory, gitRoot, sources))
-        {
-            if (dedupe.Add(path))
-            {
-                paths.Add(path);
-            }
-        }
-
-        return paths;
-    }
-
-    /// <summary>
     /// The part of the trust set that is fixed for a whole gate chain: the resolved gate executable,
     /// the existing argv file entries, and the <c>gate.trust</c> entries (literal paths and glob
     /// matches). The launcher resolves this list once, before round 1's worker runs, and reuses it
@@ -572,7 +524,7 @@ internal static class GateTrust
         }
 
         AddResolvedExecutable(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.Executable));
-        AddArgvEntries(gateCommand, gateWorkingDirectory, gitRoot, p => AddTracked(p, TrustSource.ArgvEntry));
+        AddArgvEntries(gateCommand, gateWorkingDirectory, p => AddTracked(p, TrustSource.ArgvEntry));
         AddExtraTrust(extraTrust, gitRoot, gateWorkingDirectory, runsRoot, p => AddTracked(p, TrustSource.TrustEntry), warnings);
         AddPricesFile(extraPricesFile, p => AddTracked(p, TrustSource.PricesFile));
         return paths;
@@ -795,7 +747,14 @@ internal static class GateTrust
         add(exe);
     }
 
-    private static void AddArgvEntries(IReadOnlyList<string> gateCommand, string gateWorkingDirectory, string gitRoot, Action<string> add)
+    /// <summary>
+    /// The existing file paths named in the gate's argv after argv[0], resolved against the gate
+    /// working directory, wherever they live: argv[0] is trusted wherever it resolves, and an argv
+    /// entry the worker can write changes what the gate runs just the same (a wrapper such as
+    /// <c>env X=1 sh /opt/gates/gate.sh</c> hides the script behind env, so no position or
+    /// inside-the-repo rule can pick it out). Entries that do not exist as files are skipped.
+    /// </summary>
+    private static void AddArgvEntries(IReadOnlyList<string> gateCommand, string gateWorkingDirectory, Action<string> add)
     {
         for (int i = 1; i < gateCommand.Count; i++)
         {
@@ -818,12 +777,6 @@ internal static class GateTrust
             }
 
             if (!File.Exists(full))
-            {
-                continue;
-            }
-
-            string rel = Path.GetRelativePath(gitRoot, full);
-            if (rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel))
             {
                 continue;
             }
@@ -869,7 +822,10 @@ internal static class GateTrust
     /// <summary>
     /// Resolves the operator's <c>gate.trust</c> entries against the git root (or the gate working
     /// directory when there is no git root) and adds them to the trust set. Literal entries (no glob
-    /// characters) are added as-is, even when the file does not exist; glob matches are limited to
+    /// characters) are added as-is, even when the file does not exist; a literal that names a
+    /// directory is refused with a <see cref="LaunchException"/> naming <c>gate.trust[&lt;i&gt;]</c>
+    /// (a directory hashes as non-regular and would fail every run with "is not a regular file", a
+    /// configuration mistake better caught before the worker starts). Glob matches are limited to
     /// files that exist before the worker runs (WriteScope.InScope-style matching). A glob entry
     /// that matches no file adds <c>gate.trust[&lt;i&gt;] '&lt;glob&gt;' matched no files</c> to
     /// <paramref name="warnings"/> when that list is given.
@@ -894,12 +850,12 @@ internal static class GateTrust
             }
             else
             {
-                AddLiteralEntry(entries[i], anchor, add);
+                AddLiteralEntry(entries[i], i, anchor, add);
             }
         }
     }
 
-    private static void AddLiteralEntry(string entry, string anchor, Action<string> add)
+    private static void AddLiteralEntry(string entry, int index, string anchor, Action<string> add)
     {
         string full;
         try
@@ -909,6 +865,12 @@ internal static class GateTrust
         catch (ArgumentException)
         {
             return;
+        }
+
+        if (Directory.Exists(full))
+        {
+            throw new LaunchException(
+                $"gate.trust[{index.ToString(CultureInfo.InvariantCulture)}] '{entry}' is a directory: {full}");
         }
 
         add(full);

@@ -69,6 +69,12 @@ internal static class Gate
             return await BuildStartFailureResultAsync(ex.Message, started, gateJsonPath, spec, envNames).ConfigureAwait(false);
         }
 
+        // gate.log is opened before Process.Start: if the open fails, no child exists yet and there
+        // is nothing to kill (the failure surfaces as a gate error below); once the child runs, the
+        // writer is already open and an open failure mid-run cannot orphan the process.
+        StreamWriter log = Launcher.CreateWriter(logPath, Json.Utf8);
+        await using ConfiguredAsyncDisposable logDisposal = log.ConfigureAwait(false);
+
         Process? childProcess;
         try
         {
@@ -93,7 +99,7 @@ internal static class Gate
             }
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException) { }
 
-            return await DriveProcessAsync(process, spec, logPath, gateJsonPath, started, cwd, stdout, envNames, token).ConfigureAwait(false);
+            return await DriveProcessAsync(process, spec, logPath, gateJsonPath, started, cwd, stdout, envNames, log, token).ConfigureAwait(false);
         }
     }
 
@@ -256,10 +262,10 @@ internal static class Gate
     }
 
     private static async Task<GateResult> DriveProcessAsync(Process process, GateSpec spec, string logPath, string gateJsonPath,
-        DateTimeOffset started, string cwd, StdoutBuffer stdoutBuf, IReadOnlyList<string> envNames, CancellationToken token)
+        DateTimeOffset started, string cwd, StdoutBuffer stdoutBuf, IReadOnlyList<string> envNames, StreamWriter log, CancellationToken token)
     {
-        StreamWriter log = Launcher.CreateWriter(logPath, Json.Utf8);
-        await using ConfiguredAsyncDisposable logDisposal = log.ConfigureAwait(false);
+        // The log writer is opened by the caller (before Process.Start) and disposed there; this
+        // method only writes it.
         object logLock = new();
         int feedbackCap = spec.FeedbackMaxChars + 1;
 
@@ -487,7 +493,9 @@ internal static class Gate
         string full;
         try
         {
-            full = Path.IsPathRooted(reportPath) ? reportPath : Path.GetFullPath(Path.Combine(cwd, reportPath));
+            // GetFullPath also normalizes an absolute path (a printed "../" hop or a "." segment
+            // must not blur the run-directory exemption or the source lookup).
+            full = Path.GetFullPath(Path.IsPathRooted(reportPath) ? reportPath : Path.Combine(cwd, reportPath));
         }
         catch (ArgumentException ex)
         {

@@ -107,10 +107,21 @@ internal sealed class LaunchRun
     // along, frozen too: they tell the report-path rule where a path is trusted from. Nothing is
     // excluded from a comparison by default — not even entries of the gate's own argv; only the
     // profile's declared gate.outputs leave the after-gate comparison, because the gate is expected
-    // to write exactly those paths.
+    // to write exactly those paths. After a clean after-gate check the declared outputs that are in
+    // the trusted set are re-hashed (PostGateOutputs): the gate legitimately rewrote them after
+    // round 1's baseline was taken, so the next round's baseline is round 1's snapshot with exactly
+    // those keys replaced. Everything else keeps round 1's value.
     public GateTrust.Snapshot? TrustSnapshot { get; private set; }
     public IReadOnlyList<string>? TrustPaths { get; private set; }
     public IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources { get; private set; }
+
+    /// <summary>
+    /// The declared gate outputs that are trusted inputs, re-hashed after this round's clean
+    /// after-gate check. The chain loop hands it to the next round's <see cref="GateContext"/>, whose
+    /// baseline is round 1's snapshot with exactly these keys replaced; null when there is no trust
+    /// snapshot or no declared output in the trusted set.
+    /// </summary>
+    public GateTrust.Snapshot? PostGateOutputs { get; private set; }
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -701,7 +712,13 @@ internal sealed class LaunchRun
             // become the new baseline. Only the walks meant to catch new files (runs root, config
             // walk) are re-collected, inside RunGateAsync's checks. Round 1's gate.trust warnings
             // ride along on the frozen spec: gate.json records them, the result block notes them.
-            TrustSnapshot = GateContext.TrustSnapshot;
+            // The one exception to "round 1's values": the declared outputs the previous round's
+            // gate legitimately rewrote (PostGateOutputs, hashed after its clean after-gate check)
+            // replace those keys, or this round's pre-gate check would fail on the gate's own
+            // round-1 write.
+            TrustSnapshot = GateContext.PostGateOutputs is null
+                ? GateContext.TrustSnapshot
+                : MergePostGateOutputs(NonNull(GateContext.TrustSnapshot), GateContext.PostGateOutputs);
             TrustPaths = GateContext.TrustPaths;
             FixedSources = GateContext.FixedSources;
             if (_gate?.Warnings is { Count: > 0 } frozen)
@@ -964,59 +981,132 @@ internal sealed class LaunchRun
     /// Runs the gate between the two trust checks. Both compare against round 1's before-worker
     /// snapshot, never against a fresh baseline: a later round must not accept whatever is on disk
     /// when it starts, or a tampering process that survives into it would hide. Returns the trust
-    /// violation message (null when clean) and the gate result when the gate ran.
+    /// violation message (null when clean) and the gate result when the gate ran. After a clean
+    /// after-gate check, the declared outputs that are in the trusted set are re-hashed into
+    /// <see cref="PostGateOutputs"/> so the next round's baseline accepts the gate's own round-1
+    /// write and nothing else.
     /// </summary>
     private async Task<(string? Violation, Gate.GateResult? GateRan)> RunTrustedGateAsync()
     {
-        string? violation = null;
-        Gate.GateResult? gateRan = null;
+        // Pre-gate: a worker may have swapped a trusted input between round 1's before-worker
+        // snapshot and now. Nothing is excluded: a declared gate output is compared like any
+        // other trusted path here, because the worker must not change it — only the gate may,
+        // after this check. The check refuses the gate with a precise list of changed paths so
+        // the chain ends in `error` instead of running the gate against tampered inputs.
+        string? violation;
         try
         {
-            // Pre-gate: a worker may have swapped a trusted input between round 1's before-worker
-            // snapshot and now. Nothing is excluded: a declared gate output is compared like any
-            // other trusted path here, because the worker must not change it — only the gate may,
-            // after this check. The check refuses the gate with a precise list of changed paths so
-            // the chain ends in `error` instead of running the gate against tampered inputs.
-            if (TrustSnapshot is not null)
-            {
-                violation = await TrustViolationMessageAsync(_noExclusions, reportPath: null, "the worker changed files the gate trusts: ").ConfigureAwait(false);
-            }
-
-            if (violation is null)
-            {
-                Gate.GateResult result = await Gate.RunAsync(NonNull(_gate), RunDir, CancellationToken.None).ConfigureAwait(false);
-                gateRan = result;
-
-                // Post-gate: a process the worker detached can survive the worker's exit and rewrite
-                // a trusted file between the pre-gate check and the gate's end. The pre-gate check
-                // is not enough; we hash a third time after the gate exits and refuse the chain on
-                // any difference from round 1's before-worker snapshot (or a bad state). The
-                // declared gate outputs leave this comparison on both sides — the gate is expected
-                // to write exactly those paths; everything else (the gate's argv entries included)
-                // must match. The gate's report path is checked first, inside the same call: it may
-                // be under this run's directory or a declared output, it is a trust violation when
-                // it is a trusted input from any source, and it is invisible to the trust set
-                // otherwise.
-                //
-                // Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted
-                // file between two hashes and restores it before the next hash escapes the check.
-                // Killing the worker's process group would shrink that window; the launcher does
-                // not take that step.
-                if (TrustSnapshot is not null)
-                {
-                    violation = await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync().ConfigureAwait(false), result.ReportPath,
-                        "trusted files changed while the gate ran: ").ConfigureAwait(false);
-                }
-            }
+            violation = TrustSnapshot is not null
+                ? await TrustViolationMessageAsync(_noExclusions, reportPath: null, "the worker changed files the gate trusts: ").ConfigureAwait(false)
+                : null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // A trust check that cannot read the tree fails closed as a trust violation (outcome
             // `error`, exit 5) rather than crashing the launch with exit 2.
-            violation = $"the trusted inputs could not be checked: {ex.Message}";
+            return ($"the trusted inputs could not be checked: {ex.Message}", null);
         }
 
-        return (violation, gateRan);
+        if (violation is not null)
+        {
+            return (violation, null);
+        }
+
+        Gate.GateResult result;
+        try
+        {
+            result = await Gate.RunAsync(NonNull(_gate), RunDir, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A failure inside the gate runner itself (opening gate.log, writing gate.json) is not
+            // a trust-check failure: name the actual cause instead of blaming the trusted inputs.
+            return ($"the gate could not be run: {ex.Message}", null);
+        }
+
+        return (await PostGateCheckAsync(result).ConfigureAwait(false), result);
+    }
+
+    /// <summary>
+    /// The after-gate trust check plus the post-gate bookkeeping that follows it when the check is
+    /// clean. Post-gate: a process the worker detached can survive the worker's exit and rewrite
+    /// a trusted file between the pre-gate check and the gate's end. The pre-gate check
+    /// is not enough; we hash a third time after the gate exits and refuse the chain on
+    /// any difference from round 1's before-worker snapshot (or a bad state). The
+    /// declared gate outputs leave this comparison on both sides — the gate is expected
+    /// to write exactly those paths; everything else (the gate's argv entries included)
+    /// must match. The gate's report path is checked first, inside the same call: it may
+    /// be under this run's directory or a declared output, it is a trust violation when
+    /// it is a trusted input from any source, and it is invisible to the trust set
+    /// otherwise.
+    ///
+    /// Remaining gap (deliberate, no P/Invoke): a detached process that swaps a trusted
+    /// file between two hashes and restores it before the next hash escapes the check.
+    /// Killing the worker's process group would shrink that window; the launcher does
+    /// not take that step.
+    /// After a clean check, the declared outputs that are in the trusted set are re-hashed into
+    /// <see cref="PostGateOutputs"/> so the next round's baseline accepts the gate's own write and
+    /// nothing else.
+    /// </summary>
+    private async Task<string?> PostGateCheckAsync(Gate.GateResult result)
+    {
+        try
+        {
+            string? violation = TrustSnapshot is not null
+                ? await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync().ConfigureAwait(false), result.ReportPath,
+                    "trusted files changed while the gate ran: ").ConfigureAwait(false)
+                : null;
+
+            if (violation is null)
+            {
+                PostGateOutputs = await HashPostGateOutputsAsync().ConfigureAwait(false);
+            }
+
+            return violation;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A trust check that cannot read the tree fails closed as a trust violation (outcome
+            // `error`, exit 5) rather than crashing the launch with exit 2.
+            return $"the trusted inputs could not be checked: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// After a clean after-gate check: hashes the declared gate outputs that are keys of the trust
+    /// snapshot (the trusted set) and returns them as a snapshot fragment. The gate was allowed to
+    /// rewrite exactly those paths, so the next round's baseline must carry their post-gate values —
+    /// the chain loop stores the fragment on the next <see cref="GateContext"/> and every later
+    /// round merges it over round 1's snapshot (<see cref="MergePostGateOutputs"/>), keeping round 1's
+    /// values everywhere else. Null when there is no snapshot or no declared output in it.
+    /// </summary>
+    private async Task<GateTrust.Snapshot?> HashPostGateOutputsAsync()
+    {
+        if (TrustSnapshot is null)
+        {
+            return null;
+        }
+
+        GateTrust.Snapshot snapshot = TrustSnapshot;
+        List<string> outputs =
+            [.. (await DeclaredOutputPathsAsync().ConfigureAwait(false)).Where(p => snapshot.Hashes.ContainsKey(p))];
+        return outputs.Count is 0 ? null : await GateTrust.HashAsync(outputs).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Round 1's snapshot with the post-gate declared-output values (<paramref name="postGate"/>)
+    /// replacing their keys — nothing else. The merge is anchored on round 1's snapshot every round,
+    /// so a value only the gate writes can never leak into the baseline for any other path.
+    /// </summary>
+    private static GateTrust.Snapshot MergePostGateOutputs(GateTrust.Snapshot baseline, GateTrust.Snapshot postGate)
+    {
+        Dictionary<string, string> merged = new(baseline.Hashes, StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> entry in postGate.Hashes)
+        {
+            merged[entry.Key] = entry.Value;
+        }
+
+        return new GateTrust.Snapshot(merged);
     }
 
     /// <summary>
