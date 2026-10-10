@@ -243,6 +243,53 @@ public class GateSpecTests
     }
 
     [Fact]
+    public void Gate_outputs_defaults_to_empty_and_keeps_valid_entries_with_forward_slashes()
+    {
+        Assert.Empty(GateSpec.FromProfile(Profile(MinimalGate()))!.Outputs!);
+
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = new JsonArray(["out/report.sarif", "artifacts\\check.sarif"]);
+        GateSpec spec = GateSpec.FromProfile(Profile(gate))!;
+        Assert.Equal(["out/report.sarif", "artifacts/check.sarif"], spec.Outputs, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public void Gate_outputs_must_be_an_array()
+    {
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = "out/report.sarif";
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.outputs", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("/etc/passwd")]
+    [InlineData("..")]
+    [InlineData("../outside.sarif")]
+    [InlineData("out/../../outside.sarif")]
+    [InlineData("out\\..\\..\\outside.sarif")]
+    [InlineData("out/*.sarif")]
+    [InlineData("out/report?.sarif")]
+    [InlineData("**/report.sarif")]
+    public void A_bad_gate_outputs_entry_throws_naming_its_index(string entry)
+    {
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = new JsonArray(["fine.sarif", entry]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.outputs[1]", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_non_string_gate_outputs_entry_throws_naming_its_index()
+    {
+        JsonObject gate = MinimalGate();
+        gate["outputs"] = new JsonArray(["fine.sarif", 7]);
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate)));
+        Assert.Contains("gate.outputs[1]", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void No_gate_flag_parses()
     {
         Options o = Options.Parse(["--no-gate"]);

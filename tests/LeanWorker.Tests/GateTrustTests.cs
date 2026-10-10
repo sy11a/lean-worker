@@ -19,6 +19,56 @@ public sealed class GateTrustTests : IDisposable
 
     private static string StateOf(string value) => value[(value.IndexOf('|', StringComparison.Ordinal) + 1)..];
 
+    private static Dictionary<string, HashSet<GateTrust.TrustSource>> SourcesOf(string path, GateTrust.TrustSource source) =>
+        new(StringComparer.Ordinal) { [path] = [source] };
+
+    [Fact]
+    public void A_report_path_outside_the_trusted_set_is_no_violation() =>
+        Assert.Null(GateTrust.ReportPathViolation("/r/report.sarif", SourcesOf("/r/other", GateTrust.TrustSource.ArgvEntry)));
+
+    [Fact]
+    public void A_null_or_empty_report_path_is_no_violation()
+    {
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = SourcesOf("/r/a", GateTrust.TrustSource.ArgvEntry);
+        Assert.Null(GateTrust.ReportPathViolation(reportPath: null, sources));
+        Assert.Null(GateTrust.ReportPathViolation(string.Empty, sources));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_report_path_that_is_trusted_from_any_source_is_a_violation(bool argvEntry)
+    {
+        GateTrust.TrustSource source = argvEntry ? GateTrust.TrustSource.ArgvEntry : GateTrust.TrustSource.Executable;
+        Assert.Equal(
+            "the gate's report path is a trusted input: /r/gate.sh",
+            GateTrust.ReportPathViolation("/r/gate.sh", SourcesOf("/r/gate.sh", source)));
+    }
+
+    [Fact]
+    public void A_declared_output_or_a_path_under_the_run_directory_is_no_violation()
+    {
+        Dictionary<string, HashSet<GateTrust.TrustSource>> sources = SourcesOf("/r/out.sarif", GateTrust.TrustSource.ArgvEntry);
+        Assert.Null(GateTrust.ReportPathViolation("/r/out.sarif", sources, new HashSet<string>(StringComparer.Ordinal) { "/r/out.sarif" }));
+
+        Dictionary<string, HashSet<GateTrust.TrustSource>> underRun = SourcesOf("/runs/20260101-golden/x.json", GateTrust.TrustSource.ArgvEntry);
+        Assert.Null(GateTrust.ReportPathViolation("/runs/20260101-golden/x.json", underRun, runDirectory: "/runs/20260101-golden"));
+    }
+
+    [Fact]
+    public async Task An_excluded_path_is_dropped_from_both_sides_of_the_set_differenceAsync()
+    {
+        string dir = NewDir();
+        string kept = Path.Combine(dir, "kept.txt");
+        string output = Path.Combine(dir, "out.sarif");
+        await File.WriteAllTextAsync(kept, "k", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(output, "o", TestContext.Current.CancellationToken);
+        GateTrust.Snapshot before = await GateTrust.HashAsync([kept, output]);
+
+        Assert.Equal([output], GateTrust.SetDifferences(before, [kept]), StringComparer.Ordinal);
+        Assert.Empty(GateTrust.SetDifferences(before, [kept], new HashSet<string>(StringComparer.Ordinal) { output }));
+    }
+
     [Fact]
     public async Task Unchanged_files_report_no_differenceAsync()
     {

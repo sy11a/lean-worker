@@ -276,13 +276,24 @@ public sealed class GateTrustLoopTests : IDisposable
         Assert.Equal(2, gateJson["count"]!.GetValue<int>());
     }
 
+    // No argv entry is excluded by default: a pre-existing file the gate rewrites must be declared in
+    // gate.outputs; a file that did not exist before the worker ran is not a trusted input at all.
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task A_gate_that_writes_a_file_named_in_its_argv_is_cleanAsync(bool existedBefore)
     {
         Setup setup = await NewSetupAsync(
-            gate => gate["command"]!.AsArray().Add("report.out"),
+            gate =>
+            {
+                gate["command"]!.AsArray().Add("report.out");
+                if (!existedBefore)
+                {
+                    return;
+                }
+
+                gate["outputs"] = new JsonArray(["report.out"]);
+            },
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
 
         (int code, string stdout) = await RunAsync(
@@ -308,6 +319,328 @@ public sealed class GateTrustLoopTests : IDisposable
             setup, "printf 'tampered' > report.out", () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old"));
 
         AssertViolation(setup, code, stdout, "report.out");
+    }
+
+    // ---- the gate's report path must not hide a trusted input ----------------------------------------------
+
+    // A gate that exits with code 3 and names `reportExpr` (a shell expression) as its report path.
+    private static string ReportScript(string reportExpr) =>
+        "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\necho \"sarif: " + reportExpr + "\"\nexit 3\n";
+
+    private static async Task AssertReportPathViolationAsync(int code, string stdout, string expectedPath)
+    {
+        Assert.Equal(5, code);
+        string expectedError = "the gate's report path is a trusted input: " + expectedPath;
+        Assert.Contains("gate:     ERROR: " + expectedError, stdout, StringComparison.Ordinal);
+
+        string runDir = RunAsyncGolden.RunDirFrom(stdout);
+        JsonObject summaryGate = RunAsyncGolden.Summary(runDir)["gate"]!.AsObject();
+        Assert.Equal("error", summaryGate["decision"]!.GetValue<string>());
+        Assert.Equal("error", summaryGate["outcome"]!.GetValue<string>());
+        Assert.Equal(3, summaryGate["exit_code"]!.GetValue<int>());
+        Assert.Equal(expectedError, summaryGate["error"]!.GetValue<string>());
+
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.Equal("error", gateJson["outcome"]!.GetValue<string>());
+        Assert.Equal(3, gateJson["exit_code"]!.GetValue<int>());
+    }
+
+    [Theory]
+    [InlineData("global.json")]
+    [InlineData(".config/dotnet-tools.json")]
+    [InlineData("literal.props")]
+    public async Task A_report_path_that_is_a_trusted_file_in_the_working_directory_ends_in_errorAsync(string relative)
+    {
+        Setup setup = await NewSetupAsync(
+            gate => gate["trust"] = relative is "literal.props" ? new JsonArray([relative]) : [],
+            ReportScript(relative));
+        string expected = string.Empty;
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () =>
+            {
+                string cwd = Directory.GetCurrentDirectory();
+                expected = Path.Combine(cwd, relative);
+                _ = Directory.CreateDirectory(Path.GetDirectoryName(expected)!);
+                File.WriteAllText(expected, "{}");
+            });
+
+        await AssertReportPathViolationAsync(code, stdout, expected);
+    }
+
+    [Fact]
+    public async Task A_report_path_that_is_the_prices_file_ends_in_errorAsync()
+    {
+        string prices = Path.Combine(_dirs.Create("lw-gate-prices"), "my-prices.json");
+        await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
+        Setup setup = await NewSetupAsync(scriptBody: ReportScript(prices));
+
+        (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
+
+        await AssertReportPathViolationAsync(code, stdout, prices);
+    }
+
+    // ---- a gate script inside the repository, plain (`sh gate.sh`) or behind a wrapper (`env X=1 sh gate.sh`) --
+    // An argv file entry counts as trusted only under the git root (or the working directory), so these
+    // tests keep the script in the working directory instead of the scratch directory.
+
+    private async Task<Setup> NewRepoScriptSetupAsync(bool wrapped) =>
+        await NewSetupAsync(gate => gate["command"] = wrapped ? new JsonArray(["env", "X=1", "sh", "gate.sh"]) : new JsonArray(["sh", "gate.sh"]));
+
+    // Writes the gate script into the working directory; returns its full path.
+    private static string PlantRepoScript(string body)
+    {
+        string path = Path.Combine(Directory.GetCurrentDirectory(), "gate.sh");
+        File.WriteAllText(path, body);
+        return path;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_report_path_that_is_the_gate_script_ends_in_errorAsync(bool wrapped)
+    {
+        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        string expected = string.Empty;
+
+        (int code, string stdout) = await RunAsync(setup, "true", () => expected = PlantRepoScript(ReportScript("$0")));
+
+        await AssertReportPathViolationAsync(code, stdout, expected);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_worker_that_changes_the_script_trips_the_trust_checkAsync(bool wrapped)
+    {
+        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        string expected = string.Empty;
+        string body = "#!/bin/sh\ntouch '" + setup.Marker + "'\nexit 0\n";
+
+        (int code, string stdout) = await RunAsync(
+            setup, "printf '#!/bin/sh\\nexit 0\\n' > gate.sh", () => expected = PlantRepoScript(body));
+
+        AssertViolation(setup, code, stdout, expected);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_gate_script_the_worker_leaves_alone_is_cleanAsync(bool wrapped)
+    {
+        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        string body = "#!/bin/sh\ntouch '" + setup.Marker + "'\nexit 0\n";
+
+        (int code, string stdout) = await RunAsync(setup, "true", () => PlantRepoScript(body));
+
+        AssertClean(setup, code, stdout);
+    }
+
+    // ---- declared gate outputs -----------------------------------------------------------------------------
+
+    private const string OutputScript =
+        "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nmkdir -p out\n" +
+        "printf '{\"runs\":[{\"results\":[]}]}' > out/report.sarif\necho 'sarif: out/report.sarif'\nexit 0\n";
+
+    private static void WriteOldReport()
+    {
+        string dir = Path.Combine(Directory.GetCurrentDirectory(), "out");
+        _ = Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "report.sarif"), "old");
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task A_gate_that_rewrites_a_declared_output_is_cleanAsync(bool inArgv, bool existedBefore)
+    {
+        Setup setup = await NewSetupAsync(
+            gate =>
+            {
+                gate["outputs"] = new JsonArray(["out/report.sarif"]);
+                if (!inArgv)
+                {
+                    return;
+                }
+
+                gate["command"]!.AsArray().Add("--output");
+                gate["command"]!.AsArray().Add("out/report.sarif");
+            },
+            OutputScript);
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () =>
+            {
+                if (!existedBefore)
+                {
+                    return;
+                }
+
+                WriteOldReport();
+            });
+
+        AssertClean(setup, code, stdout);
+
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(
+            Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.Equal(["out/report.sarif"], gateJson["outputs"]!.AsArray().Select(n => n!.GetValue<string>()), StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_changes_a_declared_output_that_is_also_an_argv_entry_trips_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync(
+            gate =>
+            {
+                gate["outputs"] = new JsonArray(["out/report.sarif"]);
+                gate["command"]!.AsArray().Add("--output");
+                gate["command"]!.AsArray().Add("out/report.sarif");
+            },
+            OutputScript);
+
+        (int code, string stdout) = await RunAsync(setup, "printf 'tampered' > out/report.sarif", () => WriteOldReport());
+
+        AssertViolation(setup, code, stdout, "report.sarif");
+    }
+
+    [Fact]
+    public async Task Gate_json_has_no_outputs_when_none_are_declaredAsync()
+    {
+        Setup setup = await NewSetupAsync();
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+        JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(
+            Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
+        Assert.False(gateJson.ContainsKey("outputs"));
+    }
+
+    [Fact]
+    public async Task A_gate_that_rewrites_an_undeclared_argv_output_that_existed_before_ends_in_errorAsync()
+    {
+        // The report path points elsewhere (an untrusted file), so only the after-gate comparison can see it.
+        Setup setup = await NewSetupAsync(
+            gate => gate["command"]!.AsArray().Add("report.out"),
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf 'new' > \"$1\"\nR=\"$(dirname \"$0\")/rep.json\"\n" +
+            "printf '{\"runs\":[{\"results\":[]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 0\n");
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old"));
+
+        Assert.Equal(5, code);
+        Assert.Contains("gate:     ERROR: trusted files changed while the gate ran: ", stdout, StringComparison.Ordinal);
+        Assert.Contains("report.out", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_report_path_under_the_run_directory_is_cleanAsync()
+    {
+        Setup setup = await NewSetupAsync();
+        await GateLoopTests.WriteExecutableAsync(
+            setup.Script,
+            "#!/bin/sh\ntouch '" + setup.Marker + "'\nfor d in '" + setup.Root + "'/runs/*/; do D=\"${d%/}\"; done\n" +
+            "printf '{\"runs\":[{\"results\":[]}]}' > \"$D/gate-report.json\"\necho \"sarif: $D/gate-report.json\"\nexit 0\n");
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    // ---- gate.outputs validated against the trusted inputs -------------------------------------------------
+
+    private static readonly string[] _runsRootFiles = ["profiles.json", "project.md", "task.md"];
+
+    // Creates the trusted file a declared output collides with; the "runsroot" case moves the runs root
+    // under the working directory (rr/) so a repo-relative path can name one of its files.
+    private static void PlantTrustedFile(string kind, string path, string originalRoot)
+    {
+        _ = Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, kind is "argv0" ? "#!/bin/sh\nexit 0\n" : "{}");
+        if (kind is "argv0" && !OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        if (kind is not "runsroot")
+        {
+            return;
+        }
+
+        foreach (string name in _runsRootFiles)
+        {
+            File.Copy(Path.Combine(originalRoot, name), Path.Combine(Directory.GetCurrentDirectory(), "rr", name), overwrite: true);
+        }
+    }
+
+    private static void PointOptionsAtTrustedFile(string kind, Options o, string output)
+    {
+        string cwd = Directory.GetCurrentDirectory();
+        if (kind is "prices")
+        {
+            o.PricesFile = Path.Combine(cwd, output);
+        }
+
+        if (kind is not "runsroot")
+        {
+            return;
+        }
+
+        o.RunsRoot = Path.Combine(cwd, "rr");
+        o.TaskFile = Path.Combine(cwd, "rr", "task.md");
+    }
+
+    [Theory]
+    [InlineData("argv0")]
+    [InlineData("trust")]
+    [InlineData("prices")]
+    [InlineData("global")]
+    [InlineData("runsroot")]
+    public async Task A_declared_output_that_is_a_trusted_input_is_a_launch_error_before_the_worker_runsAsync(string kind)
+    {
+        string output = kind switch
+        {
+            "argv0" => "tool.sh",
+            "trust" => "literal.props",
+            "prices" => "prices.json",
+            "global" => "global.json",
+            _ => "rr/project.md",
+        };
+        Setup setup = await NewSetupAsync(gate =>
+        {
+            gate["outputs"] = new JsonArray(["other.out", output]);
+            gate["command"] = kind is "argv0" ? new JsonArray(["./tool.sh"]) : gate["command"]!.DeepClone();
+            gate["trust"] = kind is "trust" ? new JsonArray([output]) : [];
+        });
+        string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
+        string expected = string.Empty;
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
+            setup,
+            "touch '" + workerMarker + "'",
+            () =>
+            {
+                expected = Path.Combine(Directory.GetCurrentDirectory(), output);
+                PlantTrustedFile(kind, expected, setup.Root);
+            },
+            o => PointOptionsAtTrustedFile(kind, o, output)));
+
+        Assert.Contains("gate.outputs[1] '" + expected + "' is a trusted gate input", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.False(File.Exists(setup.Marker), "the gate must not run");
+    }
+
+    [Fact]
+    public async Task A_malformed_gate_outputs_entry_stops_the_launch_naming_the_entryAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray(["../outside.sarif"]));
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "true"));
+
+        Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(setup.Marker));
     }
 
     // ---- generated files and globs -------------------------------------------------------------------------
