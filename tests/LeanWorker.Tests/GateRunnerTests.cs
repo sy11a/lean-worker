@@ -11,8 +11,12 @@ namespace LeanWorker.Tests;
 /// against it) and the process environment (the allowlist tests), so these run without parallelism.
 /// </summary>
 [Collection("launcher-process-state")]
-public partial class GateRunnerTests
+public sealed partial class GateRunnerTests : IDisposable
 {
+    private readonly TempDirs _tracked = new();
+
+    public void Dispose() => _tracked.Dispose();
+
     [GeneratedRegex(@"^sarif: (?<report>.+)$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
     private static partial Regex DefaultRegex();
 
@@ -33,7 +37,7 @@ public partial class GateRunnerTests
         return path;
     }
 
-    private static string NewDir() => Directory.CreateTempSubdirectory("lw-gate").FullName;
+    private string NewDir() => _tracked.Create("lw-gate");
 
     private static async Task<Gate.GateResult> RunInAsync(string cwd, GateSpec spec, string runDir)
     {
@@ -442,7 +446,8 @@ public partial class GateRunnerTests
         // path (same kill, a different error message).
         using TempDirs dirs = new();
         string dir = dirs.Create("lw-gate");
-        string script = WriteScript(dir, "sleep 60\nexit 0\n");
+        string marker = Path.Combine(dir, "survived");
+        string script = WriteScript(dir, "sleep 3\ntouch '" + marker + "'\nexit 0\n");
         using CancellationTokenSource cts = new();
         cts.CancelAfter(TimeSpan.FromSeconds(1));
         string oldCwd = Directory.GetCurrentDirectory();
@@ -461,5 +466,9 @@ public partial class GateRunnerTests
         Assert.Equal(-1, r.ExitCode);
         Assert.Equal("gate cancelled", r.Error);
         Assert.True(r.Duration < _bound);
+
+        // A script that had not been killed would write the marker once its sleep ends.
+        await Task.Delay(TimeSpan.FromSeconds(4), TimeProvider.System, TestContext.Current.CancellationToken);
+        Assert.False(File.Exists(marker), "the gate process kept running after the cancellation");
     }
 }

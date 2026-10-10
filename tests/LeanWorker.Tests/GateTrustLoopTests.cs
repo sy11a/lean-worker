@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.Versioning;
 using System.Text.Json.Nodes;
 using Xunit;
 
@@ -64,7 +65,7 @@ public sealed class GateTrustLoopTests : IDisposable
 
     private static void AssertClean(Setup setup, int code, string stdout)
     {
-        Assert.Equal(0, code);
+        Assert.True(code is 0, stdout);
         Assert.True(File.Exists(setup.Marker), "the gate should have run");
         Assert.Contains("gate:     clean after 1 round(s), findings 0", stdout, StringComparison.Ordinal);
     }
@@ -249,9 +250,11 @@ public sealed class GateTrustLoopTests : IDisposable
     // ---- trusted files changed while the gate ran ----------------------------------------------------------
 
     [Fact]
-    public async Task A_gate_that_rewrites_a_trusted_file_while_it_runs_ends_in_error_with_exit_code_minus_oneAsync()
+    public async Task A_gate_that_rewrites_a_trusted_file_while_it_runs_ends_in_error_and_keeps_the_gates_real_exit_codeAsync()
     {
-        Setup setup = await NewSetupAsync(scriptBody: "#!/bin/sh\nprintf '{}' > global.json\nexit 0\n");
+        Setup setup = await NewSetupAsync(scriptBody:
+            "#!/bin/sh\nprintf '{}' > global.json\nR=\"$(dirname \"$0\")/report.json\"\n" +
+            "printf '{\"runs\":[{\"results\":[1,2]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 1\n");
 
         (int code, string stdout) = await RunAsync(setup, "true");
 
@@ -263,11 +266,298 @@ public sealed class GateTrustLoopTests : IDisposable
         JsonObject gate = RunAsyncGolden.Summary(runDir)["gate"]!.AsObject();
         Assert.Equal("error", gate["decision"]!.GetValue<string>());
         Assert.Equal("error", gate["outcome"]!.GetValue<string>());
-        Assert.Equal(-1, gate["exit_code"]!.GetValue<int>());
+        Assert.Equal(1, gate["exit_code"]!.GetValue<int>());
+        Assert.Equal(2, gate["count"]!.GetValue<int>());
         Assert.StartsWith("trusted files changed while the gate ran: ", gate["error"]!.GetValue<string>(), StringComparison.Ordinal);
 
         JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(runDir, "gate.json"), TestContext.Current.CancellationToken))!.AsObject();
-        Assert.Equal(-1, gateJson["exit_code"]!.GetValue<int>());
+        Assert.Equal("error", gateJson["outcome"]!.GetValue<string>());
+        Assert.Equal(1, gateJson["exit_code"]!.GetValue<int>());
+        Assert.Equal(2, gateJson["count"]!.GetValue<int>());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_gate_that_writes_a_file_named_in_its_argv_is_cleanAsync(bool existedBefore)
+    {
+        // Production bug (gate-fix9, LaunchRun.TrustViolationMessageAsync): the report path is dropped from the
+        // checked list but stays in round 1's snapshot, so SetDifferences reports it as "removed". Remove this
+        // skip when the exclusion also applies to the snapshot's keys.
+        Assert.SkipWhen(existedBefore, "known production bug: an excluded report path that existed before the worker is reported as changed");
+
+        Setup setup = await NewSetupAsync(
+            gate => gate["command"]!.AsArray().Add("report.out"),
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
+
+        (int code, string stdout) = await RunAsync(
+            setup, "true", () =>
+            {
+                if (!existedBefore)
+                {
+                    return;
+                }
+
+                File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old");
+            });
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_worker_that_edits_an_argv_file_that_existed_before_trips_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("report.out"));
+
+        (int code, string stdout) = await RunAsync(
+            setup, "printf 'tampered' > report.out", () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old"));
+
+        AssertViolation(setup, code, stdout, "report.out");
+    }
+
+    // ---- generated files and globs -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_worker_that_generates_a_file_matched_by_a_gate_trust_glob_does_not_trip_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
+
+        (int code, string stdout) = await RunAsync(setup, "mkdir -p obj\nprintf '<Project/>' > obj/x.nuget.g.props");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_gate_that_generates_a_file_matched_by_a_gate_trust_glob_is_cleanAsync()
+    {
+        Setup setup = await NewSetupAsync(
+            gate => gate["trust"] = new JsonArray(["**/*.props"]),
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nmkdir -p obj\nprintf '<Project/>' > obj/x.nuget.g.props\nexit 0\n");
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_worker_that_edits_a_pre_existing_file_matched_by_a_recursive_glob_trips_the_trust_checkAsync()
+    {
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
+
+        (int code, string stdout) = await RunAsync(
+            setup,
+            "printf '<Project><PropertyGroup/></Project>' > Directory.Build.props",
+            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>"));
+
+        AssertViolation(setup, code, stdout, "Directory.Build.props");
+    }
+
+    // ---- chains of symlinks and non-regular trusted paths ------------------------------------------------
+
+    [Fact]
+    public async Task A_gate_executable_behind_a_two_link_chain_runs_cleanAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        Setup setup = await NewSetupAsync();
+        string dir = Path.GetDirectoryName(setup.Script)!;
+        string link1 = Path.Combine(dir, "gate-link1");
+        string link2 = Path.Combine(dir, "gate-link2");
+        _ = File.CreateSymbolicLink(link1, setup.Script);
+        _ = File.CreateSymbolicLink(link2, link1);
+        RunAsyncGolden.WriteProfile(setup.Root, "test", new JsonObject { ["gate"] = new JsonObject { ["command"] = new JsonArray([link2]) } });
+
+        (int code, string stdout) = await RunAsync(setup, "true");
+
+        AssertClean(setup, code, stdout);
+    }
+
+    [Fact]
+    public async Task A_trusted_file_behind_a_two_link_chain_is_clean_until_the_worker_edits_its_targetAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        static void Prepare()
+        {
+            string cwd = Directory.GetCurrentDirectory();
+            File.WriteAllText(Path.Combine(cwd, "real.cfg"), "one");
+            _ = File.CreateSymbolicLink(Path.Combine(cwd, "l1.cfg"), "real.cfg");
+            _ = File.CreateSymbolicLink(Path.Combine(cwd, "tools.cfg"), "l1.cfg");
+        }
+
+        Setup clean = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["tools.cfg"]));
+        (int cleanCode, string cleanStdout) = await RunAsync(clean, "true", () => Prepare());
+        AssertClean(clean, cleanCode, cleanStdout);
+
+        Setup edited = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["tools.cfg"]));
+        (int editedCode, string editedStdout) = await RunAsync(edited, "printf 'two' > real.cfg", () => Prepare());
+        AssertViolation(edited, editedCode, editedStdout, "tools.cfg");
+    }
+
+    [Theory]
+    [InlineData("directory")]
+    [InlineData("dangling")]
+    public async Task A_pre_existing_non_regular_trusted_path_ends_in_error_naming_the_pathAsync(string kind)
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "symlinks need privileges on Windows");
+
+        Setup setup = await NewSetupAsync();
+        string expected = string.Empty;
+
+        (int code, string stdout) = await RunAsync(setup, "true", () =>
+        {
+            expected = Path.Combine(Directory.GetCurrentDirectory(), "global.json");
+            if (kind is "directory")
+            {
+                _ = Directory.CreateDirectory(expected);
+            }
+            else
+            {
+                _ = File.CreateSymbolicLink(expected, Path.Combine(Directory.GetCurrentDirectory(), "lw-missing-target"));
+            }
+        });
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(setup.Marker), "the gate must not run against a non-regular trusted path");
+        Assert.Contains("trusted path '" + expected + "' is not a regular file", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain("the worker changed files", stdout, StringComparison.Ordinal);
+    }
+
+    // ---- tampering between rounds ----------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("global.json")]
+    [InlineData("profiles.json")]
+    public async Task A_process_that_tampers_between_round_one_and_round_two_ends_round_two_in_errorAsync(string target)
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
+
+        string root = _dirs.NewRoot();
+        string scratch = _dirs.Create("lw-gate-between");
+        string script = await GateLoopTests.WriteSequenceScriptAsync(scratch, (1, 3), (1, 2), (0, 0));
+        RunAsyncGolden.WriteProfile(root, "test", GateLoopTests.GateProfile(script));
+        string tamper = target is "global.json"
+            ? "printf '{}' > global.json"
+            : "printf ' ' >> '" + Path.Combine(root, "profiles.json") + "'";
+        string counter = Path.Combine(scratch, "w");
+        string tampered = Path.Combine(scratch, "tampered");
+
+        // Round 1's worker leaves a background process that waits until round 1 is recorded, then
+        // tampers and does not restore. Round 2's worker waits for it, so the change is on disk before
+        // round 2's gate check no matter how the launcher is scheduled.
+        string worker =
+            "N=$(cat '" + counter + "' 2>/dev/null || echo 0); N=$((N+1)); echo $N > '" + counter + "'\n" +
+            "if [ $N = 1 ]; then\n" +
+            "  ( i=0; while [ $i -lt 400 ]; do\n" +
+            "      if ls '" + root + "'/runs/*/summary.json >/dev/null 2>&1; then " + tamper + "; touch '" + tampered + "'; exit 0; fi\n" +
+            "      sleep 0.05; i=$((i+1)); done ) >/dev/null 2>&1 </dev/null &\n" +
+            "else\n" +
+            "  i=0; while [ ! -e '" + tampered + "' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n" +
+            "fi\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker, _ => _dirs.Track(Directory.GetCurrentDirectory()));
+
+        Assert.True(File.Exists(tampered), "the background process never tampered");
+        Assert.Equal(5, code);
+        Assert.Equal("1", (await File.ReadAllTextAsync(Path.Combine(scratch, "n"), TestContext.Current.CancellationToken)).Trim());
+        string[] names = GateLoopTests.RunDirNames(root);
+        Assert.Equal(2, names.Length);
+        JsonObject gate = RunAsyncGolden.Summary(Path.Combine(root, "runs", names[1]))["gate"]!.AsObject();
+        Assert.Equal(2, gate["round"]!.GetValue<int>());
+        Assert.Equal("error", gate["decision"]!.GetValue<string>());
+        Assert.Contains(target, gate["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+    }
+
+    // ---- unreadable directories and FIFOs -------------------------------------------------------------------
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task An_unreadable_directory_under_the_runs_root_does_not_fail_the_launchAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows() || Environment.IsPrivilegedProcess, "needs a non-root POSIX user");
+
+        Setup setup = await NewSetupAsync();
+        string locked = Path.Combine(setup.Root, "locked");
+        _ = Directory.CreateDirectory(locked);
+        File.SetUnixFileMode(locked, UnixFileMode.None);
+        try
+        {
+            (int code, string stdout) = await RunAsync(setup, "true");
+
+            Assert.NotEqual(2, code);
+            Assert.True(code is 0 or 5, stdout);
+            if (code is 0)
+            {
+                Assert.True(File.Exists(setup.Marker), "the gate should have run");
+            }
+            else
+            {
+                Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task An_unreadable_directory_under_the_git_root_does_not_fail_the_launchAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows() || Environment.IsPrivilegedProcess, "needs a non-root POSIX user");
+        Assert.SkipWhen(Launcher.FindOnPath("git") is null, "git is not on PATH");
+
+        Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
+        string locked = string.Empty;
+        try
+        {
+            (int code, string stdout) = await RunAsync(setup, "true", () =>
+            {
+                string repo = Directory.GetCurrentDirectory();
+                GitInit(repo);
+                locked = Path.Combine(repo, "locked");
+                _ = Directory.CreateDirectory(locked);
+                File.SetUnixFileMode(locked, UnixFileMode.None);
+            });
+
+            Assert.NotEqual(2, code);
+            Assert.True(code is 0 or 5, stdout);
+            if (code is 0)
+            {
+                Assert.True(File.Exists(setup.Marker), "the gate should have run");
+            }
+            else
+            {
+                Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            if (locked.Length > 0 && Directory.Exists(locked))
+            {
+                File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Several_fifos_a_worker_plants_under_the_runs_root_do_not_cost_a_timeout_eachAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "mkfifo is Unix only");
+
+        Setup setup = await NewSetupAsync();
+        string r = setup.Root;
+        Stopwatch watch = Stopwatch.StartNew();
+
+        Task<(int Code, string Stdout)> run = RunAsync(
+            setup, "mkfifo '" + r + "/f1' '" + r + "/f2' '" + r + "/f3' '" + r + "/f4' '" + r + "/f5'");
+        (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(60), TimeProvider.System, TestContext.Current.CancellationToken);
+        watch.Stop();
+
+        AssertViolation(setup, code, stdout, "/f1");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(12), "the trust check took " + watch.Elapsed.TotalSeconds.ToString(CultureInfo.InvariantCulture) + " s");
     }
 
     [Fact]

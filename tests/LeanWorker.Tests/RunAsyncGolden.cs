@@ -103,6 +103,14 @@ internal static partial class RunAsyncGolden
             Directory.SetCurrentDirectory(oldCwd);
             Environment.SetEnvironmentVariable("PATH", oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", oldKey);
+            try
+            {
+                Directory.Delete(cleanCwd, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A leftover temp directory must not fail the test that already finished.
+            }
         }
     }
 
