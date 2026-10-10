@@ -237,6 +237,129 @@ public class GateLoopTests
     }
 
     [Fact]
+    public async Task A_worker_that_rewrites_profiles_json_trips_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        string profilesPath = Path.Combine(root, "profiles.json");
+        string worker = "printf 'tampered' > '" + profilesPath + "'\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(marker));
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("profiles.json", stdout, StringComparison.Ordinal);
+
+        string runDir = RunAsyncGolden.RunDirFrom(stdout);
+        JsonObject s = RunAsyncGolden.Summary(runDir);
+        string error = s["gate"]!["error"]!.GetValue<string>();
+        Assert.Contains("profiles.json", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_rewrites_the_gate_script_in_the_working_directory_trips_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        RunAsyncGolden.WriteProfile(root, "test", new JsonObject { ["gate"] = new JsonObject { ["command"] = new JsonArray(["./gate.sh"]) } });
+        const string worker = "printf '#!/bin/sh\\nexit 0\\n' > gate.sh\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+
+        Assert.Equal(5, code);
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("gate.sh", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_creates_global_json_in_the_working_directory_trips_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        const string worker = "printf '{}' > global.json\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(marker));
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("global.json", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_creates_nuget_config_in_the_working_directory_trips_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        const string worker = "printf '<configuration/>' > nuget.config\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+
+        Assert.Equal(5, code);
+        Assert.False(File.Exists(marker));
+        Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+        Assert.Contains("nuget.config", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worker_that_edits_Directory_Build_props_does_not_trip_the_trust_checkAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string marker = Path.Combine(scratch, "gate-ran");
+        string script = Path.Combine(scratch, "gate.sh");
+        await WriteExecutableAsync(script, "#!/bin/sh\ntouch '" + marker + "'\nexit 0\n");
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(script));
+        const string worker = "printf '<Project/>' > Directory.Build.props\n" + RunAsyncGolden.SuccessStream;
+
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker);
+
+        Assert.Equal(0, code);
+        Assert.True(File.Exists(marker));
+        Assert.Contains("gate:     clean after 1 round(s), findings 0", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Round_two_uses_round_ones_gate_spec_even_when_profiles_json_changedAsync()
+    {
+        string root = RunAsyncGolden.NewRoot();
+        string scratch = NewScratch();
+        string scriptA = Path.Combine(scratch, "a.sh");
+        await File.WriteAllTextAsync(scriptA, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
+        GateSpec round1Spec = GateSpec.FromProfile(GateProfile(scriptA), scratch)!;
+
+        string scriptB = Path.Combine(scratch, "b.sh");
+        await File.WriteAllTextAsync(scriptB, "#!/bin/sh\nexit 0\n", TestContext.Current.CancellationToken);
+        RunAsyncGolden.WriteProfile(root, "test", GateProfile(scriptB));
+
+        Options o = new() { TaskFile = Path.Combine(root, "task.md"), RunsRoot = root, Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "golden" };
+        GateContext context = new(
+            ChainId: "chain1",
+            Round: 1,
+            Counts: [3],
+            ChainCostUsd: 0m,
+            OriginalTask: "do nothing",
+            OriginalName: "golden",
+            Feedback: new Gate.GateResult(Outcome: "findings", ExitCode: 1, Count: 3, ReportPath: null, Feedback: "feedback", Error: null, Duration: TimeSpan.Zero),
+            Spec: round1Spec);
+        LaunchRun run = new(o, context);
+
+        Assert.Equal(round1Spec, run.InitialGateSpec);
+    }
+
+    [Fact]
     public async Task Continue_from_a_gate_round_cuts_the_task_at_the_gate_headingAsync()
     {
         string root = RunAsyncGolden.NewRoot();

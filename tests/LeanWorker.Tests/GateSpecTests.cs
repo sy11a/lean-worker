@@ -153,6 +153,18 @@ public class GateSpecTests
     }
 
     [Fact]
+    public void A_directory_in_the_command_throws_naming_the_index()
+    {
+        string workDir = Directory.CreateTempSubdirectory("lw-gatespec").FullName;
+        string subdir = Path.Combine(workDir, "sub");
+        Directory.CreateDirectory(subdir);
+        JsonObject gate = new() { ["command"] = new JsonArray(["sh", "sub"]) };
+        LaunchException ex = Assert.Throws<LaunchException>(() => GateSpec.FromProfile(Profile(gate), workDir));
+        Assert.Contains("gate.command[1]", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(subdir, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void No_gate_flag_parses()
     {
         Options o = Options.Parse(["--no-gate"]);
