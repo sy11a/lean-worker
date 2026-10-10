@@ -259,6 +259,64 @@ Limits:
 - `hook checks` in the `budget:` line counts how often the hook ran. `0` with wrap-up on means the hook
   never ran; the budget is still enforced.
 
+## Gate: a run ends when a check passes
+
+A worker saying it is done is not verification. A profile can therefore name a **gate**, a command the launcher runs
+after the worker ends with `success`: a linter, a build that treats warnings as errors, a test command. The gate's
+contract is small:
+- exit `0`: clean;
+- exit `1`: findings, with the last stdout line naming a JSON report (default `sarif: <path>`) whose findings array
+  (default `runs[0].results`) is counted;
+- exit `2`: the gate itself failed.
+
+The launcher knows no specific tool.
+
+1. While the gate reports findings, the launcher starts a **fresh** worker (the continuation mechanism) with the original
+   task plus a `## Gate report (lean-worker)` section: the gate's output and its report path. Each round is its own
+   run (`<name>-gate2`, `-gate3`, …).
+2. The chain ends **clean** (exit `0`), **stuck** (exit `4`), or in **error** (exit `5`).
+   - Stuck: the finding count did not decrease in two consecutive rounds, or `maxRounds` or `maxTotalUsd` (default
+     3 × the profile budget) was reached.
+   - Error: the gate exited 2, timed out or wrote no readable report, or the trust check fired.
+3. The result block gets a `gate:` line, and each run directory gets `gate.log` and `gate.json`. `summary.json` and
+   `runs.jsonl` get a `gate` object, and `stats` counts a gated run as a success only when the gate was clean.
+
+```
+gate:     clean after 2 round(s), findings 2→0
+```
+
+The gate runs in the tree the worker has just changed, so the launcher guards what the gate relies on:
+
+- **Fixed in round 1 for the whole chain:** the gate spec, the resolved absolute gate executable, a PATH of absolute
+  directories only, and the trusted files.
+- **Trusted files:** the gate executable and every argv file; `gate.trust` paths and globs; the runs root's own files
+  and the prices file; `global.json`, `nuget.config` and the dotnet tool manifests from the working directory up to
+  the git root.
+- **When they are checked:** they are hashed before the worker, before the gate and after it. Gate PATH directories
+  are compared by name and entry metadata.
+- **What counts as a violation:**
+  - a change by the worker, or during the gate, except files declared in `gate.outputs`;
+  - a non-regular or unreadable file;
+  - a gate PATH entry that resolves into the working tree.
+
+  A violation ends the chain with exit `5`. Configuration that can never be safe (an unresolvable executable, a PATH
+  with no absolute entry, a PATH directory inside the working tree, a declared output that is a trusted input) is
+  refused before the worker runs, with exit `2`.
+- **Environment:** the gate gets a minimal one (PATH, HOME, locale, `DOTNET_*`, `NUGET_*`,
+  `NuGetPackageSourceCredentials_*`, `MSBUILD*`, plus `gate.env`). Model API keys and tokens never reach it.
+
+Limits:
+
+- It is not a sandbox. A background process the worker leaves running can swap a trusted file and restore it between
+  two checks.
+- Build files such as `Directory.Build.props` are trusted only when listed in `gate.trust`.
+- The content of files in gate PATH directories is not hashed: a replacement with the same length and a restored
+  mtime is not detected.
+- Installing a tool into a gate PATH directory during a chain (for example `pip install --user`) ends the run with exit
+  `5`. Install tools before launching.
+
+The template `templates/profiles.json` has a disabled example (`_gate` in the `code` profile) with every key.
+
 ## Models, prices and subscriptions
 
 ### Model ids and providers
@@ -457,8 +515,13 @@ gets no MCP server unless the profile or `--mcp-config` names one.
 Other commands (same `dotnet run ... --` prefix): `quota`, `cost`, `stats`, `prices` (see above), and
 `hook`, which the launcher installs into workers itself.
 
-Exit codes: `0` success, `1` the worker reported an error or failed, `2` the launcher failed,
-`3` the worker wrapped up near its budget and left a handoff.
+Exit codes:
+- `0`: success. With a gate, the gate is clean.
+- `1`: the worker reported an error or failed.
+- `2`: the launcher failed, including a gate configuration refused before the worker ran.
+- `3`: the worker wrapped up near its budget and left a handoff.
+- `4`: the gate is stuck.
+- `5`: the gate failed, or a trusted input changed.
 
 ## Cost notes from real runs
 
