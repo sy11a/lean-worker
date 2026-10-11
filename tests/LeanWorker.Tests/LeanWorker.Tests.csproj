@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- Large (sy11a_analyzers case 0002, R-025): tests start processes. -->
+    <Sy11aTestTier>large</Sy11aTestTier>
     <TargetFramework>net8.0</TargetFramework>
     <RollForward>LatestMajor</RollForward>
     <Nullable>enable</Nullable>
