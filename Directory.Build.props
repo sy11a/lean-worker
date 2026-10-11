@@ -1,9 +1,10 @@
 <Project>
 
-  <!-- The Sy11a.Analyzers policy (lean-worker#48): pinned exactly; restored from the "github" source in
-       nuget.config. Applies to checkouts of this repository only: install.sh copies skills/lean-worker alone. -->
+  <!-- The Sy11a.Analyzers policy (lean-worker#48): pinned exactly in Directory.Packages.props; restored from
+       the "github" source in nuget.config. Applies to checkouts of this repository only: install.sh copies
+       skills/lean-worker alone. -->
   <ItemGroup>
-    <PackageReference Include="Sy11a.Analyzers" Version="[0.8.0]" PrivateAssets="all" />
+    <PackageReference Include="Sy11a.Analyzers" PrivateAssets="all" />
   </ItemGroup>
 
 </Project>
