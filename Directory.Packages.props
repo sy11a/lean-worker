@@ -1,0 +1,15 @@
+<Project>
+
+  <!-- Package versions are set here only (Sy11a.Analyzers SYT0004). Installed copies (install.sh copies
+       skills/lean-worker alone) do not see this file and need no package. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Sy11a.Analyzers" Version="[0.9.1]" />
+    <PackageVersion Include="xunit.v3" Version="4.0.1" />
+  </ItemGroup>
+
+</Project>

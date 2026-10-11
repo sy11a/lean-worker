@@ -28,7 +28,7 @@ Never commit to `master` directly and never force-push it.
 
 ## Verify
 
-- The build references the `Sy11a.Analyzers` policy package (`Directory.Build.props`, pinned), restored by
+- The build references the `Sy11a.Analyzers` policy package (`Directory.Build.props`, pinned exactly in `Directory.Packages.props`), restored by
   `nuget.config` from the private GitHub Packages feed `https://nuget.pkg.github.com/sy11a/index.json`. Restoring
   it needs a classic personal access token with `read:packages`, stored as credentials for the source key `github`
   in the user NuGet config (not in the repository), e.g.
