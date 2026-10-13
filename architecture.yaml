@@ -1,0 +1,20 @@
+# The architecture of lean-worker (case 0003). Drafted by `sy11a-arch init`, then structured.
+# One launcher program (skills/lean-worker/launcher, namespace LeanWorker) that runs a task in a minimal-context
+# worker (`claude -p` or `opencode run`), meters its cost and records the run. It is a single self-contained
+# console process with no layering inside: it uses only the .NET host APIs (process control, files, network,
+# JSON) and no third-party package. The tests (tests/LeanWorker.Tests) are not under the dependency rules.
+# Assembly attributes live in the global namespace and need only the core BCL.
+version: 1
+style: single-launcher-process
+layers:
+  LeanWorker:
+    namespaces: ["LeanWorker"]
+  Global:
+    namespaces: ["<global>"]
+rules:
+  - from: LeanWorker
+    to: ["@dotnet-host"]
+    principle: self-contained-launcher
+  - from: Global
+    to: ["@dotnet-core"]
+    principle: assembly-attributes
