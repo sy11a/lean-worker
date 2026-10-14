@@ -9,7 +9,7 @@
 
   <ItemGroup>
     <!-- Moves in lockstep with sy11a.lint in .config/dotnet-tools.json (SY-POLICYVERSION). -->
-    <PackageVersion Include="Sy11a.Analyzers" Version="[0.13.0]" />
+    <PackageVersion Include="Sy11a.Analyzers" Version="[0.15.0]" />
     <PackageVersion Include="coverlet.MTP" Version="[10.1.0]" />
     <PackageVersion Include="xunit.v3" Version="4.0.1" />
   </ItemGroup>
