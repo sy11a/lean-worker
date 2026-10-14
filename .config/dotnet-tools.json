@@ -15,6 +15,13 @@
         "sy11a-arch"
       ],
       "rollForward": false
+    },
+    "sy11a.test": {
+      "version": "0.15.0",
+      "commands": [
+        "sy11a-test"
+      ],
+      "rollForward": false
     }
   }
 }
