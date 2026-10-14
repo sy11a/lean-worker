@@ -35,6 +35,7 @@ Never commit to `master` directly and never force-push it.
   `NuGetPackageSourceCredentials_github="Username=<you>;Password=<token>"`. A policy finding fails the build: fix
   it, never suppress it. Installed copies (`install.sh` copies `skills/lean-worker/` alone) build without it.
 - Unit tests: `dotnet test --project tests/LeanWorker.Tests -v q` (Microsoft Testing Platform, opted in by `global.json`).
+- Lint gate: `dotnet tool run sy11a-lint check --full tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target covers the launcher; `--affected` needs a solution, which lean-worker does not have; `sy11a.lint` moves in lockstep with `Sy11a.Analyzers`, SY-POLICYVERSION).
 - Architecture gate: `dotnet tool run sy11a-arch check --affected skills/lean-worker/launcher/LeanWorker.csproj` (`--full` for the whole picture; `sy11a.arch` moves in lockstep with `Sy11a.Analyzers` and `sy11a.lint`, SY-POLICYVERSION).
 - Test gate: `dotnet tool run sy11a-test check --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target, so a launcher-only change selects it; `--full` for the whole picture; `sy11a.test` moves in lockstep with `Sy11a.Analyzers`, `sy11a.lint` and `sy11a.arch`).
 - Acceptance (real workers, cents of list price): `tests/acceptance.sh`. It needs GLM; while GLM is not in
