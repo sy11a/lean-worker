@@ -38,5 +38,20 @@ Never commit to `master` directly and never force-push it.
 - Lint gate: `dotnet tool run sy11a-lint check --full tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target covers the launcher; `--affected` needs a solution, which lean-worker does not have; `sy11a.lint` moves in lockstep with `Sy11a.Analyzers`, SY-POLICYVERSION).
 - Architecture gate: `dotnet tool run sy11a-arch check --affected skills/lean-worker/launcher/LeanWorker.csproj` (`--full` for the whole picture; `sy11a.arch` moves in lockstep with `Sy11a.Analyzers` and `sy11a.lint`, SY-POLICYVERSION).
 - Test gate: `dotnet tool run sy11a-test check --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target, so a launcher-only change selects it; `--full` for the whole picture; `sy11a.test` moves in lockstep with `Sy11a.Analyzers`, `sy11a.lint` and `sy11a.arch`).
+- Review evidence from the gates: the bindings of dev-flow's `flows/stages/test-design.md#pass-two`,
+  `flows/review/read.md#gates` and `flows/review/judge.md#checks` (dev-flow ADR-0033, sy11a/sy11a_analyzers#327).
+  - Deleted tests: the test gate's `SYT-DELETED` notes, one per test the diff removed, stripped of
+    `[Fact]`/`[Theory]` or disabled with `Skip`. They never fail the gate. The review's gate tail carries them, and
+    the review judges each one justified or lost coverage.
+  - Mutation round, once the test gate is green: `dotnet tool run sy11a-test mutate --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj`.
+    The survivors (file, line, original and replacement, mutator, covering tests) are in
+    `artifacts/sy11a-test/mutate.json`. A Claude-family test worker gets them for one round that writes or
+    strengthens tests only; then the test gate and `mutate --affected` run again on the same lines, and what still
+    survives goes into the test-plan note and the review evidence. Exit 0 means the run completed, however many
+    mutants survived. **Exit 2 is a tool failure (Stryker crashed, a hash mismatch, no sandbox) and means skip**:
+    one line in the test-plan note and in the review evidence, and the task is not blocked.
+  - Duplicate gate: `sy11a-arch` SYA1201 (jscpd Type 1/2 clones, part of the architecture gate). A clone the
+    reviewer finds that SYA1201 missed, or an SYA1201 finding the reviewer judges false, goes under
+    "Duplicate-detector evidence" in the review report.
 - Acceptance (real workers, cents of list price): `tests/acceptance.sh`. It needs GLM; while GLM is not in
   use, run `LW_OPENCODE_MODEL=minimax-coding-plan/MiniMax-M3 tests/acceptance.sh --claude-only`.
