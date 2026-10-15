@@ -239,9 +239,11 @@ Exit codes with a gate, and what to do on each:
 
 With `gate.commands`, every command runs each round even when others report findings, so one round's worker sees every
 tool's findings in its `## Gate report` section; the first error (a failed gate or a trust violation) ends the round
-and the chain reports `error`. The chain decision uses the round's total finding count: "no decrease in 2 rounds" and
-the caps (`maxRounds`, `maxTotalUsd`) apply to the sum over all commands, so totals that shift between tools count as
-no progress. `summary.json`'s `gate` section holds the aggregate plus a `commands` list with each command's outcome.
+and the chain reports `error`. The chain decision uses the round's total finding count: "no decrease in 2 rounds", so
+totals that shift between tools count as no progress. The caps are chain-wide: one round counter and one cost budget
+for all commands. Each command's `outputs` are excluded only from its own after-check; an output declared by two
+commands is refused (exit 2). `summary.json`'s `gate` section holds the aggregate plus a `commands` list with each
+command's outcome.
 
 What the gate may trust is fixed in round 1 for the whole chain. That covers:
 

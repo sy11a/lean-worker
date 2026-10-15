@@ -139,7 +139,8 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     /// <summary>
     /// The single-command form: one spec, <c>Name</c> null, read from the gate-level keys exactly as
     /// before the <c>commands</c> form existed (readers label their errors "profile gate.*" so the
-    /// messages stay byte-identical).
+    /// messages stay byte-identical, and the read order matches the legacy parser so the first
+    /// failure with two errors at once is the one the legacy parser gave).
     /// </summary>
     private static GateSpec FromProfileObject(JsonObject gate, string gateWorkingDirectory)
     {
@@ -152,8 +153,8 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         // fixed trusted inputs when round 1 collects them, before the worker starts.
         Regex reportFromLastLine = ReadReportRegex(gate, "profile gate");
         string countPath = ReadCountPath(gate, "profile gate");
-        List<string> outputs = ReadOutputs(gate, "profile gate");
         SharedKeys shared = ReadSharedKeys(gate);
+        List<string> outputs = ReadOutputs(gate, "profile gate");
 
         return new GateSpec(command, reportFromLastLine, countPath, shared.FeedbackMaxChars, shared.TimeoutMinutes, shared.MaxRounds, shared.MaxTotalUsd, shared.Env, shared.Trust, outputs);
     }
@@ -242,7 +243,12 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
 
     private static void RefuseSharedKeys(JsonObject entry, string label)
     {
-        string[] sharedKeys = ["maxRounds", "maxTotalUsd", "trust", "env", "feedbackMaxChars", "commands"];
+        if (entry["commands"] is not null)
+        {
+            throw new LaunchException($"{label}.commands is not allowed; gate.commands does not nest");
+        }
+
+        string[] sharedKeys = ["maxRounds", "maxTotalUsd", "trust", "env", "feedbackMaxChars"];
         foreach (string key in sharedKeys)
         {
             if (entry[key] is not null)

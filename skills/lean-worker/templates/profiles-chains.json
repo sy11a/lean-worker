@@ -59,7 +59,7 @@
         "Bash(pwd)"
       ],
       "maxBudgetUsd": 2,
-      "_gate_comment": "Optional. Rename \"_gate\" to \"gate\" to run checks after every successful run and re-run the worker with the reports until they pass (SKILL.md, \"Gate\"). Per command: name (unique, ^[a-z][a-z0-9-]{0,31}$) and command (argv) are required; reportFromLastLine, countPath, outputs (files that command writes, excluded only from its own after-gate check) and timeoutMinutes are optional. Shared on the gate itself: trust, env, maxRounds, maxTotalUsd (default 3 x maxBudgetUsd), timeoutMinutes (the default for commands) and feedbackMaxChars (the total for the round). A single-command form (\"command\" plus the same keys on the gate itself) also works.",
+      "_gate_comment": "Optional. Rename \"_gate\" to \"gate\" to run checks after every successful run and re-run the worker with the reports until they pass (SKILL.md, \"Gate\"). Per command: name (unique, ^[a-z][a-z0-9-]{0,31}$) and command (argv) are required; reportFromLastLine finds the report path on the last stdout line; countPath points at the findings array; outputs (files that command writes, excluded only from its own after-gate check) and timeoutMinutes are optional. Shared on the gate itself: trust, env, maxRounds, maxTotalUsd (default 3 x maxBudgetUsd), timeoutMinutes (the default for commands) and feedbackMaxChars (the total for the round). A single-command form (\"command\" plus the same keys on the gate itself) also works.",
       "_gate": {
         "commands": [
           {

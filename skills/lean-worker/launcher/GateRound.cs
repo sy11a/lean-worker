@@ -30,17 +30,21 @@ internal static class GateRound
     /// element 0 itself; the commands form builds it: outcome "error" when any command errored, else
     /// "findings" when any had findings, else "clean"; the failing command's exit code (else 1 for
     /// findings, 0 for clean); the sum of the non-null counts (null when every count is null); the
-    /// error as "name: message" of the first errored command; no report path; the summed duration;
-    /// and the composed feedback text.
+    /// error as "name: message" of the first errored command; no report path; the summed duration; and
+    /// the composed feedback text. When the round's only failure is a pre-round trust violation
+    /// against the first command (no command ran, the worker changed a file the gate trusts),
+    /// <paramref name="preRoundViolation"/> is true and <paramref name="results"/> is exactly the one
+    /// error result; its message is then used unprefixed so the chain names the worker, not command 1,
+    /// for the change.
     /// </summary>
-    public static Gate.GateResult Aggregate(IReadOnlyList<GateSpec> specs, IReadOnlyList<Gate.GateResult> results, int round, string runDir)
+    public static Gate.GateResult Aggregate(IReadOnlyList<GateSpec> specs, IReadOnlyList<Gate.GateResult> results, int round, string runDir, bool preRoundViolation = false)
     {
         if (!IsMulti(specs))
         {
             return results[0];
         }
 
-        string? failedError = FailedError(specs, results);
+        int failed = FailedIndex(results);
         bool findings = results.Any(r => r.Outcome is "findings");
         int? count = null;
         foreach (Gate.GateResult r in results)
@@ -53,10 +57,14 @@ internal static class GateRound
 
         string outcome = "clean";
         int exitCode = 0;
-        if (failedError is not null)
+        string? error = null;
+        if (failed >= 0)
         {
             outcome = "error";
-            exitCode = FailedExitCode(results);
+            exitCode = results[failed].ExitCode;
+            error = preRoundViolation && failed is 0
+                ? results[failed].Error
+                : $"{specs[failed].Name}: {results[failed].Error}";
         }
         else if (findings)
         {
@@ -66,7 +74,7 @@ internal static class GateRound
 
         TimeSpan duration = results.Aggregate(TimeSpan.Zero, (acc, r) => acc + r.Duration);
         string feedback = ComposeFeedback(specs, results, round, runDir, specs[0].FeedbackMaxChars);
-        return new Gate.GateResult(outcome, exitCode, count, ReportPath: null, feedback, failedError, duration);
+        return new Gate.GateResult(outcome, exitCode, count, ReportPath: null, feedback, error, duration);
     }
 
     /// <summary>
@@ -125,17 +133,7 @@ internal static class GateRound
         JsonArray commands = [];
         for (int i = 0; i < results.Count; i++)
         {
-            JsonObject command = new()
-            {
-                ["name"] = specs[i].Name,
-                ["outcome"] = results[i].Outcome,
-                ["exit_code"] = results[i].ExitCode,
-                ["count"] = results[i].Count,
-            };
-            command["report_path"] = results[i].ReportPath;
-            command["error"] = results[i].Error;
-            command["duration_ms"] = (long)results[i].Duration.TotalMilliseconds;
-            commands.Add(command);
+            commands.Add(Gate.ResultFields(results[i], name: specs[i].Name));
         }
 
         return commands;
@@ -143,21 +141,22 @@ internal static class GateRound
 
     private static int Total(IReadOnlyList<Gate.GateResult> results) => results.Sum(r => r.Count ?? 0);
 
-    private static string? FailedError(IReadOnlyList<GateSpec> specs, IReadOnlyList<Gate.GateResult> results)
+    /// <summary>
+    /// The index of the first errored result, or -1 when no command errored. Used to build both
+    /// the aggregate's error text (<c>{name}: {error}</c>) and its exit code from a single search.
+    /// </summary>
+    private static int FailedIndex(IReadOnlyList<Gate.GateResult> results)
     {
         for (int i = 0; i < results.Count; i++)
         {
             if (results[i].Outcome is "error")
             {
-                return $"{specs[i].Name}: {results[i].Error}";
+                return i;
             }
         }
 
-        return null;
+        return -1;
     }
-
-    private static int FailedExitCode(IReadOnlyList<Gate.GateResult> results) =>
-        results.First(r => r.Outcome is "error").ExitCode;
 
     /// <summary>
     /// The same cut Gate.JoinStdout applies — cap the text and point at the full log — so a section
