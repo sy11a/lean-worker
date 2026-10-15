@@ -73,4 +73,26 @@ public class GateChainTests
     [Fact]
     public void Unknown_outcome_throws() =>
         _ = Assert.Throws<ArgumentOutOfRangeException>(() => GateChain.Decide(Result("bogus"), [1], round: 1, maxRounds: 5, chainCostIncludingThis: 0m, maxTotalUsd: 10m));
+
+    // lint 3, arch 0 -> lint 0, arch 3 -> lint 1, arch 2: each tool moves, the round's total (what the chain
+    // decides on) does not fall, so the chain is stuck.
+    [Fact]
+    public void Totals_that_shift_between_commands_without_falling_are_stuck()
+    {
+        List<GateSpec> specs = GateRoundTests.Specs(8000, "lint", "arch");
+        List<int> totals = [];
+        Gate.GateResult last = GateRoundTests.Clean();
+        foreach ((int lint, int arch) in new[] { (3, 0), (0, 3), (1, 2) })
+        {
+            Gate.GateResult[] results = [Count(lint), Count(arch)];
+            last = GateRound.Aggregate(specs, results, totals.Count + 1, runDir: "/runs/r");
+            totals.Add(last.Count ?? 0);
+        }
+
+        string decision = GateChain.Decide(last, totals, totals.Count, maxRounds: 5, chainCostIncludingThis: 0m, maxTotalUsd: 10m);
+        string? reason = GateChain.StuckReason(totals, totals.Count, maxRounds: 5, chainCostIncludingThis: 0m, maxTotalUsd: 10m);
+        Assert.Equal(("3,3,3", GateChain.Stuck, "no decrease in 2 rounds"), (string.Join(',', totals), decision, reason));
+    }
+
+    private static Gate.GateResult Count(int n) => n is 0 ? GateRoundTests.Clean() : GateRoundTests.Findings(n);
 }

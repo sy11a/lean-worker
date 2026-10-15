@@ -48,11 +48,20 @@ internal static class Gate
 
     private readonly record struct WaitResult(bool TimedOut, bool Cancelled, int ExitCode);
 
+    /// <summary>
+    /// The file name of one gate command's artifacts: <c>gate.log</c> / <c>gate.json</c> for the
+    /// single-command form (a null <see cref="GateSpec.Name"/>), <c>gate-&lt;name&gt;.log</c> /
+    /// <c>gate-&lt;name&gt;.json</c> for the commands form, so every command's log, record and
+    /// failure write are its own. The name is validated to <c>[a-z][a-z0-9-]{0,31}</c>, so it is
+    /// path-safe as-is.
+    /// </summary>
+    internal static string FileName(GateSpec spec, string ext) => spec.Name is null ? $"gate.{ext}" : $"gate-{spec.Name}.{ext}";
+
     public static async Task<GateResult> RunAsync(GateSpec spec, string runDir, CancellationToken token)
     {
         DateTimeOffset started = DateTimeOffset.Now;
-        string logPath = Path.Combine(runDir, "gate.log");
-        string gateJsonPath = Path.Combine(runDir, "gate.json");
+        string logPath = Path.Combine(runDir, FileName(spec, "log"));
+        string gateJsonPath = Path.Combine(runDir, FileName(spec, "json"));
         string cwd = Directory.GetCurrentDirectory();
         StdoutBuffer stdout = new();
         List<string> envNames = [];
@@ -889,19 +898,36 @@ internal static class Gate
             Error: string.Create(CultureInfo.InvariantCulture, $"gate exited {exitCode}"), Duration: duration);
     }
 
+    /// <summary>
+    /// The six result fields shared by the per-command <c>gate.json</c> and the summary's
+    /// <c>commands</c> array, in their fixed order. When <paramref name="name"/> is null the
+    /// returned object has only the six fields, as the per-command <c>gate.json</c> requires; when
+    /// it is not null the helper prepends a <c>name</c> key as the summary's <c>commands</c> array
+    /// requires. Either way, <c>gate.json</c> keeps its pre-chain key order and the <c>commands</c>
+    /// entries keep theirs.
+    /// </summary>
+    internal static JsonObject ResultFields(GateResult result, string? name = null)
+    {
+        List<KeyValuePair<string, JsonNode?>> fields = [];
+        if (name is not null)
+        {
+            fields.Add(new("name", name));
+        }
+
+        fields.Add(new("outcome", result.Outcome));
+        fields.Add(new("exit_code", result.ExitCode));
+        fields.Add(new("count", result.Count));
+        fields.Add(new("report_path", result.ReportPath));
+        fields.Add(new("error", result.Error));
+        fields.Add(new("duration_ms", (long)result.Duration.TotalMilliseconds));
+        return new JsonObject(fields);
+    }
+
     internal static async Task WriteGateJsonAsync(string path, GateResult result, GateSpec spec, IReadOnlyList<string> envNames)
     {
-        JsonObject o = new()
-        {
-            ["outcome"] = result.Outcome,
-            ["exit_code"] = result.ExitCode,
-            ["count"] = result.Count,
-            ["report_path"] = result.ReportPath,
-            ["error"] = result.Error,
-            ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
-            ["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]),
-            ["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]),
-        };
+        JsonObject o = ResultFields(result);
+        o["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]);
+        o["env_names"] = new JsonArray([.. envNames.Select(n => (JsonNode)n)]);
         // The gate PATH the gate resolves command names through: the frozen absolute-only value the
         // trust check watches (the GateTrust header's rule). Null only in a spec no launcher has
         // resolved.
@@ -940,7 +966,7 @@ internal static class Gate
             ? new GateResult(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
                 Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero)
             : gateRan with { Outcome = "error", Error = errorMessage };
-        await WriteGateJsonAsync(Path.Combine(runDir, "gate.json"), result, spec, envNames: []).ConfigureAwait(false);
+        await WriteGateJsonAsync(Path.Combine(runDir, FileName(spec, "json")), result, spec, envNames: []).ConfigureAwait(false);
         return result;
     }
 

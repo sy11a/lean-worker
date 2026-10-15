@@ -64,4 +64,18 @@ public class StatsTests
         StatsRow row = Assert.Single(rows);
         Assert.Equal(1, row.Success);
     }
+
+    [Fact]
+    public void A_commands_gate_row_counts_by_its_chain_decision_alone()
+    {
+        const string CommandsJson = /*lang=json,strict*/ """[{"name":"lint","outcome":"findings","exit_code":1,"count":2,"report_path":null,"error":null,"duration_ms":5}]""";
+        List<StatsRow> rows = Commands.StatsRows([
+            R("""{"profile":"code","model":"claude-sonnet-5","status":"error","total_cost_usd":1.0,"gate":{"decision":"clean","commands":""" + CommandsJson + "}}"),
+            R("""{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"error","commands":""" + CommandsJson + "}}"),
+            R("""{"profile":"code","model":"claude-sonnet-5","status":"success","total_cost_usd":1.0,"gate":{"decision":"stuck","commands":""" + CommandsJson + "}}"),
+        ]);
+        StatsRow row = Assert.Single(rows);
+        Assert.Equal(3, row.Runs);
+        Assert.Equal(1, row.Success);
+    }
 }

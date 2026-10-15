@@ -437,7 +437,7 @@ public class GateLoopTests
                 OriginalTask: "do nothing",
                 OriginalName: "golden",
                 Feedback: new Gate.GateResult(Outcome: "findings", ExitCode: 1, Count: 3, ReportPath: null, Feedback: "feedback", Error: null, Duration: TimeSpan.Zero),
-                Spec: round1Spec);
+                Specs: [round1Spec]);
 
             (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.SuccessStream, gateContext: context);
 
