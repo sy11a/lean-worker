@@ -14,7 +14,7 @@ namespace LeanWorker.Tests;
 public sealed class GateTrustLoopTests : IDisposable
 {
     // A success stream with token usage, so the meter has something to price (haiku list price: $0.0022).
-    private const string MeteredSuccessStream = """
+    internal const string MeteredSuccessStream = """
         printf '%s\n' '{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-haiku-4-5","usage":{"input_tokens":1000,"output_tokens":0,"cache_read_input_tokens":9200,"cache_creation_input_tokens":0}}}}'
         printf '%s\n' '{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":50}}}'
         printf '%s\n' '{"type":"assistant","message":{"id":"m1","model":"claude-haiku-4-5","usage":{"input_tokens":1000,"output_tokens":3,"cache_read_input_tokens":9200,"cache_creation_input_tokens":0}}}'
