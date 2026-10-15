@@ -18,3 +18,43 @@ rules:
   - from: Global
     to: ["@dotnet-core"]
     principle: assembly-attributes
+metric_debt:
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.ClaudeRuntime.Parse(System.Text.Json.Nodes.JsonObject,LeanWorker.Outcome)"
+    cyclomatic_complexity: 21
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.Commands.OpencodeCalls(System.String)"
+    cyclomatic_complexity: 16
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.LaunchRun.PrintHeaderAsync"
+    cyclomatic_complexity: 18
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.LaunchRun.ResolveOptions"
+    cyclomatic_complexity: 19
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.OpencodeRuntime.Parse(System.Text.Json.Nodes.JsonObject,LeanWorker.Outcome)"
+    cyclomatic_complexity: 19
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.Options.TrySetText(System.String,System.Func{System.String})"
+    cyclomatic_complexity: 17
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.PriceBook.ParsePrice(System.Text.Json.Nodes.JsonObject,LeanWorker.Price)"
+    cyclomatic_complexity: 16
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.Quota.ParseMinimax(System.String,System.String)"
+    cyclomatic_complexity: 16
+  - project: "LeanWorker"
+    symbol: "M:LeanWorker.WriteScope.TakeAsync(System.String,System.String)"
+    cyclomatic_complexity: 16
+  - project: "LeanWorker"
+    symbol: "T:LeanWorker.Gate"
+    class_coupling: 92
+  - project: "LeanWorker"
+    symbol: "T:LeanWorker.GateTrust"
+    class_coupling: 86
+  - project: "LeanWorker"
+    symbol: "T:LeanWorker.LaunchRun"
+    class_coupling: 94
+  - project: "LeanWorker.Tests"
+    symbol: "M:LeanWorker.Tests.GateLoopTests.Round_two_uses_round_ones_gate_spec_even_when_profiles_json_changedAsync"
+    class_coupling: 38
