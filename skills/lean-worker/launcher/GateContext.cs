@@ -1,7 +1,7 @@
 // What a gate round N+1 needs to know about the chain so far. Round 1 passes null; subsequent rounds are
-// built by the launcher from the previous round's GateOutcome. The frozen Spec is the round-1 GateSpec —
-// the launcher uses it instead of re-reading profiles.json, so a worker cannot swap the gate command for
-// the next round. The frozen TrustSnapshot, TrustPaths, FixedSources and GatePathNames are round 1's
+// built by the launcher from the previous round's GateOutcome. The frozen Specs are round 1's gate
+// commands — the launcher uses them instead of re-reading profiles.json, so a worker cannot swap a gate
+// command for the next round. The frozen TrustSnapshot, TrustPaths, FixedSources and GatePathNames are round 1's
 // before-worker trust snapshot, its fixed trust-path list, those paths' sources and its gate-PATH listing
 // — every later round compares against them, so a detached process cannot re-baseline the trust
 // check by surviving into the next round. PostGateOutputs
@@ -12,12 +12,13 @@ namespace LeanWorker;
 
 /// <summary>
 /// What a gate round N+1 needs to know about the chain so far. Round 1 passes null; subsequent rounds are
-/// built by the launcher from the previous round's <see cref="GateOutcome"/>. The frozen <c>Spec</c>
-/// is the round-1 <see cref="GateSpec"/>: the launcher uses it instead of re-reading
-/// <c>profiles.json</c>, so a worker cannot change the gate's command for the next round. The spec
-/// also carries the round-1 resolved gate executable (<c>ResolvedExecutable</c>, the absolute path
-/// hashed as <c>TrustSource.Executable</c>) and the round-1 gate PATH (<c>GatePath</c>, the absolute-only
-/// PATH of the GateTrust header's rule), which every round starts the gate with verbatim — the gate
+/// built by the launcher from the previous round's <see cref="GateOutcome"/>. The frozen <c>Specs</c>
+/// are round 1's gate commands — one spec for the single-command form, one per entry for the commands
+/// form: the launcher uses them instead of re-reading <c>profiles.json</c>, so a worker cannot change a
+/// gate command for the next round. Each spec also carries the round-1 resolved gate executable
+/// (<c>ResolvedExecutable</c>, the absolute path hashed as <c>TrustSource.Executable</c>) and the
+/// round-1 gate PATH (<c>GatePath</c>, the absolute-only PATH of the GateTrust header's rule), which
+/// every round starts the gate with verbatim — the gate
 /// runner never searches PATH again. The frozen
 /// <c>TrustSnapshot</c>, <c>TrustPaths</c> and <c>FixedSources</c> are round 1's
 /// before-worker trust snapshot, its fixed trust-path list and those paths' sources: every later round
@@ -42,7 +43,7 @@ internal sealed record GateContext(
     string OriginalTask,
     string OriginalName,
     Gate.GateResult Feedback,
-    GateSpec Spec,
+    IReadOnlyList<GateSpec> Specs,
     GateTrust.Snapshot? TrustSnapshot = null,
     IReadOnlyList<string>? TrustPaths = null,
     IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>>? FixedSources = null,

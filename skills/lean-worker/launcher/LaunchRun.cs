@@ -31,7 +31,7 @@ internal sealed class LaunchRun
     private List<string>? _writeScope;
     private decimal _budget;
     private decimal _wrapUpAt;
-    private GateSpec? _gate;
+    private List<GateSpec>? _gates;
 
     // ResolveSettings (hooks)
     private string _permissionMode = string.Empty;
@@ -86,7 +86,7 @@ internal sealed class LaunchRun
     /// <summary>
     /// The chain loop reads <c>LastGate</c> to decide whether to start the next round; the rest are the chain
     /// state at this round (chain id, round number, all counts so far, summed worker cost, original task text
-    /// and name, and the round-1 GateSpec propagated to later rounds). All are null/empty/zero for the first
+    /// and name, and round 1's gate specs propagated to later rounds). All are null/empty/zero for the first
     /// round until the gate runs.
     /// </summary>
     public GateContext? GateContext { get; }
@@ -98,7 +98,14 @@ internal sealed class LaunchRun
     public decimal ChainCostUsd { get; private set; }
     public string OriginalTask { get; private set; } = string.Empty;
     public string OriginalName { get; private set; } = string.Empty;
-    public GateSpec? InitialGateSpec { get; private set; }
+    public IReadOnlyList<GateSpec>? InitialGateSpecs { get; private set; }
+
+    /// <summary>
+    /// The chain-level fields (maxRounds, maxTotalUsd, the frozen gate PATH, the warnings, trust)
+    /// live identically on every element of <see cref="_gates"/> — the commands form copies them in
+    /// at profile-load time — so the first element speaks for the chain.
+    /// </summary>
+    private GateSpec ChainGate => NonNull(_gates)[0];
 
     // Trust boundary. Round 1 collects the fixed part of the trust set (gate.trust globs, argv file
     // entries, the resolved gate executable, the prices file) and hashes everything before its worker;
@@ -129,11 +136,40 @@ internal sealed class LaunchRun
 
     /// <summary>
     /// The declared gate outputs that are trusted inputs, re-hashed after this round's clean
-    /// after-gate check. The chain loop hands it to the next round's <see cref="GateContext"/>, whose
-    /// baseline is round 1's snapshot with exactly these keys replaced; null when there is no trust
-    /// snapshot or no declared output in the trusted set.
+    /// after-gate checks — one fragment per command that ran, merged over each other. The chain loop
+    /// hands it to the next round's <see cref="GateContext"/>, whose baseline is round 1's snapshot
+    /// with exactly these keys replaced; null when there is no trust snapshot or no declared output
+    /// in the trusted set.
     /// </summary>
     public GateTrust.Snapshot? PostGateOutputs { get; private set; }
+
+    /// <summary>
+    /// The same fragments, but scoped to the current round: after command i's clean after-gate
+    /// check, its declared outputs that are in the trusted set are hashed and merged here, so the
+    /// checks before and after command i+1 compare against a baseline that accepts the earlier
+    /// commands' legitimate writes. Never leaves the round: the next round starts from
+    /// <see cref="TrustSnapshot"/> (already merged with the previous round's PostGateOutputs) and a
+    /// fresh, empty accumulation.
+    /// </summary>
+    private GateTrust.Snapshot? _roundOutputs;
+
+    /// <summary>
+    /// The baseline every trust check inside this round compares against: round 1's snapshot with
+    /// the current round's accumulated command outputs merged over it (see <see cref="_roundOutputs"/>).
+    /// Null only when no trust snapshot exists (a hand-built context without the trust fields).
+    /// </summary>
+    private GateTrust.Snapshot? RoundBaseline
+    {
+        get
+        {
+            if (TrustSnapshot is null)
+            {
+                return null;
+            }
+
+            return _roundOutputs is null ? TrustSnapshot : MergePostGateOutputs(TrustSnapshot, _roundOutputs);
+        }
+    }
 
     // BuildSummary (stats)
     private List<Usage> _calls = [];
@@ -159,7 +195,7 @@ internal sealed class LaunchRun
         ChainId = gateContext?.ChainId ?? string.Empty;
         OriginalTask = gateContext?.OriginalTask ?? string.Empty;
         OriginalName = gateContext?.OriginalName ?? string.Empty;
-        InitialGateSpec = gateContext?.Spec;
+        InitialGateSpecs = gateContext?.Specs;
     }
 
     public async Task<int> RunAsync()
@@ -293,12 +329,12 @@ internal sealed class LaunchRun
 
     private void ResolveGate()
     {
-        // Round N+1: use the round-1 spec the launcher passed in. The worker cannot change the gate's
+        // Round N+1: use the round-1 specs the launcher passed in. The worker cannot change a gate
         // command for the next round, so we never re-read profiles.json here.
-        GateSpec spec;
-        if (InitialGateSpec is not null)
+        List<GateSpec>? specs;
+        if (InitialGateSpecs is not null)
         {
-            spec = InitialGateSpec;
+            specs = [.. InitialGateSpecs];
         }
         else
         {
@@ -307,8 +343,8 @@ internal sealed class LaunchRun
                 return;
             }
 
-            GateSpec? fromProfile = GateSpec.FromProfile(_profile, Directory.GetCurrentDirectory());
-            if (fromProfile is null)
+            specs = GateSpec.FromProfileAll(_profile, Directory.GetCurrentDirectory());
+            if (specs is null)
             {
                 if (_o.GateMaxRounds is not null)
                 {
@@ -318,7 +354,6 @@ internal sealed class LaunchRun
                 return;
             }
 
-            spec = fromProfile;
             if (_o.GateMaxRounds is { } rounds)
             {
                 if (rounds <= 0)
@@ -326,58 +361,74 @@ internal sealed class LaunchRun
                     throw new LaunchException("--gate-max-rounds must be a positive integer");
                 }
 
-                spec = spec with { MaxRounds = rounds };
+                specs = [.. specs.Select(s => s with { MaxRounds = rounds })];
             }
         }
 
-        _gate = spec with { MaxTotalUsd = spec.MaxTotalUsd ?? (3m * _budget) };
+        // The cost cap is chain-wide: the same value (the profile's, or the default 3 x budget)
+        // covers every command's rounds together.
+        _gates = [.. specs.Select(s => s with { MaxTotalUsd = s.MaxTotalUsd ?? (3m * _budget) })];
         FreezeRound1GateResolution();
-        InitialGateSpec = _gate;
-        NoteGate(_gate);
+        InitialGateSpecs = _gates;
+        NoteGate(_gates);
     }
 
     /// <summary>
-    /// Round 1's one resolution of the gate's argv[0] and PATH, frozen on the spec the chain carries
-    /// into every round. Later rounds return immediately: the frozen values are reused unchanged.
+    /// Round 1's one resolution of every gate command's argv[0] and of the PATH, frozen on the specs
+    /// the chain carries into every round. Later rounds return immediately: the frozen values are
+    /// reused unchanged.
     /// </summary>
     private void FreezeRound1GateResolution()
     {
-        GateSpec gate = NonNull(_gate);
-        // Round 1 resolves the gate's argv[0] exactly once, to the absolute path the trust check
+        List<GateSpec> gates = NonNull(_gates);
+        // Round 1 resolves each command's argv[0] exactly once, to the absolute path the trust check
         // hashes as TrustSource.Executable (CollectFixedPathsAsync adds exactly this string); later
         // rounds reuse the value frozen on the round-1 spec, which the chain carries in
-        // GateContext.Spec. Gate.BuildStartInfo starts exactly this path — there is no PATH search at
+        // GateContext.Specs. Gate.BuildStartInfo starts exactly this path — there is no PATH search at
         // gate time — so an executable the worker plants in an earlier PATH directory after this
         // lookup can never be swapped in for a later round. An unresolvable argv[0] is a launch error
         // (exit 2) before the worker starts.
         //
         // The same freeze covers the gate's PATH: built once from the launcher's PATH by keeping only
-        // the absolute entries (the GateTrust header's rule), it is what every round hands the gate
-        // as PATH and what the listing trust check watches; a PATH re-read at gate time would let a
-        // later round pick up directories the worker created. A PATH with no absolute entry left is
-        // refused here (exit 2): an empty PATH would make the gate resolve bare command names in its
-        // current directory. The early return below requires both frozen values: a spec carrying only
-        // one of them (a hand-built spec) is resolved the same way round 1 is.
-        if (gate.ResolvedExecutable is not null && gate.GatePath is not null)
+        // the absolute entries (the GateTrust header's rule), it is what every round hands every gate
+        // command as PATH and what the listing trust check watches; a PATH re-read at gate time would
+        // let a later round pick up directories the worker created. One value serves every command —
+        // they are one chain's tools. A PATH with no absolute entry left is refused here (exit 2): an
+        // empty PATH would make the gate resolve bare command names in its current directory. The
+        // early return below requires every frozen value: a spec carrying only some of them (a
+        // hand-built spec) is resolved the same way round 1 is.
+        if (gates.TrueForAll(g => g.ResolvedExecutable is not null && g.GatePath is not null))
         {
             return;
         }
 
-        _gate = gate with
+        string cwd = Directory.GetCurrentDirectory();
+        string gatePath = gates[0].GatePath ?? GateTrust.BuildGatePath();
+        List<GateSpec> resolved = new(gates.Count);
+        foreach (GateSpec g in gates)
         {
-            ResolvedExecutable = GateTrust.ResolveExecutableStrict(gate.Command, Directory.GetCurrentDirectory()),
-            GatePath = GateTrust.BuildGatePath(),
-        };
+            resolved.Add(g with
+            {
+                ResolvedExecutable = g.ResolvedExecutable ?? GateTrust.ResolveExecutableStrict(g.Command, cwd),
+                GatePath = g.GatePath ?? gatePath,
+            });
+        }
+
+        _gates = resolved;
     }
 
-    private void NoteGate(GateSpec? spec)
+    private void NoteGate(IReadOnlyList<GateSpec>? gates)
     {
-        if (spec is null)
+        if (gates is null)
         {
             return;
         }
 
-        _notes.Add(string.Create(CultureInfo.InvariantCulture, $"gate: {string.Join(' ', spec.Command)} (rounds {spec.MaxRounds}, ${spec.MaxTotalUsd:0.####})"));
+        // Legacy stays one argv on the note line; the commands form names each command.
+        string what = gates[0].Name is null
+            ? string.Join(' ', gates[0].Command)
+            : string.Join("; ", gates.Select(g => $"{g.Name}={string.Join(' ', g.Command)}"));
+        _notes.Add(string.Create(CultureInfo.InvariantCulture, $"gate: {what} (rounds {gates[0].MaxRounds}, ${gates[0].MaxTotalUsd:0.####})"));
     }
 
     private void ResolveHookSettings()
@@ -655,6 +706,14 @@ internal sealed class LaunchRun
         }
 
         baseText = baseText.TrimEnd();
+        // The commands form's aggregate Feedback is already the whole text under the heading (the
+        // instruction line with the per-command counts, then one section per command with findings);
+        // the single-command form builds its text here, exactly as before.
+        if (GateRound.IsMulti(context.Specs))
+        {
+            return baseText + nl + nl + Launcher.GateHeading + nl + nl + context.Feedback.Feedback;
+        }
+
         Gate.GateResult feedback = context.Feedback;
         int findings = feedback.Count ?? 0;
         int previousRound = context.Round - 1;
@@ -768,7 +827,7 @@ internal sealed class LaunchRun
 
     private async Task SnapshotTrustAsync()
     {
-        if (_gate is null)
+        if (_gates is null)
         {
             return;
         }
@@ -779,7 +838,7 @@ internal sealed class LaunchRun
             // list, so whatever a tampering process left on disk when this round started cannot
             // become the new baseline. Only the walks meant to catch new files (runs root, config
             // walk) are re-collected, inside RunGateAsync's checks. Round 1's gate.trust warnings
-            // ride along on the frozen spec: gate.json records them, the result block notes them.
+            // ride along on the frozen specs: gate.json records them, the result block notes them.
             // The one exception to "round 1's values": the declared outputs the previous round's
             // gate legitimately rewrote (PostGateOutputs, hashed after its clean after-gate check)
             // replace those keys, or this round's pre-gate check would fail on the gate's own
@@ -790,7 +849,7 @@ internal sealed class LaunchRun
             TrustPaths = GateContext.TrustPaths;
             FixedSources = GateContext.FixedSources;
             GatePathNames = GateContext.GatePathNames;
-            if (_gate?.Warnings is { Count: > 0 } frozen)
+            if (ChainGate.Warnings is { Count: > 0 } frozen)
             {
                 _notes.AddRange(frozen);
             }
@@ -833,7 +892,7 @@ internal sealed class LaunchRun
     /// </summary>
     private async Task FreezeGatePathNamesAsync()
     {
-        string? gatePath = NonNull(_gate).GatePath;
+        string? gatePath = ChainGate.GatePath;
         if (gatePath is null)
         {
             return;
@@ -870,7 +929,7 @@ internal sealed class LaunchRun
         string gitRootCanonical = CanonicalRootOrRefuse(gitRoot, $"git root '{gitRoot}'").Path;
         string workingDirectoryCanonical = CanonicalRootOrRefuse(workingDirectory, $"working directory '{workingDirectory}'").Path;
         string runsRootCanonical = CanonicalRootOrRefuse(Path.GetFullPath(_runsRoot), $"runs root '{Path.GetFullPath(_runsRoot)}'").Path;
-        string? gatePath = NonNull(_gate).GatePath;
+        string? gatePath = ChainGate.GatePath;
         if (gatePath is not null)
         {
             foreach (string dir in GateTrust.SplitGatePath(gatePath))
@@ -988,31 +1047,48 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// The part of the trust set that is fixed for the whole chain: the resolved gate executable,
-    /// the argv file entries that exist now, and the gate.trust literals and glob matches. Resolved
+    /// The part of the trust set that is fixed for the whole chain: every gate command's resolved
+    /// executable and argv file entries, and the gate.trust literals and glob matches. Resolved
     /// once, before round 1's worker, so glob matches and argv entries never pick up files the
-    /// worker or the gate create later. The executable enters as the spec's
+    /// worker or the gate create later. Each executable enters as its spec's
     /// <c>ResolvedExecutable</c> — the exact string round 1 resolved and the gate will start — so
     /// the hashed path and the started path are the same value. The per-path sources are frozen
     /// with the list: the report-path rule asks where a path is trusted from, and a later round
-    /// must not re-derive that from a tree the worker has already changed. A gate.trust glob that
-    /// matched no file becomes a warning on the gate spec (recorded in gate.json) and a note in
+    /// must not re-derive that from a tree the worker has already changed. gate.trust and the
+    /// prices file enter through the first command's collection only (they are chain-level, and the
+    /// glob warnings must not repeat per command); the paths of all commands are unioned in order,
+    /// deduped, into one shared sources dictionary. A gate.trust glob that
+    /// matched no file becomes a warning on every spec (recorded in each gate.json) and a note in
     /// the result block.
     /// </summary>
     private async Task<List<string>> CollectFixedPathsAsync()
     {
-        GateSpec gate = NonNull(_gate);
+        List<GateSpec> gates = NonNull(_gates);
         string cwd = Directory.GetCurrentDirectory();
         string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
         string root = gitRoot ?? cwd;
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(GateTrust.PathComparer);
-        List<string> paths = GateTrust.CollectChainPaths(_runsRoot, root, cwd, gate.Command, gate.Trust, _pricesFile, warnings, sources, gate.ResolvedExecutable);
+        List<string> paths = [];
+        HashSet<string> dedupe = new(GateTrust.PathComparer);
+        for (int i = 0; i < gates.Count; i++)
+        {
+            IReadOnlyList<string>? trust = i is 0 ? gates[0].Trust : null;
+            string? pricesFile = i is 0 ? _pricesFile : null;
+            foreach (string path in GateTrust.CollectChainPaths(_runsRoot, root, cwd, gates[i].Command, trust, pricesFile, warnings, sources, gates[i].ResolvedExecutable))
+            {
+                if (dedupe.Add(path))
+                {
+                    paths.Add(path);
+                }
+            }
+        }
+
         FixedSources = sources;
         if (warnings.Count > 0)
         {
-            _gate = gate with { Warnings = warnings };
-            InitialGateSpec = _gate;
+            _gates = [.. gates.Select(g => g with { Warnings = warnings })];
+            InitialGateSpecs = _gates;
             _notes.AddRange(warnings);
         }
 
@@ -1064,38 +1140,50 @@ internal sealed class LaunchRun
     private static readonly IReadOnlySet<string> _noExclusions = new HashSet<string>(GateTrust.PathComparer);
 
     /// <summary>
-    /// The profile's declared <c>gate.outputs</c>, resolved against the git root (or the working
-    /// directory when not in git) — the same anchor the trust entries resolve against. Absolute
-    /// entries are used as-is, normalised by <see cref="ResolveOutputEntry"/>.
+    /// The profile's declared <c>gate.outputs</c> for one command, resolved against the git root (or
+    /// the working directory when not in git) — the same anchor the trust entries resolve against.
+    /// Absolute entries are used as-is, normalised by <see cref="ResolveOutputEntry"/>.
     /// </summary>
-    private async Task<List<string>> DeclaredOutputPathsAsync()
+    private async Task<List<string>> DeclaredOutputPathsAsync(GateSpec spec)
     {
-        GateSpec gate = NonNull(_gate);
-        if (gate.Outputs is not { Count: > 0 })
+        if (spec.Outputs is not { Count: > 0 })
         {
             return [];
         }
 
         string anchor = await OutputAnchorAsync().ConfigureAwait(false);
-        List<string> resolved = new(gate.Outputs.Count);
-        foreach (string entry in gate.Outputs)
+        string label = OutputLabel(spec);
+        List<string> resolved = new(spec.Outputs.Count);
+        foreach (string entry in spec.Outputs)
         {
-            resolved.Add(ResolveOutputEntry(entry, anchor));
+            resolved.Add(ResolveOutputEntry(entry, anchor, label));
         }
 
         return resolved;
     }
 
     /// <summary>
-    /// The declared gate outputs as the exclusion set of the after-gate trust comparison: the gate
-    /// is expected to write them, so they leave both sides of that one comparison. The before-worker
-    /// snapshot and the pre-gate comparison exclude nothing (<see cref="_noExclusions"/>) — the worker
-    /// must not change a declared output either; only the gate, after the pre-gate check, may.
+    /// One command's declared gate outputs as the exclusion set of its after-gate trust comparison:
+    /// the gate is expected to write them, so they leave both sides of that one comparison. The
+    /// before-worker snapshot, the pre-gate comparison and every other command's comparison exclude
+    /// nothing (<see cref="_noExclusions"/>) — the worker and the other commands must not change a
+    /// declared output either; only the command that declared it, after its pre-gate check, may.
     /// </summary>
-    private async Task<IReadOnlySet<string>> DeclaredOutputExclusionsAsync()
+    private async Task<IReadOnlySet<string>> DeclaredOutputExclusionsAsync(GateSpec spec)
     {
-        List<string> outputs = await DeclaredOutputPathsAsync().ConfigureAwait(false);
+        List<string> outputs = await DeclaredOutputPathsAsync(spec).ConfigureAwait(false);
         return outputs.Count is 0 ? _noExclusions : new HashSet<string>(outputs, GateTrust.PathComparer);
+    }
+
+    /// <summary>
+    /// How a spec's outputs are named in profile errors: the legacy <c>gate.outputs[…]</c> for a
+    /// single-command gate, <c>gate.commands[k].outputs[…]</c> for the commands form (k the
+    /// profile-order index).
+    /// </summary>
+    private string OutputLabel(GateSpec spec)
+    {
+        List<GateSpec> gates = NonNull(_gates);
+        return spec.Name is null ? "gate" : $"gate.commands[{gates.IndexOf(spec).ToString(CultureInfo.InvariantCulture)}]";
     }
 
     // gitRoot ?? cwd: the anchor CollectFixedPathsAsync resolved the fixed trust list against, so a
@@ -1106,7 +1194,7 @@ internal sealed class LaunchRun
         return await RepoToken.RootAsync(cwd).ConfigureAwait(false) ?? cwd;
     }
 
-    private static string ResolveOutputEntry(string entry, string anchor)
+    private static string ResolveOutputEntry(string entry, string anchor, string label)
     {
         try
         {
@@ -1116,7 +1204,7 @@ internal sealed class LaunchRun
         {
             // Spec validation (non-empty, no globs, no ".." in a relative entry) has passed; this is a
             // path the OS layer still refuses. A configuration mistake → launch error, not a crash.
-            throw new LaunchException($"profile gate.outputs entry '{entry}' is invalid: {ex.Message}");
+            throw new LaunchException($"profile {label}.outputs entry '{entry}' is invalid: {ex.Message}");
         }
     }
 
@@ -1160,29 +1248,31 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// Refuses a declared output that is also a trusted gate input from any source other than an
-    /// argv entry: the resolved executable, a gate.trust literal or glob match, the prices file, a
-    /// config-walk file (<c>global.json</c>, <c>nuget.config</c>, <c>dotnet-tools.json</c>,
-    /// <c>.config/dotnet-tools.json</c>) or a runs-root file. The config walk adds its candidate
-    /// paths whether or not they exist, so a declared output with a config-walk file name is
-    /// already refused by that check — no file-name rule is needed on top. The one refusal that
-    /// applies whether or not the file is in the trusted set yet is the runs-root one: the moment
-    /// the gate creates an output at or under the runs root outside the launcher's own bookkeeping
-    /// subtrees, a later round's runs-root walk picks it up and the pre-gate check fails on the
-    /// launcher's own tree. Like the walk's skip set, <c>runs/</c>, <c>inbox/</c> and
-    /// <c>system/</c> under the runs root are exempt — the walk never descends into them, so an
-    /// output there can never trip a later round (and <c>inbox/</c> is a likely place for scratch
-    /// output). An argv entry is allowed as a trusted input: the operator may pin the very file
-    /// the gate writes to (e.g. <c>sh gate.sh artifacts/check.sarif</c> with the path in the argv
-    /// and in <c>gate.outputs</c>) — it is compared before the gate, and only the after-gate
-    /// comparison excludes it. Runs with the round-1 snapshot, before the run directory is
-    /// created: a collision is a profile mistake, so it fails as a launch error (exit 2), not as a
-    /// trust violation.
+    /// Refuses, per command, a declared output that is also a trusted gate input from any source
+    /// other than an argv entry: the resolved executable, a gate.trust literal or glob match, the
+    /// prices file, a config-walk file (<c>global.json</c>, <c>nuget.config</c>,
+    /// <c>dotnet-tools.json</c>, <c>.config/dotnet-tools.json</c>) or a runs-root file. The config
+    /// walk adds its candidate paths whether or not they exist, so a declared output with a
+    /// config-walk file name is already refused by that check — no file-name rule is needed on top.
+    /// The one refusal that applies whether or not the file is in the trusted set yet is the
+    /// runs-root one: the moment the gate creates an output at or under the runs root outside the
+    /// launcher's own bookkeeping subtrees, a later round's runs-root walk picks it up and the
+    /// pre-gate check fails on the launcher's own tree. Like the walk's skip set, <c>runs/</c>,
+    /// <c>inbox/</c> and <c>system/</c> under the runs root are exempt — the walk never descends
+    /// into them, so an output there can never trip a later round (and <c>inbox/</c> is a likely
+    /// place for scratch output). An argv entry is allowed as a trusted input: the operator may pin
+    /// the very file the gate writes to (e.g. <c>sh gate.sh artifacts/check.sarif</c> with the path
+    /// in the argv and in <c>gate.outputs</c>) — it is compared before the gate, and only the
+    /// after-gate comparison excludes it. An output declared by two different commands is refused
+    /// too: each command's after-gate exclusion is its own outputs only, so a shared declaration
+    /// would let whichever command ran first rewrite the other's trusted input unnoticed. Runs with
+    /// the round-1 snapshot, before the run directory is created: a collision is a profile mistake,
+    /// so it fails as a launch error (exit 2), not as a trust violation.
     /// </summary>
     private async Task ValidateDeclaredOutputsAsync(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
     {
-        GateSpec gate = NonNull(_gate);
-        if (gate.Outputs is not { Count: > 0 })
+        List<GateSpec> gates = NonNull(_gates);
+        if (gates.TrueForAll(g => g.Outputs is not { Count: > 0 }))
         {
             return;
         }
@@ -1198,23 +1288,39 @@ internal sealed class LaunchRun
         GateTrust.CanonicalPath inboxDirCanonical = CanonicalRootOrRefuse(Path.Combine(runsRoot, "inbox"), $"runs root subtree '{Path.Combine(runsRoot, "inbox")}'");
         GateTrust.CanonicalPath systemDirCanonical = CanonicalRootOrRefuse(Path.Combine(runsRoot, "system"), $"runs root subtree '{Path.Combine(runsRoot, "system")}'");
         // The same subtrees AddRunsRootFiles never descends into: the launcher's own bookkeeping.
-        for (int i = 0; i < gate.Outputs.Count; i++)
+        Dictionary<string, int> claimed = new(GateTrust.PathComparer);
+        for (int k = 0; k < gates.Count; k++)
         {
-            string full = ResolveOutputEntry(gate.Outputs[i], anchor);
-            if (sources.TryGetValue(full, out HashSet<GateTrust.TrustSource>? set)
-                && set.Any(s => s is not GateTrust.TrustSource.ArgvEntry))
+            if (gates[k].Outputs is not { Count: > 0 } outputs)
             {
-                throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is a trusted gate input");
+                continue;
             }
 
-            GateTrust.CanonicalPath fullCanonical = GateTrust.Canonical(full);
-            RefuseUnresolvedCanonical(fullCanonical, $"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}'");
-            if (GateTrust.IsAtOrUnder(fullCanonical.Path, runsRootCanonical.Path)
-                && !GateTrust.IsAtOrUnder(fullCanonical.Path, runsDirCanonical.Path)
-                && !GateTrust.IsAtOrUnder(fullCanonical.Path, inboxDirCanonical.Path)
-                && !GateTrust.IsAtOrUnder(fullCanonical.Path, systemDirCanonical.Path))
+            string label = gates[k].Name is null ? "gate" : $"gate.commands[{k.ToString(CultureInfo.InvariantCulture)}]";
+            for (int i = 0; i < outputs.Count; i++)
             {
-                throw new LaunchException($"gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is at or under the runs root outside runs/");
+                string full = ResolveOutputEntry(outputs[i], anchor, label);
+                if (claimed.TryGetValue(full, out int owner) && owner != k)
+                {
+                    throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is declared by two gate commands");
+                }
+
+                claimed[full] = k;
+                if (sources.TryGetValue(full, out HashSet<GateTrust.TrustSource>? set)
+                    && set.Any(s => s is not GateTrust.TrustSource.ArgvEntry))
+                {
+                    throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is a trusted gate input");
+                }
+
+                GateTrust.CanonicalPath fullCanonical = GateTrust.Canonical(full);
+                RefuseUnresolvedCanonical(fullCanonical, $"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}'");
+                if (GateTrust.IsAtOrUnder(fullCanonical.Path, runsRootCanonical.Path)
+                    && !GateTrust.IsAtOrUnder(fullCanonical.Path, runsDirCanonical.Path)
+                    && !GateTrust.IsAtOrUnder(fullCanonical.Path, inboxDirCanonical.Path)
+                    && !GateTrust.IsAtOrUnder(fullCanonical.Path, systemDirCanonical.Path))
+                {
+                    throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] '{full}' is at or under the runs root outside runs/");
+                }
             }
         }
     }
@@ -1261,59 +1367,67 @@ internal sealed class LaunchRun
     {
         // The gate only runs after a successful worker (a non-success status ends the chain with the
         // today's exit code; --no-gate or no profile key skips it).
-        if (_gate is null || _status is not "success")
+        if (_gates is null || _status is not "success")
         {
             return;
         }
 
-        (string? violation, Gate.GateResult? gateRan) = await RunTrustedGateAsync().ConfigureAwait(false);
-        if (violation is not null)
+        // One round: every command in profile order, each between its own two trust checks. A
+        // finding never stops the round (the worker should see every tool's findings at once); the
+        // first error — or trust violation — does, because an error already ends the chain and a
+        // violation means the inputs of every later command are tampered. Commands that did not run
+        // are simply absent from the results.
+        List<Gate.GateResult> results = [];
+        for (int i = 0; i < _gates.Count; i++)
         {
-            await FinishTrustViolationAsync(violation, gateRan).ConfigureAwait(false);
-            return;
+            (string? violation, Gate.GateResult result) = await RunOneGateCommandAsync(_gates[i], i).ConfigureAwait(false);
+            results.Add(result);
+            if (violation is not null || result.Outcome is "error")
+            {
+                break;
+            }
         }
 
-        Gate.GateResult result = gateRan!;
-        GateResult = result;
-
-        List<int> countsIncludingThis = GateContext is null
-            ? [result.Count ?? 0]
-            : [.. GateContext.Counts, result.Count ?? 0];
-        decimal chainCostIncludingThis = ChainCostUsd + NonNull(_meter).Spent;
-        decimal maxTotalUsd = _gate.MaxTotalUsd ?? 0m;
-        int maxRounds = _gate.MaxRounds;
-
-        string decision = GateChain.Decide(result, countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd);
-        string? stuckReason = decision is GateChain.Stuck
-            ? GateChain.StuckReason(countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd)
-            : null;
-
-        Counts = countsIncludingThis;
-        ChainCostUsd = chainCostIncludingThis;
-        LastGate = new GateOutcome(decision, result, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason);
+        FinishRound(results);
     }
 
     /// <summary>
-    /// Runs the gate between the two trust checks. Both compare against round 1's before-worker
-    /// snapshot, never against a fresh baseline: a later round must not accept whatever is on disk
-    /// when it starts, or a tampering process that survives into it would hide. Returns the trust
-    /// violation message (null when clean) and the gate result when the gate ran. After a clean
-    /// after-gate check, the declared outputs that are in the trusted set are re-hashed into
-    /// <see cref="PostGateOutputs"/> so the next round's baseline accepts the gate's own round-1
-    /// write and nothing else.
+    /// One command of the round: its trusted run, then — when the trust check fired — the failure
+    /// result <see cref="Gate.WriteFailureAsync"/> records for it (the gate's real exit code, count
+    /// and duration stay when the gate already ran; only the outcome and error are replaced).
     /// </summary>
-    private async Task<(string? Violation, Gate.GateResult? GateRan)> RunTrustedGateAsync()
+    private async Task<(string? Violation, Gate.GateResult Result)> RunOneGateCommandAsync(GateSpec spec, int index)
+    {
+        (string? violation, Gate.GateResult? gateRan) = await RunTrustedGateAsync(spec, index).ConfigureAwait(false);
+        Gate.GateResult result = violation is null
+            ? gateRan!
+            : await Gate.WriteFailureAsync(RunDir, spec, violation, gateRan).ConfigureAwait(false);
+        return (violation, result);
+    }
+
+    /// <summary>
+    /// Runs one gate command between the two trust checks. Both compare against round 1's
+    /// before-worker snapshot (patched with this round's earlier command outputs), never against a
+    /// fresh baseline: a later round must not accept whatever is on disk when it starts, or a
+    /// tampering process that survives into it would hide. Returns the trust violation message (null
+    /// when clean) and the gate result when the gate ran. After a clean after-gate check, the
+    /// declared outputs that are in the trusted set are re-hashed into <see cref="PostGateOutputs"/>
+    /// (and this round's baseline) so the next round accepts the gate's own write and nothing else.
+    /// </summary>
+    private async Task<(string? Violation, Gate.GateResult? GateRan)> RunTrustedGateAsync(GateSpec spec, int index)
     {
         // Pre-gate: a worker may have swapped a trusted input between round 1's before-worker
-        // snapshot and now. Nothing is excluded: a declared gate output is compared like any
-        // other trusted path here, because the worker must not change it — only the gate may,
-        // after this check. The check refuses the gate with a precise list of changed paths so
-        // the chain ends in `error` instead of running the gate against tampered inputs.
+        // snapshot and now — or, for the second and later commands, an earlier command of this round
+        // may have (the prefix says which). Nothing is excluded: a declared gate output is compared
+        // like any other trusted path here, because only the command that declared it may write it,
+        // after this check. The check refuses the gate with a precise list of changed paths so the
+        // chain ends in `error` instead of running the gate against tampered inputs.
+        string changedPrefix = index is 0 ? "the worker changed files the gate trusts: " : "trusted files changed between gate commands: ";
         string? violation;
         try
         {
             violation = TrustSnapshot is not null
-                ? await TrustViolationMessageAsync(_noExclusions, reportPath: null, "the worker changed files the gate trusts: ").ConfigureAwait(false)
+                ? await TrustViolationMessageAsync(_noExclusions, reportPath: null, changedPrefix, spec).ConfigureAwait(false)
                 : null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1333,16 +1447,16 @@ internal sealed class LaunchRun
         Gate.GateResult result;
         try
         {
-            result = await Gate.RunAsync(NonNull(_gate), RunDir, CancellationToken.None).ConfigureAwait(false);
+            result = await Gate.RunAsync(spec, RunDir, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // A failure inside the gate runner itself (opening gate.log, writing gate.json) is not
+            // A failure inside the gate runner itself (opening the gate log, writing its json) is not
             // a trust-check failure: name the actual cause instead of blaming the trusted inputs.
             return ($"the gate could not be run: {ex.Message}", null);
         }
 
-        return (await PostGateCheckAsync(result).ConfigureAwait(false), result);
+        return (await PostGateCheckAsync(result, spec).ConfigureAwait(false), result);
     }
 
     /// <summary>
@@ -1366,20 +1480,20 @@ internal sealed class LaunchRun
     /// <see cref="PostGateOutputs"/> so the next round's baseline accepts the gate's own write and
     /// nothing else.
     /// </summary>
-    private async Task<string?> PostGateCheckAsync(Gate.GateResult result)
+    private async Task<string?> PostGateCheckAsync(Gate.GateResult result, GateSpec spec)
     {
         try
         {
             string? violation = TrustSnapshot is not null
-                ? await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync().ConfigureAwait(false), result.ReportPath,
-                    "trusted files changed while the gate ran: ").ConfigureAwait(false)
+                ? await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync(spec).ConfigureAwait(false), result.ReportPath,
+                    "trusted files changed while the gate ran: ", spec).ConfigureAwait(false)
                 : null;
 
             violation ??= GatePathViolation("a gate PATH directory changed while the gate ran: ");
 
             if (violation is null)
             {
-                PostGateOutputs = await HashPostGateOutputsAsync().ConfigureAwait(false);
+                await HashRoundOutputsAsync(spec).ConfigureAwait(false);
             }
 
             return violation;
@@ -1402,7 +1516,7 @@ internal sealed class LaunchRun
     /// </summary>
     private string? GatePathViolation(string prefix)
     {
-        string? gatePath = NonNull(_gate).GatePath;
+        string? gatePath = ChainGate.GatePath;
         if (GatePathNames is null || gatePath is null)
         {
             return null;
@@ -1420,24 +1534,33 @@ internal sealed class LaunchRun
     private const string PathPathHint = " (PATH directories must not change during a gated run; install tools before launching or call them by absolute path)";
 
     /// <summary>
-    /// After a clean after-gate check: hashes the declared gate outputs that are keys of the trust
-    /// snapshot (the trusted set) and returns them as a snapshot fragment. The gate was allowed to
-    /// rewrite exactly those paths, so the next round's baseline must carry their post-gate values —
-    /// the chain loop stores the fragment on the next <see cref="GateContext"/> and every later
-    /// round merges it over round 1's snapshot (<see cref="MergePostGateOutputs"/>), keeping round 1's
-    /// values everywhere else. Null when there is no snapshot or no declared output in it.
+    /// After one command's clean after-gate check: hashes the declared outputs of that command that
+    /// are keys of the round's baseline (the trusted set) and merges the fragment into
+    /// <see cref="_roundOutputs"/> (the baseline of this round's remaining commands) and
+    /// <see cref="PostGateOutputs"/> (the patch the chain loop hands the next round, which merges it
+    /// over round 1's snapshot, keeping round 1's values everywhere else). The command was allowed
+    /// to rewrite exactly those paths, so every later comparison must carry their post-gate values.
+    /// Nothing to do when there is no snapshot or none of the command's outputs is in the trusted
+    /// set.
     /// </summary>
-    private async Task<GateTrust.Snapshot?> HashPostGateOutputsAsync()
+    private async Task HashRoundOutputsAsync(GateSpec spec)
     {
         if (TrustSnapshot is null)
         {
-            return null;
+            return;
         }
 
-        GateTrust.Snapshot snapshot = TrustSnapshot;
+        GateTrust.Snapshot baseline = NonNull(RoundBaseline);
         List<string> outputs =
-            [.. (await DeclaredOutputPathsAsync().ConfigureAwait(false)).Where(p => snapshot.Hashes.ContainsKey(p))];
-        return outputs.Count is 0 ? null : await GateTrust.HashAsync(outputs).ConfigureAwait(false);
+            [.. (await DeclaredOutputPathsAsync(spec).ConfigureAwait(false)).Where(p => baseline.Hashes.ContainsKey(p))];
+        if (outputs.Count is 0)
+        {
+            return;
+        }
+
+        GateTrust.Snapshot fragment = await GateTrust.HashAsync(outputs).ConfigureAwait(false);
+        _roundOutputs = _roundOutputs is null ? fragment : MergePostGateOutputs(_roundOutputs, fragment);
+        PostGateOutputs = PostGateOutputs is null ? fragment : MergePostGateOutputs(PostGateOutputs, fragment);
     }
 
     /// <summary>
@@ -1457,21 +1580,23 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
-    /// Runs one trust check against round 1's before-worker snapshot. When the gate has already run,
+    /// Runs one trust check against the round's baseline (round 1's before-worker snapshot patched
+    /// with this round's earlier command outputs). When the gate has already run,
     /// <paramref name="reportPath"/> is the report path it named: it is checked first, because a
     /// trusted input the gate just announced it writes over deserves a precise error instead of a
-    /// generic comparison failure (<see cref="GateTrust.ReportPathViolation"/>). Then compare the
+    /// generic comparison failure (<see cref="GateTrust.ReportPathViolation"/>) — and the report-path
+    /// rule's exemption set is <paramref name="spec"/>'s own declared outputs. Then compare the
     /// path sets first (a file that appeared or vanished is reported before anything is hashed),
     /// then hash the stable list and stop at the first entry that differs or sits in a bad state, so
     /// a planted FIFO cannot cost a timeout per entry. Returns null when the tree is clean;
     /// otherwise the error message for the chain's trust violation.
     /// </summary>
-    private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string? reportPath, string changedPrefix)
+    private async Task<string?> TrustViolationMessageAsync(IReadOnlySet<string> exclusions, string? reportPath, string changedPrefix, GateSpec spec)
     {
-        GateTrust.Snapshot before = NonNull(TrustSnapshot);
+        GateTrust.Snapshot before = NonNull(RoundBaseline);
         (List<string> paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources) = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
 
-        if (GateTrust.ReportPathViolation(reportPath, sources, await DeclaredOutputExclusionsAsync().ConfigureAwait(false), RunDir) is { } reportViolation)
+        if (GateTrust.ReportPathViolation(reportPath, sources, await DeclaredOutputExclusionsAsync(spec).ConfigureAwait(false), RunDir) is { } reportViolation)
         {
             return reportViolation;
         }
@@ -1495,23 +1620,36 @@ internal sealed class LaunchRun
             : $"{changedPrefix}{diff.Path}";
     }
 
-    private async Task FinishTrustViolationAsync(string message, Gate.GateResult? gateRan = null)
+    /// <summary>
+    /// The one finish path of a round: aggregate the commands' results into the one
+    /// <see cref="Gate.GateResult"/> the chain decision feeds on (for the single-command form that
+    /// is the one result itself), then decide. A trust violation needs no forcing here: its result
+    /// already carries outcome <c>error</c> (<see cref="Gate.WriteFailureAsync"/>), which
+    /// <see cref="GateChain.Decide"/> passes through, and StuckReason is only set on a stuck
+    /// decision. The commands form records the per-command results on <see cref="GateOutcome.Commands"/>.
+    /// </summary>
+    private void FinishRound(List<Gate.GateResult> results)
     {
-        GateSpec gate = NonNull(_gate);
-        // When the gate already ran, keep its real exit code, count and duration in gate.json and
-        // the summary; replace only the outcome and the error.
-        Gate.GateResult result = await Gate.WriteFailureAsync(RunDir, gate, message, gateRan).ConfigureAwait(false);
-        GateResult = result;
+        List<GateSpec> gates = NonNull(_gates);
+        Gate.GateResult aggregate = GateRound.Aggregate(gates, results, Round, RunDir);
+        GateResult = aggregate;
 
         List<int> countsIncludingThis = GateContext is null
-            ? [result.Count ?? 0]
-            : [.. GateContext.Counts, result.Count ?? 0];
+            ? [aggregate.Count ?? 0]
+            : [.. GateContext.Counts, aggregate.Count ?? 0];
         decimal chainCostIncludingThis = ChainCostUsd + NonNull(_meter).Spent;
+        decimal maxTotalUsd = ChainGate.MaxTotalUsd ?? 0m;
+        int maxRounds = ChainGate.MaxRounds;
 
-        // The decision is forced to "error"; no StuckReason (StuckReason is only set when decision == Stuck).
+        string decision = GateChain.Decide(aggregate, countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd);
+        string? stuckReason = decision is GateChain.Stuck
+            ? GateChain.StuckReason(countsIncludingThis, Round, maxRounds, chainCostIncludingThis, maxTotalUsd)
+            : null;
+
         Counts = countsIncludingThis;
         ChainCostUsd = chainCostIncludingThis;
-        LastGate = new GateOutcome(GateChain.Error, result, RunDir, countsIncludingThis, chainCostIncludingThis, StuckReason: null);
+        LastGate = new GateOutcome(decision, aggregate, RunDir, countsIncludingThis, chainCostIncludingThis, stuckReason,
+            Commands: GateRound.IsMulti(gates) ? results : null);
     }
 
     private async Task ComputeSummaryStatsAsync()
@@ -1618,7 +1756,7 @@ internal sealed class LaunchRun
         }
 
         Gate.GateResult result = outcome.Result;
-        return new JsonObject
+        JsonObject section = new()
         {
             ["chain_id"] = ChainId,
             ["round"] = Round,
@@ -1630,6 +1768,15 @@ internal sealed class LaunchRun
             ["report_path"] = result.ReportPath,
             ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
         };
+        // The commands form adds the per-command results (the count vector of the round); the
+        // legacy keys above hold the aggregate either way. Only adds a field, so the run schema
+        // version stays.
+        if (outcome.Commands is not null)
+        {
+            section["commands"] = GateRound.BuildCommandsJson(NonNull(_gates), outcome.Commands);
+        }
+
+        return section;
     }
 
     private async Task WriteSummaryAsync()
@@ -1700,10 +1847,15 @@ internal sealed class LaunchRun
 
         Gate.GateResult result = outcome.Result;
         int n = result.Count ?? 0;
+        // The commands form adds the per-command breakdown to the continue and stuck lines; clean
+        // and error stay the same text either way.
+        string? breakdown = outcome.Commands is null ? null : GateRound.Counts(NonNull(_gates), outcome.Commands);
         return outcome.Decision switch
         {
             GateChain.Clean => string.Create(ic, $"gate:     clean after {Round.ToString(ic)} round(s), findings {string.Join('→', outcome.Counts)}"),
+            GateChain.Continue when breakdown is not null => string.Create(ic, $"gate:     round {Round.ToString(ic)}, {n.ToString(ic)} finding(s) ({breakdown}); starting round {(Round + 1).ToString(ic)}"),
             GateChain.Continue => string.Create(ic, $"gate:     round {Round.ToString(ic)}, {n.ToString(ic)} finding(s); starting round {(Round + 1).ToString(ic)}"),
+            GateChain.Stuck when breakdown is not null => string.Create(ic, $"gate:     STUCK after {Round.ToString(ic)} round(s), findings {string.Join('→', outcome.Counts)} ({outcome.StuckReason ?? "stuck"}; last: {breakdown})"),
             GateChain.Stuck => string.Create(ic, $"gate:     STUCK after {Round.ToString(ic)} round(s), findings {string.Join('→', outcome.Counts)} ({outcome.StuckReason ?? "stuck"})"),
             GateChain.Error => $"gate:     ERROR: {result.Error ?? "(no error message)"}",
             _ => null,

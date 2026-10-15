@@ -48,11 +48,20 @@ internal static class Gate
 
     private readonly record struct WaitResult(bool TimedOut, bool Cancelled, int ExitCode);
 
+    /// <summary>
+    /// The file name of one gate command's artifacts: <c>gate.log</c> / <c>gate.json</c> for the
+    /// single-command form (a null <see cref="GateSpec.Name"/>), <c>gate-&lt;name&gt;.log</c> /
+    /// <c>gate-&lt;name&gt;.json</c> for the commands form, so every command's log, record and
+    /// failure write are its own. The name is validated to <c>[a-z][a-z0-9-]{0,31}</c>, so it is
+    /// path-safe as-is.
+    /// </summary>
+    internal static string FileName(GateSpec spec, string ext) => spec.Name is null ? $"gate.{ext}" : $"gate-{spec.Name}.{ext}";
+
     public static async Task<GateResult> RunAsync(GateSpec spec, string runDir, CancellationToken token)
     {
         DateTimeOffset started = DateTimeOffset.Now;
-        string logPath = Path.Combine(runDir, "gate.log");
-        string gateJsonPath = Path.Combine(runDir, "gate.json");
+        string logPath = Path.Combine(runDir, FileName(spec, "log"));
+        string gateJsonPath = Path.Combine(runDir, FileName(spec, "json"));
         string cwd = Directory.GetCurrentDirectory();
         StdoutBuffer stdout = new();
         List<string> envNames = [];
@@ -940,7 +949,7 @@ internal static class Gate
             ? new GateResult(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
                 Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero)
             : gateRan with { Outcome = "error", Error = errorMessage };
-        await WriteGateJsonAsync(Path.Combine(runDir, "gate.json"), result, spec, envNames: []).ConfigureAwait(false);
+        await WriteGateJsonAsync(Path.Combine(runDir, FileName(spec, "json")), result, spec, envNames: []).ConfigureAwait(false);
         return result;
     }
 

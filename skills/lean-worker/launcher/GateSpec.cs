@@ -2,6 +2,12 @@
 // "no gate"). The validation matches the gate profile grammar in the task brief; failures throw LaunchException
 // so the user sees a precise, named message.
 //
+// A gate is one command ("gate": {"command": [...]}) or several ("gate": {"commands": [{...}, ...]}). The
+// single-command form keeps this record exactly as it has always been (Name null); the commands form resolves
+// to one record per entry, its Name the entry's "name" key. The chain-level keys (caps, trust, env, the PATH
+// freeze) belong to the gate itself and are copied into every element, so a chain of specs is a list of
+// self-contained records and nothing downstream has to pair them with a shared half.
+//
 // User-supplied `reportFromLastLine` patterns must include at least one capture group. The runner reads
 // group 1 first; if that is empty it falls back to the first named group (excluding group 0), so a regex
 // that uses a named capture for its only group — like the default `^sarif: (?<report>.+)$` — still works.
@@ -27,13 +33,14 @@
 // a launch error (exit 2) rather than frozen as an empty value, which would resolve bare command names in
 // the gate's current directory.
 
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace LeanWorker;
 
-internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null, string? ResolvedExecutable = null, string? GatePath = null)
+internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLastLine, string CountPath, int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string>? Trust = null, List<string>? Outputs = null, List<string>? Warnings = null, string? ResolvedExecutable = null, string? GatePath = null, string? Name = null)
 {
     // A count-path segment: a JSON property name optionally followed by one non-negative index in brackets.
     // `[0-9]` (not `\d`, which matches non-ASCII digits) and a leading-zero rule so the runtime walk can
@@ -47,12 +54,34 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*\*?$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
     private static partial Regex EnvNamePatternRegex();
 
+    // A command entry's name: lowercase, digits and dashes, at most 32 chars. It lands in file names
+    // (gate-<name>.log) and section headings, so it must be readable and path-safe as-is.
+    [GeneratedRegex(@"^[a-z][a-z0-9-]{0,31}$", RegexOptions.ExplicitCapture, matchTimeoutMilliseconds: 1000)]
+    private static partial Regex CommandNamePatternRegex();
+
     /// <summary>
-    /// Returns null when the profile has no gate key. Any other value (a string, number, array, object
-    /// other than the gate spec) throws so a mis-spelled gate key fails fast with a precise message.
-    /// Uses the current process's working directory as the gate's working directory for the
-    /// directory-refusal check on <c>gate.command</c> entries.
+    /// Returns null when the profile has no gate key; otherwise every command the gate runs: one
+    /// spec for the single <c>gate.command</c> form (its <c>Name</c> null), one per entry for the
+    /// <c>gate.commands</c> form. Any other value (a string, number, array) throws so a mis-spelled
+    /// gate key fails fast with a precise message.
     /// </summary>
+    /// <param name="profile">The profile JSON object (or null for "no profile").</param>
+    /// <param name="gateWorkingDirectory">Directory the gate process will be started in
+    /// (<c>ProcessStartInfo.WorkingDirectory</c>); argv entries are resolved against this directory for the
+    /// directory-refusal check.</param>
+    public static List<GateSpec>? FromProfileAll(JsonObject? profile, string gateWorkingDirectory)
+    {
+        JsonObject? gate = GateObject(profile);
+        if (gate is null)
+        {
+            return null;
+        }
+
+        return gate["commands"] is null
+            ? [FromProfileObject(gate, gateWorkingDirectory)]
+            : FromProfileCommands(gate, gateWorkingDirectory);
+    }
+
     public static GateSpec? FromProfile(JsonObject? profile) => FromProfile(profile, Directory.GetCurrentDirectory());
 
     /// <summary>
@@ -65,6 +94,16 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     /// directory-refusal check.</param>
     public static GateSpec? FromProfile(JsonObject? profile, string gateWorkingDirectory)
     {
+        JsonObject? gate = GateObject(profile);
+        return gate is null ? null : FromProfileObject(gate, gateWorkingDirectory);
+    }
+
+    /// <summary>
+    /// The profile's <c>gate</c> object, or null when the profile has no gate key. Any other value
+    /// (a string, number, array) throws so a mis-spelled gate key fails fast with a precise message.
+    /// </summary>
+    private static JsonObject? GateObject(JsonObject? profile)
+    {
         JsonNode? node = profile?["gate"];
         if (node is null)
         {
@@ -76,40 +115,168 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             throw new LaunchException("profile gate must be an object");
         }
 
-        List<string> command = ReadCommand(gate, gateWorkingDirectory);
+        return gate;
+    }
+
+    /// <summary>
+    /// The chain-level keys every command of a gate shares: the feedback cap, the default timeout,
+    /// the round and cost caps, the extra env and the trust list. The commands form copies these
+    /// into every spec; the single-command form puts them on its one spec.
+    /// </summary>
+    private sealed record SharedKeys(int FeedbackMaxChars, int TimeoutMinutes, int MaxRounds, decimal? MaxTotalUsd, List<string> Env, List<string> Trust);
+
+    private static SharedKeys ReadSharedKeys(JsonObject gate)
+    {
+        return new SharedKeys(
+            ReadPositiveInt(gate, "feedbackMaxChars", 8000, "profile gate.feedbackMaxChars"),
+            ReadPositiveInt(gate, "timeoutMinutes", 30, "profile gate.timeoutMinutes"),
+            ReadPositiveInt(gate, "maxRounds", 5, "profile gate.maxRounds"),
+            ReadMaxTotalUsd(gate),
+            ReadEnv(gate),
+            ReadTrust(gate));
+    }
+
+    /// <summary>
+    /// The single-command form: one spec, <c>Name</c> null, read from the gate-level keys exactly as
+    /// before the <c>commands</c> form existed (readers label their errors "profile gate.*" so the
+    /// messages stay byte-identical).
+    /// </summary>
+    private static GateSpec FromProfileObject(JsonObject gate, string gateWorkingDirectory)
+    {
+        List<string> command = ReadCommand(gate, gateWorkingDirectory, "profile gate");
         // The gate's report path cannot be checked against the trusted inputs here: the profile only
         // carries the reportFromLastLine regex, and the path itself arrives on the gate's stdout at
         // run time. The trusted-input check for it is therefore run-time only (LaunchRun's trust
         // checks via GateTrust.ReportPathViolation, after the gate runs and the path is resolved).
         // Declared gate.outputs entries, in contrast, are known up front and validated against the
         // fixed trusted inputs when round 1 collects them, before the worker starts.
-        Regex reportFromLastLine = ReadReportRegex(gate);
-        string countPath = ReadCountPath(gate);
-        int feedbackMaxChars = ReadPositiveInt(gate, "feedbackMaxChars", 8000, "profile gate.feedbackMaxChars");
-        int timeoutMinutes = ReadPositiveInt(gate, "timeoutMinutes", 30, "profile gate.timeoutMinutes");
-        int maxRounds = ReadPositiveInt(gate, "maxRounds", 5, "profile gate.maxRounds");
-        decimal? maxTotalUsd = ReadMaxTotalUsd(gate);
-        List<string> env = ReadEnv(gate);
-        List<string> trust = ReadTrust(gate);
-        List<string> outputs = ReadOutputs(gate);
+        Regex reportFromLastLine = ReadReportRegex(gate, "profile gate");
+        string countPath = ReadCountPath(gate, "profile gate");
+        List<string> outputs = ReadOutputs(gate, "profile gate");
+        SharedKeys shared = ReadSharedKeys(gate);
 
-        return new GateSpec(command, reportFromLastLine, countPath, feedbackMaxChars, timeoutMinutes, maxRounds, maxTotalUsd, env, trust, outputs);
+        return new GateSpec(command, reportFromLastLine, countPath, shared.FeedbackMaxChars, shared.TimeoutMinutes, shared.MaxRounds, shared.MaxTotalUsd, shared.Env, shared.Trust, outputs);
     }
 
-    private static List<string> ReadCommand(JsonObject gate, string gateWorkingDirectory)
+    /// <summary>
+    /// The <c>gate.commands</c> form: the shared chain-level keys read once from the gate object, the
+    /// per-command keys from each entry, the shared values copied into every spec. The shared-only and
+    /// command-only keys are kept apart by <see cref="RefuseSharedKeys"/> and
+    /// <see cref="RefuseGateLevelCommandKeys"/> so a key on the wrong level is a named refusal, not a
+    /// silently ignored setting.
+    /// </summary>
+    private static List<GateSpec> FromProfileCommands(JsonObject gate, string gateWorkingDirectory)
     {
-        if (gate["command"] is not JsonArray arr || arr.Count is 0)
+        if (gate["command"] is not null)
         {
-            throw new LaunchException("profile gate.command must be a non-empty array of strings");
+            throw new LaunchException("profile gate cannot have both command and commands");
+        }
+
+        RefuseGateLevelCommandKeys(gate);
+        SharedKeys shared = ReadSharedKeys(gate);
+
+        List<JsonObject> entries = ReadCommands(gate);
+        HashSet<string> names = new(StringComparer.Ordinal);
+        List<GateSpec> specs = new(entries.Count);
+        for (int i = 0; i < entries.Count; i++)
+        {
+            specs.Add(ReadCommandSpec(entries[i], i, gateWorkingDirectory, shared, names));
+        }
+
+        return specs;
+    }
+
+    private static GateSpec ReadCommandSpec(JsonObject entry, int index, string gateWorkingDirectory, SharedKeys shared, HashSet<string> names)
+    {
+        string label = $"profile gate.commands[{index.ToString(CultureInfo.InvariantCulture)}]";
+        RefuseSharedKeys(entry, label);
+        string name = ReadName(entry, label, names);
+        List<string> command = ReadCommand(entry, gateWorkingDirectory, label);
+        Regex reportFromLastLine = ReadReportRegex(entry, label);
+        string countPath = ReadCountPath(entry, label);
+        List<string> outputs = ReadOutputs(entry, label);
+        int timeoutMinutes = ReadPositiveInt(entry, "timeoutMinutes", shared.TimeoutMinutes, $"{label}.timeoutMinutes");
+        return new GateSpec(command, reportFromLastLine, countPath, shared.FeedbackMaxChars, timeoutMinutes, shared.MaxRounds, shared.MaxTotalUsd, shared.Env, shared.Trust, outputs, Name: name);
+    }
+
+    private static List<JsonObject> ReadCommands(JsonObject gate)
+    {
+        if (gate["commands"] is not JsonArray arr || arr.Count is 0)
+        {
+            throw new LaunchException("profile gate.commands must be a non-empty array of objects");
+        }
+
+        List<JsonObject> entries = new(arr.Count);
+        foreach (JsonNode? item in arr)
+        {
+            if (item is not JsonObject entry)
+            {
+                throw new LaunchException("profile gate.commands must be a non-empty array of objects");
+            }
+
+            entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    private static string ReadName(JsonObject entry, string label, HashSet<string> names)
+    {
+        if (!IsNonEmptyString(entry["name"], out string? name))
+        {
+            throw new LaunchException($"{label}.name is required and must be a non-empty string");
+        }
+
+        if (!CommandNamePatternRegex().IsMatch(name))
+        {
+            throw new LaunchException($"{label}.name must match ^[a-z][a-z0-9-]{{0,31}}$: '{name}'");
+        }
+
+        if (!names.Add(name))
+        {
+            throw new LaunchException($"{label}.name '{name}' is already used by an earlier command");
+        }
+
+        return name;
+    }
+
+    private static void RefuseSharedKeys(JsonObject entry, string label)
+    {
+        string[] sharedKeys = ["maxRounds", "maxTotalUsd", "trust", "env", "feedbackMaxChars", "commands"];
+        foreach (string key in sharedKeys)
+        {
+            if (entry[key] is not null)
+            {
+                throw new LaunchException($"{label}.{key} is set on gate, not on a command");
+            }
+        }
+    }
+
+    private static void RefuseGateLevelCommandKeys(JsonObject gate)
+    {
+        string[] commandKeys = ["outputs", "reportFromLastLine", "countPath"];
+        foreach (string key in commandKeys)
+        {
+            if (gate[key] is not null)
+            {
+                throw new LaunchException($"profile gate.{key} cannot be set when gate.commands is; it belongs on a command");
+            }
+        }
+    }
+
+    private static List<string> ReadCommand(JsonObject holder, string gateWorkingDirectory, string label)
+    {
+        if (holder["command"] is not JsonArray arr || arr.Count is 0)
+        {
+            throw new LaunchException($"{label}.command must be a non-empty array of strings");
         }
 
         List<string> command = new(arr.Count);
         for (int i = 0; i < arr.Count; i++)
         {
-            JsonNode? node = arr[i];
-            if (node is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
+            if (!IsNonEmptyString(arr[i], out string? s))
             {
-                throw new LaunchException("profile gate.command must be a non-empty array of non-empty strings");
+                throw new LaunchException($"{label}.command must be a non-empty array of non-empty strings");
             }
 
             // The directory refusal is an operator rule on later arguments; argv[0] without a directory
@@ -126,12 +293,12 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
                 }
                 catch (ArgumentException ex)
                 {
-                    throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is invalid: {ex.Message}");
+                    throw new LaunchException($"{label}.command[{i.ToString(CultureInfo.InvariantCulture)}] is invalid: {ex.Message}");
                 }
 
                 if (Directory.Exists(resolved))
                 {
-                    throw new LaunchException($"profile gate.command[{i.ToString(CultureInfo.InvariantCulture)}] is a directory: {resolved}");
+                    throw new LaunchException($"{label}.command[{i.ToString(CultureInfo.InvariantCulture)}] is a directory: {resolved}");
                 }
             }
 
@@ -147,17 +314,33 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             || s.Contains(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal);
     }
 
-    private static Regex ReadReportRegex(JsonObject gate)
+    /// <summary>
+    /// Whether <paramref name="node"/> is a JSON string that is neither null nor empty — the shape
+    /// every string-list reader (command argv, names, trust and output entries) requires of its
+    /// items. The caller keeps its own precise refusal message.
+    /// </summary>
+    private static bool IsNonEmptyString(JsonNode? node, [NotNullWhen(true)] out string? value)
     {
-        const string label = "profile gate.reportFromLastLine";
-        if (!gate.TryGetPropertyValue("reportFromLastLine", out JsonNode? rn) || rn is null)
+        if (node is JsonValue v && v.TryGetValue(out string? s) && !string.IsNullOrEmpty(s))
+        {
+            value = s;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
+    private static Regex ReadReportRegex(JsonObject holder, string label)
+    {
+        if (!holder.TryGetPropertyValue("reportFromLastLine", out JsonNode? rn) || rn is null)
         {
             return DefaultReportFromLastLineRegex();
         }
 
         if (rn is not JsonValue rv || !rv.TryGetValue(out string? pattern) || string.IsNullOrEmpty(pattern))
         {
-            throw new LaunchException($"{label} must be a regex string");
+            throw new LaunchException($"{label}.reportFromLastLine must be a regex string");
         }
 
         Regex compiled;
@@ -167,29 +350,29 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         }
         catch (ArgumentException ex)
         {
-            throw new LaunchException($"{label} is not a valid regex: {ex.Message}");
+            throw new LaunchException($"{label}.reportFromLastLine is not a valid regex: {ex.Message}");
         }
 
         // GetGroupNames includes the whole-match group 0 plus any other named or numbered capture groups;
         // a regex with at least one capture group (named or not) yields more than one entry.
         if (compiled.GetGroupNames().Length <= 1)
         {
-            throw new LaunchException($"{label} must have at least one capture group");
+            throw new LaunchException($"{label}.reportFromLastLine must have at least one capture group");
         }
 
         return compiled;
     }
 
-    private static string ReadCountPath(JsonObject gate)
+    private static string ReadCountPath(JsonObject holder, string label)
     {
-        if (!gate.TryGetPropertyValue("countPath", out JsonNode? cn) || cn is null)
+        if (!holder.TryGetPropertyValue("countPath", out JsonNode? cn) || cn is null)
         {
             return "runs[0].results";
         }
 
         if (cn is not JsonValue cv || !cv.TryGetValue(out string? path) || string.IsNullOrEmpty(path))
         {
-            throw new LaunchException("profile gate.countPath must be a non-empty string");
+            throw new LaunchException($"{label}.countPath must be a non-empty string");
         }
 
         Regex segmentPattern = CountPathSegmentRegex();
@@ -197,7 +380,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         {
             if (!segmentPattern.IsMatch(segment))
             {
-                throw new LaunchException($"profile gate.countPath has an invalid segment: '{segment}'");
+                throw new LaunchException($"{label}.countPath has an invalid segment: '{segment}'");
             }
         }
 
@@ -292,7 +475,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             // A non-empty string is required so the matcher can rely on the prefix-relative shape
             // (an empty entry would match every directory above the root, which is not what the
             // operator asked for).
-            if (item is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
+            if (!IsNonEmptyString(item, out string? s))
             {
                 throw new LaunchException($"profile gate.trust[{i.ToString(CultureInfo.InvariantCulture)}] must be a non-empty string");
             }
@@ -339,25 +522,25 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
     /// report is not named in its argv — a lint gate's default report under <c>artifacts/</c>, for
     /// example — needs no <c>gate.outputs</c>: an untrusted path needs no exclusion.
     /// </summary>
-    private static List<string> ReadOutputs(JsonObject gate)
+    private static List<string> ReadOutputs(JsonObject holder, string label)
     {
-        if (!gate.TryGetPropertyValue("outputs", out JsonNode? n) || n is null)
+        if (!holder.TryGetPropertyValue("outputs", out JsonNode? n) || n is null)
         {
             return [];
         }
 
         if (n is not JsonArray arr)
         {
-            throw new LaunchException("profile gate.outputs must be an array of paths");
+            throw new LaunchException($"{label}.outputs must be an array of paths");
         }
 
         List<string> outputs = new(arr.Count);
         for (int i = 0; i < arr.Count; i++)
         {
             JsonNode? item = arr[i];
-            if (item is not JsonValue v || !v.TryGetValue(out string? s) || string.IsNullOrEmpty(s))
+            if (!IsNonEmptyString(item, out string? s))
             {
-                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must be a non-empty string");
+                throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must be a non-empty string");
             }
 
             string normalized = s.Replace('\\', '/');
@@ -372,7 +555,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
                 {
                     if (segment is "..")
                     {
-                        throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
+                        throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain a '..' segment: {s}");
                     }
                 }
             }
@@ -382,7 +565,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             // gate.trust globs out of the report-path decision).
             if (normalized.IndexOfAny(['*', '?']) >= 0)
             {
-                throw new LaunchException($"profile gate.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain glob characters: {s}");
+                throw new LaunchException($"{label}.outputs[{i.ToString(CultureInfo.InvariantCulture)}] must not contain glob characters: {s}");
             }
 
             outputs.Add(normalized);

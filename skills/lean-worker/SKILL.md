@@ -207,15 +207,18 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
 
 ## Gate (optional): the run ends when a check passes
 
-A profile can name a gate: a command the launcher runs after the worker ends with `success`. While the gate reports
-findings, the launcher starts a fresh worker with the original task plus a `## Gate report (lean-worker)` section (the
-gate's output and its report path), up to the profile's caps. The gate is not run when the worker did not succeed.
-The result block gets one `gate:` line:
+A profile can name a gate: one command (`gate.command`) or several (`gate.commands`, a list of named entries) the
+launcher runs after the worker ends with `success`. While the gate reports findings, the launcher starts a fresh worker
+with the original task plus a `## Gate report (lean-worker)` section (the gate's output and its report path), up to the
+profile's caps. The gate is not run when the worker did not succeed. The result block gets one `gate:` line:
 
 ```
 gate:     clean after 2 round(s), findings 7→0
 gate:     STUCK after 3 round(s), findings 3→3→3 (no decrease in 2 rounds)
 gate:     ERROR: the worker changed files the gate trusts: /repo/global.json
+gate:     round 1, 5 finding(s) (lint 3, arch 0, test 2); starting round 2
+gate:     STUCK after 3 round(s), findings 5→5→5 (no decrease in 2 rounds; last: lint 3, arch 0, test 2)
+gate:     ERROR: arch: gate exited 2
 ```
 
 Exit codes with a gate, and what to do on each:
@@ -226,22 +229,30 @@ Exit codes with a gate, and what to do on each:
   was reached. Read the last run's `report.md` and the gate report it names. Then sharpen or split the task, or take
   it to the user. Do not raise the caps to push it through.
 - **5** (`gate-error`): the gate failed (exit 2, timeout, no readable report) or the trust check fired. The `gate:`
-  line names the cause; `gate.json` and `gate.log` in the run directory have the details. A trust violation means the
+  line names the cause; `gate.json` and `gate.log` in the run directory have the details (`gate-<name>.json` and
+  `gate-<name>.log` for each command when `gate.commands` is used). A trust violation means the
   worker (or something running while it ran) changed a file the gate relies on. Look at that change with the user
   before running again.
 - **2**: the launcher refused before the worker ran. That covers an invalid `gate` key and an unresolvable gate
   executable. It also covers a gate PATH with no absolute entry, or with a directory or link inside the working tree.
   Fix the profile or the environment the message names.
 
+With `gate.commands`, every command runs each round even when others report findings, so one round's worker sees every
+tool's findings in its `## Gate report` section; the first error (a failed gate or a trust violation) ends the round
+and the chain reports `error`. The chain decision uses the round's total finding count: "no decrease in 2 rounds" and
+the caps (`maxRounds`, `maxTotalUsd`) apply to the sum over all commands, so totals that shift between tools count as
+no progress. `summary.json`'s `gate` section holds the aggregate plus a `commands` list with each command's outcome.
+
 What the gate may trust is fixed in round 1 for the whole chain. That covers:
 
-- the resolved gate executable and its PATH (absolute directories only);
-- every argv file;
+- every gate command's resolved executable, and the PATH (absolute directories only) they all share;
+- every command's argv files;
 - `gate.trust` entries;
 - the runs root's own files and the prices file;
 - `global.json`, `nuget.config` and the dotnet tool manifests from the working directory up to the git root.
 
-These are checked again before and after each gate run. The gate gets a minimal environment: PATH, HOME, locale,
+These are checked again before and after each gate command's run (a change found before a later command is reported as
+`trusted files changed between gate commands`). The gate gets a minimal environment: PATH, HOME, locale,
 `DOTNET_*`, `NUGET_*`, `NuGetPackageSourceCredentials_*`, `MSBUILD*`, plus `gate.env`. API keys and tokens never reach
 it. Install the tools a gate uses before launching: a change to a gate PATH directory during the chain ends the run
 with exit 5. The profile keys are in `templates/profiles.json`.

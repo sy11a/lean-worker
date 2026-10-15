@@ -46,6 +46,7 @@ internal static class Launcher
             // The one patch: the declared outputs this round's gate was allowed to rewrite, hashed
             // after its clean after-gate check (PostGateOutputs) — they replace exactly those keys
             // of round 1's snapshot, everything else keeps round 1's baseline.
+            IReadOnlyList<GateSpec> specs = run.InitialGateSpecs ?? throw new LaunchException("gate chain has no spec");
             GateContext nextContext = new(
                 ChainId: run.ChainId,
                 Round: run.Round + 1,
@@ -54,7 +55,7 @@ internal static class Launcher
                 OriginalTask: run.OriginalTask,
                 OriginalName: run.OriginalName,
                 Feedback: run.LastGate.Result,
-                Spec: run.InitialGateSpec ?? throw new LaunchException("gate chain has no spec"),
+                Specs: specs,
                 TrustSnapshot: run.TrustSnapshot ?? throw new LaunchException("gate chain has no trust snapshot"),
                 TrustPaths: run.TrustPaths ?? throw new LaunchException("gate chain has no trust paths"),
                 FixedSources: run.FixedSources ?? throw new LaunchException("gate chain has no trust path sources"),
