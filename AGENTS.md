@@ -38,5 +38,22 @@ Never commit to `master` directly and never force-push it.
 - Lint gate: `dotnet tool run sy11a-lint check --full tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target covers the launcher; `--affected` needs a solution, which lean-worker does not have; `sy11a.lint` moves in lockstep with `Sy11a.Analyzers`, SY-POLICYVERSION).
 - Architecture gate: `dotnet tool run sy11a-arch check --affected skills/lean-worker/launcher/LeanWorker.csproj` (`--full` for the whole picture; `sy11a.arch` moves in lockstep with `Sy11a.Analyzers` and `sy11a.lint`, SY-POLICYVERSION).
 - Test gate: `dotnet tool run sy11a-test check --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj` (the test project as target, so a launcher-only change selects it; `--full` for the whole picture; `sy11a.test` moves in lockstep with `Sy11a.Analyzers`, `sy11a.lint` and `sy11a.arch`).
+- Gate evidence for review (dev-flow BL-522; tool sides bound by sy11a/sy11a_analyzers#327):
+  - **Deleted tests.** The test gate's report lists the test methods the diff deleted or that lost
+    `[Fact]`/`[Theory]` (0002 R-073). That list goes into the review's gate tail. A deletion fails no gate;
+    review judges it.
+  - **Mutation round.** After a green test gate, run
+    `dotnet tool run sy11a-test mutate --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj`
+    (0002 R-092).
+    - The survivors (file, line, original and replacement, mutator, covering tests) go to the Claude test
+      worker for one round that writes or strengthens tests only.
+    - The test gate and `mutate --affected` then run again over the same lines.
+    - What still survives goes into the test-plan note's survivor record.
+    - Exit `2`: the round could not run. The test-plan note says so in one line, and the task is not blocked.
+    - Exit `143` (`sy11a.test` 0.18.0 and later): the run was interrupted. It is treated like `2`, but the
+      line says "interrupted", and the survivors of the pairs that finished still count.
+  - **Duplicate-detector evidence.** The duplicate gate is the architecture gate's SYA1201 (jscpd, 0004 R-045).
+    The reviewer records any clone it missed and any SYA1201 hit judged false, with file and lines, under
+    "Duplicate-detector evidence" in the review report.
 - Acceptance (real workers, cents of list price): `tests/acceptance.sh`. It needs GLM; while GLM is not in
   use, run `LW_OPENCODE_MODEL=minimax-coding-plan/MiniMax-M3 tests/acceptance.sh --claude-only`.
