@@ -27,6 +27,7 @@ internal static class Program
                 "quota" => Commands.Quota(args[1..]),
                 "cost" => Commands.Cost(args[1..]),
                 "stats" => Commands.Stats(args[1..]),
+                "profiles" => Commands.Profiles(args[1..]),
                 "prices" => Commands.Prices(args[1..]),
                 _ => await Launcher.RunAsync(Options.Parse(args)).ConfigureAwait(false),
             };

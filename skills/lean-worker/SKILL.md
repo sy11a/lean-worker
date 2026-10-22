@@ -143,7 +143,13 @@ In both, the first launch may ask for permission; the installer pre-approves `do
 (`.claude/settings.json`, `opencode.json`).
 
 ```
-dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/<task-name>/task.md" --profile code
+dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/<task-name>/task.md" --profile code-minimax
+
+> Profile names are LOCAL RUNTIME CONFIG, not a fixed convention: the set and the
+> model behind each name come from this repo's `.lean-worker/profiles.json` and can be
+> reconfigured (e.g. 2026-10-14: `code` became Claude/tests-only). Never recall profile
+> names from memory or docs — run `dotnet run --project <skill-dir>/launcher -c Release
+> -- --profiles` to list what the local config actually maps before delegating.
 ```
 
 Run it from the project root, because `.lean-worker/` is resolved relative to the current directory.
