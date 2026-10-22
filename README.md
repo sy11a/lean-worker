@@ -113,7 +113,13 @@ The orchestrator reads the repository and asks you about anything it cannot see.
 - **`.lean-worker/project.md`**: the notes every worker receives. Stack, layout, build, test and
   lint commands, conventions, prohibitions, and where to look. Keep it short (target under 2k
   tokens), because it is paid for on every worker API call.
-- **`.lean-worker/profiles.json`**: named profiles (`read`, `edit`, `code`, `research`, `review`), or, with other model plans, `templates/profiles-chains.json`: the same roles with model chains across plans (MiniMax, GLM, then Claude). What each model needs is in `skills/lean-worker/models.md`.
+- **`.lean-worker/profiles.json`**: named profiles — the generic template ships roles
+  (`read`, `edit`, `code`, `research`, `review`); real installs RENAME and REMAP them
+  (this repo since 2026-10-14: `code-minimax` = MiniMax production code, `code-glm` =
+  GLM fallback writer + default, `code` = Claude Sonnet tests-only, `review` = opus).
+  Profile names are local runtime config, not a convention: before delegating, list the
+  actual mapping with `dotnet run --project <skill-dir>/launcher -c Release -- --profiles`
+  instead of trusting docs or memory. What each model needs is in `skills/lean-worker/models.md`.
   Each one sets the model, effort, tools, pre-approved commands and budget. The `{build command}`
   and `{test command}` placeholders are replaced with your own commands, and you add profiles
   for your own task classes.
