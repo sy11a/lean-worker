@@ -15,6 +15,12 @@ internal sealed class LaunchRun
     private string? _profileName;
     private JsonObject? _profile;
 
+    // The workspace root (Workspace.ResolveAsync): the git working tree of the task file or
+    // continue-from run dir, else that directory itself. Every anchor that used to read the
+    // launcher's own working directory reads this instead — the worker's cwd/PWD, the write-scope
+    // snapshot, the <repo> token, gate command resolution and the gate child's cwd.
+    private string _workspaceRoot = string.Empty;
+
     // ResolveSettings (price book + runtime + chain)
     private PriceBook? _prices;
     private List<string> _notes = [];
@@ -194,6 +200,7 @@ internal sealed class LaunchRun
 
     public async Task<int> RunAsync()
     {
+        await ResolveWorkspaceAsync().ConfigureAwait(false);
         await LoadProfileAsync().ConfigureAwait(false);
         ResolveSettings();
         await ValidateInputsAsync().ConfigureAwait(false);
@@ -212,6 +219,42 @@ internal sealed class LaunchRun
         await WriteSummaryAsync().ConfigureAwait(false);
         await PrintAsync().ConfigureAwait(false);
         return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
+    }
+
+    // Resolved before everything else: LoadProfileAsync reads a relative --continue-from, and
+    // ResolveGate (inside ResolveSettings) anchors gate specs on the workspace. A relative task or
+    // continue-from path that misses under the launcher's cwd is retried against that cwd's git
+    // root first, so the anchor itself is as right as the checkout can make it.
+    private async Task ResolveWorkspaceAsync()
+    {
+        if (_o.TaskFile is null && _o.ContinueFrom is null)
+        {
+            // ValidateInputsAsync (still later in RunAsync) reports the missing-input error; there
+            // is no anchor to resolve yet.
+            return;
+        }
+
+        string cwd = Directory.GetCurrentDirectory();
+        if (_o.TaskFile is not null)
+        {
+            _o.TaskFile = await Workspace.ResolveRelativeAsync(_o.TaskFile, cwd).ConfigureAwait(false);
+        }
+
+        if (_o.ContinueFrom is not null)
+        {
+            _o.ContinueFrom = await Workspace.ResolveRelativeAsync(_o.ContinueFrom, cwd).ConfigureAwait(false);
+        }
+
+        string anchor = _o.TaskFile is not null
+            ? Path.GetDirectoryName(Path.GetFullPath(_o.TaskFile))!
+            : Path.GetFullPath(_o.ContinueFrom!);
+        _workspaceRoot = await Workspace.ResolveAsync(anchor, cwd).ConfigureAwait(false);
+        if (_workspaceRoot.Equals(cwd, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _notes.Add($"workspace {_workspaceRoot} (anchored on the task's location; the launcher's own cwd {cwd} is ignored)");
     }
 
     private async Task LoadProfileAsync()
@@ -337,7 +380,7 @@ internal sealed class LaunchRun
                 return;
             }
 
-            specs = GateSpec.FromProfileAll(_profile, Directory.GetCurrentDirectory());
+            specs = GateSpec.FromProfileAll(_profile, _workspaceRoot);
             if (specs is null)
             {
                 if (_o.GateMaxRounds is not null)
@@ -397,7 +440,7 @@ internal sealed class LaunchRun
             return;
         }
 
-        string cwd = Directory.GetCurrentDirectory();
+        string cwd = _workspaceRoot;
         string gatePath = GateTrust.BuildGatePath();
         _gates = [.. gates.Select(g => g with { ResolvedExecutable = GateTrust.ResolveExecutableStrict(g.Command, cwd), GatePath = gatePath })];
     }
@@ -579,7 +622,7 @@ internal sealed class LaunchRun
 
     private async Task ResolveRepoTokenAsync()
     {
-        string? root = await RepoToken.RootAsync(Directory.GetCurrentDirectory()).ConfigureAwait(false);
+        string? root = await RepoToken.RootAsync(_workspaceRoot).ConfigureAwait(false);
         _allowed = RepoToken.Expand(_allowed, root);
         _denied = RepoToken.ExpandDenied(_denied, root);
     }
@@ -745,7 +788,7 @@ internal sealed class LaunchRun
         PriceBook prices = NonNull(_prices);
         RunSpec spec = new(RunDir, _provider, _model, _effort, _variant, _tools, _allowed, _denied, _budget, _wrapUp, _permissionMode,
             _mcpConfig, _runSystem, _o.ReplaceSystemPrompt, _mode, _cacheTtl, _o.KeepClaudeMd, _o.KeepMemory, _keepHooks,
-            !_o.NoUserEnv, _o.ClaudeSettings, providerInfo);
+            !_o.NoUserEnv, _o.ClaudeSettings, providerInfo, _workspaceRoot);
         Prepared prepared = runtime.Prepare(spec);
         // Locals declared before the try: needed by code after the try and the lambda inside.
         _meter = new Meter(prices, _provider, RunDir, _budget, _wrapUp ? _wrapUpAt : null, Meter.HandoffInstruction);
@@ -762,7 +805,7 @@ internal sealed class LaunchRun
         try
         {
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-            treeBefore = await WriteScope.TakeAsync(Directory.GetCurrentDirectory(), _runsRoot).ConfigureAwait(false);
+            treeBefore = await WriteScope.TakeAsync(_workspaceRoot, _runsRoot).ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes,
                 line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel)).ConfigureAwait(false);
         }
@@ -884,9 +927,8 @@ internal sealed class LaunchRun
         }
 
         GatePathNames = GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
-        string cwd = Directory.GetCurrentDirectory();
-        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
-        RefuseGatePathInsideWorkingTree(gitRoot ?? cwd, cwd);
+        string workspace = _workspaceRoot;
+        RefuseGatePathInsideWorkingTree(await RepoToken.RootAsync(workspace).ConfigureAwait(false) ?? workspace, workspace);
     }
 
     /// <summary>
@@ -1049,9 +1091,8 @@ internal sealed class LaunchRun
     private async Task<List<string>> CollectFixedPathsAsync()
     {
         List<GateSpec> gates = NonNull(_gates);
-        string cwd = Directory.GetCurrentDirectory();
-        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
-        string root = gitRoot ?? cwd;
+        string cwd = _workspaceRoot;
+        string root = await RepoToken.RootAsync(cwd).ConfigureAwait(false) ?? cwd;
         List<string> warnings = [];
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(GateTrust.PathComparer);
         List<string> paths = [];
@@ -1092,9 +1133,8 @@ internal sealed class LaunchRun
     /// </summary>
     private async Task<(List<string> Paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> Sources)> CollectCheckPathsAsync(IReadOnlySet<string> exclusions)
     {
-        string cwd = Directory.GetCurrentDirectory();
-        string? gitRoot = await RepoToken.RootAsync(cwd).ConfigureAwait(false);
-        string root = gitRoot ?? cwd;
+        string cwd = _workspaceRoot;
+        string root = await RepoToken.RootAsync(cwd).ConfigureAwait(false) ?? cwd;
         Dictionary<string, HashSet<GateTrust.TrustSource>> sources = new(GateTrust.PathComparer);
         foreach (KeyValuePair<string, HashSet<GateTrust.TrustSource>> entry in NonNull(FixedSources))
         {
@@ -1129,14 +1169,13 @@ internal sealed class LaunchRun
     /// the working directory when not in git) — the same anchor the trust entries resolve against.
     /// Absolute entries are used as-is, normalised by <see cref="ResolveOutputEntry"/>.
     /// </summary>
-    private static async Task<List<string>> DeclaredOutputPathsAsync(GateSpec spec, int index)
+    private static List<string> DeclaredOutputPaths(GateSpec spec, int index, string anchor)
     {
         if (spec.Outputs is not { Count: > 0 })
         {
             return [];
         }
 
-        string anchor = await OutputAnchorAsync().ConfigureAwait(false);
         string label = OutputLabel(spec, index);
         List<string> resolved = new(spec.Outputs.Count);
         foreach (string entry in spec.Outputs)
@@ -1154,9 +1193,9 @@ internal sealed class LaunchRun
     /// nothing (<see cref="_noExclusions"/>) — the worker and the other commands must not change a
     /// declared output either; only the command that declared it, after its pre-gate check, may.
     /// </summary>
-    private static async Task<IReadOnlySet<string>> DeclaredOutputExclusionsAsync(GateSpec spec, int index)
+    private static IReadOnlySet<string> DeclaredOutputExclusions(GateSpec spec, int index, string anchor)
     {
-        List<string> outputs = await DeclaredOutputPathsAsync(spec, index).ConfigureAwait(false);
+        List<string> outputs = DeclaredOutputPaths(spec, index, anchor);
         return outputs.Count is 0 ? _noExclusions : new HashSet<string>(outputs, GateTrust.PathComparer);
     }
 
@@ -1168,13 +1207,8 @@ internal sealed class LaunchRun
     private static string OutputLabel(GateSpec spec, int index) =>
         spec.Name is null ? "gate" : $"gate.commands[{index.ToString(CultureInfo.InvariantCulture)}]";
 
-    // gitRoot ?? cwd: the anchor CollectFixedPathsAsync resolved the fixed trust list against, so a
-    // declared output and a trust entry name the same file the same way.
-    private static async Task<string> OutputAnchorAsync()
-    {
-        string cwd = Directory.GetCurrentDirectory();
-        return await RepoToken.RootAsync(cwd).ConfigureAwait(false) ?? cwd;
-    }
+    // (The anchor the declared outputs resolve against is the workspace root, the same one the
+    // trust entries resolve against.)
 
     private static string ResolveOutputEntry(string entry, string anchor, string label)
     {
@@ -1259,7 +1293,7 @@ internal sealed class LaunchRun
             return;
         }
 
-        string anchor = await OutputAnchorAsync().ConfigureAwait(false);
+        string anchor = _workspaceRoot;
         string runsRoot = Path.GetFullPath(_runsRoot);
         // Both sides of the runs-root comparison are canonicalised: a declared output that reaches
         // the runs root through a symlink — or a bookkeeping subtree (runs/, inbox/, system/)
@@ -1441,7 +1475,7 @@ internal sealed class LaunchRun
         Gate.GateResult result;
         try
         {
-            result = await Gate.RunAsync(spec, RunDir, CancellationToken.None).ConfigureAwait(false);
+            result = await Gate.RunAsync(spec, RunDir, CancellationToken.None, _workspaceRoot).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1479,7 +1513,7 @@ internal sealed class LaunchRun
         try
         {
             string? violation = TrustSnapshot is not null
-                ? await TrustViolationMessageAsync(await DeclaredOutputExclusionsAsync(spec, index).ConfigureAwait(false), result.ReportPath,
+                ? await TrustViolationMessageAsync(DeclaredOutputExclusions(spec, index, _workspaceRoot), result.ReportPath,
                     "trusted files changed while the gate ran: ", spec, index).ConfigureAwait(false)
                 : null;
 
@@ -1545,7 +1579,7 @@ internal sealed class LaunchRun
 
         GateTrust.Snapshot baseline = NonNull(RoundBaseline);
         List<string> outputs =
-            [.. (await DeclaredOutputPathsAsync(spec, index).ConfigureAwait(false)).Where(p => baseline.Hashes.ContainsKey(p))];
+            [.. DeclaredOutputPaths(spec, index, _workspaceRoot).Where(p => baseline.Hashes.ContainsKey(p))];
         if (outputs.Count is 0)
         {
             return;
@@ -1588,7 +1622,7 @@ internal sealed class LaunchRun
         GateTrust.Snapshot before = NonNull(RoundBaseline);
         (List<string> paths, IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources) = await CollectCheckPathsAsync(exclusions).ConfigureAwait(false);
 
-        if (GateTrust.ReportPathViolation(reportPath, sources, await DeclaredOutputExclusionsAsync(spec, index).ConfigureAwait(false), RunDir) is { } reportViolation)
+        if (GateTrust.ReportPathViolation(reportPath, sources, DeclaredOutputExclusions(spec, index, _workspaceRoot), RunDir) is { } reportViolation)
         {
             return reportViolation;
         }

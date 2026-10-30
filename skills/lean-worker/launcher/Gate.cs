@@ -57,12 +57,12 @@ internal static class Gate
     /// </summary>
     internal static string FileName(GateSpec spec, string ext) => spec.Name is null ? $"gate.{ext}" : $"gate-{spec.Name}.{ext}";
 
-    public static async Task<GateResult> RunAsync(GateSpec spec, string runDir, CancellationToken token)
+    public static async Task<GateResult> RunAsync(GateSpec spec, string runDir, CancellationToken token, string? workingDirectory = null)
     {
         DateTimeOffset started = DateTimeOffset.Now;
         string logPath = Path.Combine(runDir, FileName(spec, "log"));
         string gateJsonPath = Path.Combine(runDir, FileName(spec, "json"));
-        string cwd = Directory.GetCurrentDirectory();
+        string cwd = workingDirectory ?? Directory.GetCurrentDirectory();
         StdoutBuffer stdout = new();
         List<string> envNames = [];
 
