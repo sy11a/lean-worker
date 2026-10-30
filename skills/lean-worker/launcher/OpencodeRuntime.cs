@@ -58,7 +58,7 @@ internal sealed class OpencodeRuntime : IRuntime
             a.AddRange(["--variant", s.Variant]);
         }
 
-        return new Prepared(opencode, a, env, "opencode " + string.Join(' ', a.Select(x => Runtimes.Quote(x))), ScratchDirectory: xdg);
+        return new Prepared(opencode, a, env, "opencode " + string.Join(' ', a.Select(x => Runtimes.Quote(x))), ScratchDirectory: xdg, WorkingDirectory: s.WorkspaceRoot);
     }
 
     // A clean config home: a unique temporary directory under the system temp path, outside the repository,

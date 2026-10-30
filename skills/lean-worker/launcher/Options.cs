@@ -59,6 +59,9 @@ internal sealed class Options
           stats [--since <yyyy-mm-dd>] [--json]
                                      runs per profile and model: success rate (worker status or gate clean), wrap-ups, escalations,
                                      cost per success, quota used; --json for other tools (schema_version as in runs.jsonl)
+          profiles [--runs-root <dir>] [--json]
+                                     the profiles <runs-root>/profiles.json maps: name, runtime, model (a chain as "a -> b"),
+                                     the default marked, so a delegator reads the local mapping instead of trusting memory
           prices                     the merged price book: sources and each entry's date
         """;
 

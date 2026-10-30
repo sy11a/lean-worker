@@ -235,7 +235,10 @@ internal static class Launcher
 
     internal static ProcessStartInfo StartInfo(Prepared prep)
     {
-        string cwd = Directory.GetCurrentDirectory();
+        // The worker's working directory is the workspace root resolved from the task (see
+        // Workspace.ResolveAsync); the launcher's own cwd is only a fallback for hand-built specs,
+        // so a wrong directory the launcher was typed into cannot become the worker's project.
+        string cwd = prep.WorkingDirectory ?? Directory.GetCurrentDirectory();
         ProcessStartInfo psi = new()
         {
             RedirectStandardInput = true,

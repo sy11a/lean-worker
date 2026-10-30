@@ -1,5 +1,5 @@
 // Subcommands besides launching a worker: the worker's pre-tool hook, subscription quota, pricing a manual
-// session, run statistics and the merged price book.
+// session, run statistics, the profiles mapping and the merged price book.
 
 using System.Diagnostics;
 using System.Globalization;
@@ -321,6 +321,93 @@ internal static partial class Commands
 
         Console.Out.WriteLine("cost = list price (list-price equivalent for subscriptions); esc = runs that offered the next model; quota%/run = largest window increase per run.");
         return 0;
+    }
+
+    /// <summary>
+    /// Lists the profiles the runs root's profiles.json maps, so a delegator reads the local mapping instead of
+    /// trusting memory: name, runtime, model (a chain as "a -> b") and the default marked.
+    /// </summary>
+    public static int Profiles(string[] args)
+    {
+        Dictionary<string, string?> f = Flags(args, "--json");
+        string path = Path.Combine(f.GetValueOrDefault("--runs-root") ?? ".lean-worker", "profiles.json");
+        if (!File.Exists(path))
+        {
+            throw new LaunchException($"no profiles at {path}");
+        }
+
+        JsonObject doc;
+        try { doc = Json.ParseLenient(File.ReadAllText(path)).AsObject(); }
+        catch (Exception ex) { throw new LaunchException($"profiles.json is not valid JSON: {ex.Message}"); }
+        string? def = Json.Str(doc, "defaultProfile");
+        if (doc["profiles"] is not JsonObject profiles)
+        {
+            throw new LaunchException($"no \"profiles\" object in {path}");
+        }
+
+        // The default first, the rest by name: the same order in both modes.
+        List<(string Name, JsonObject? Profile)> rows =
+        [
+            .. profiles.Where(kv => kv.Key == def)
+                .Concat(profiles.Where(kv => kv.Key != def).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                .Select(kv => (kv.Key, kv.Value as JsonObject)),
+        ];
+
+        if (f.ContainsKey("--json"))
+        {
+            return ProfilesJson(rows, def);
+        }
+
+        ProfilesTable(rows, def);
+        if (def is not null && !profiles.ContainsKey(def))
+        {
+            Console.Out.WriteLine($"defaultProfile '{def}' not found in {path}");
+        }
+
+        return 0;
+    }
+
+    private static int ProfilesJson(List<(string Name, JsonObject? Profile)> rows, string? def)
+    {
+        JsonObject outDoc = new() { ["default"] = def };
+        JsonArray list = [];
+        foreach ((string name, JsonObject? profile) in rows)
+        {
+            list.Add(new JsonObject
+            {
+                ["name"] = name,
+                ["runtime"] = profile?["runtime"]?.DeepClone(),
+                ["model"] = profile?["model"]?.DeepClone(),
+            });
+        }
+
+        outDoc["profiles"] = list;
+        Console.Out.WriteLine(outDoc.ToJsonString(Json.Indented));
+        return 0;
+    }
+
+    private static void ProfilesTable(List<(string Name, JsonObject? Profile)> rows, string? def)
+    {
+        // Column widths follow the widest label and runtime, so a long default name does not shift the columns.
+        int w = rows.Count > 0 ? rows.Max(r => r.Name.Length + (r.Name == def ? 10 : 0)) : 18;
+        int rw = rows.Count > 0 ? rows.Max(r => (Json.Str(r.Profile, "runtime") ?? "-").Length) : 10;
+        foreach ((string name, JsonObject? profile) in rows)
+        {
+            string label = name == def ? $"{name} (default)" : name;
+            string runtime = Json.Str(profile, "runtime") ?? "-";
+            Console.Out.WriteLine($"{label.PadRight(w)} {runtime.PadRight(rw)} {ModelText(profile)}");
+        }
+    }
+
+    private static string ModelText(JsonObject? p)
+    {
+        if (p?["model"] is JsonArray arr)
+        {
+            return string.Join(" -> ", arr.Select(x => x is JsonValue v && v.TryGetValue(out string? s) ? s : x?.ToJsonString()));
+        }
+
+        // A model that is not a string is a schema surprise worth showing verbatim, not a dash.
+        return p?["model"] switch { null => "-", JsonValue v when v.TryGetValue(out string? s) => s, var n => n.ToJsonString() };
     }
 
     public static int Prices(string[] args)

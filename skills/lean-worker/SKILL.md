@@ -143,10 +143,22 @@ In both, the first launch may ask for permission; the installer pre-approves `do
 (`.claude/settings.json`, `opencode.json`).
 
 ```
-dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/<task-name>/task.md" --profile code
+dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/inbox/<task-name>/task.md" --profile code-minimax
+
+> Profile names are LOCAL RUNTIME CONFIG, not a fixed convention: the set and the
+> model behind each name come from this repo's `.lean-worker/profiles.json` and can be
+> reconfigured (e.g. 2026-10-14: `code` became Claude/tests-only). Never recall profile
+> names from memory or docs — run `dotnet run --project <skill-dir>/launcher -c Release
+> -- --profiles` to list what the local config actually maps before delegating.
 ```
 
 Run it from the project root, because `.lean-worker/` is resolved relative to the current directory.
+The worker's own workspace no longer depends on that: the launcher anchors the worker's working
+directory (and the write scope, `<repo>` token and gate paths) on the **task file's git root**, so a
+wrong shell cwd cannot point the worker at another repo — and a relative `--task` that misses under
+the cwd is retried against that cwd's git root, so it resolves from any subdirectory of the
+checkout. Never `cd` to a hand-typed path before delegating: if the shell's cwd does not exist the
+whole command is refused before it starts.
 
 ## 4. Read the result
 
