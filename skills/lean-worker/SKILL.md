@@ -153,6 +153,12 @@ dotnet run --project "<skill-dir>/launcher" -c Release -- --task ".lean-worker/i
 ```
 
 Run it from the project root, because `.lean-worker/` is resolved relative to the current directory.
+The worker's own workspace no longer depends on that: the launcher anchors the worker's working
+directory (and the write scope, `<repo>` token and gate paths) on the **task file's git root**, so a
+wrong shell cwd cannot point the worker at another repo — and a relative `--task` that misses under
+the cwd is retried against that cwd's git root, so it resolves from any subdirectory of the
+checkout. Never `cd` to a hand-typed path before delegating: if the shell's cwd does not exist the
+whole command is refused before it starts.
 
 ## 4. Read the result
 
