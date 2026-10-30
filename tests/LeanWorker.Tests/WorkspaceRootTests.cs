@@ -171,6 +171,68 @@ public class WorkspaceRootTests
         }
     }
 
+    /// <summary>
+    /// The default relative runs root (".lean-worker") also resolves against the workspace root
+    /// when the launcher's cwd is a subdirectory: the profile under the repo's .lean-worker must
+    /// load and the run must be recorded there, not under the subdirectory.
+    /// </summary>
+    [Fact]
+    public async Task Relative_runs_root_resolves_against_the_workspace_root_from_a_subdirectoryAsync()
+    {
+        string repo = Directory.CreateTempSubdirectory("lw-ws-runsroot").FullName;
+        string stubDir = Directory.CreateTempSubdirectory("lw-ws-stub2").FullName;
+        try
+        {
+            RunGit(repo, "init", "-q");
+            string runsRoot = Path.Combine(repo, ".lean-worker");
+            string taskDir = Directory.CreateDirectory(Path.Combine(runsRoot, "inbox", "wk")).FullName;
+            await File.WriteAllTextAsync(Path.Combine(taskDir, "task.md"), "do nothing", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(runsRoot, "profiles.json"),
+                """{"defaultProfile":"p1","profiles":{"p1":{"runtime":"claude"}}}""", TestContext.Current.CancellationToken);
+
+            string stubPath = Path.Combine(stubDir, "claude");
+            await File.WriteAllTextAsync(stubPath, "#!/bin/sh\ncat >/dev/null\nexit 0\n", TestContext.Current.CancellationToken);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(stubPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            string? oldPath = Environment.GetEnvironmentVariable("PATH");
+            string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+            string oldCwd = Directory.GetCurrentDirectory();
+            int code;
+            await using StringWriter outWriter = new();
+            TextWriter oldOut = Console.Out;
+            try
+            {
+                Environment.SetEnvironmentVariable("PATH", stubDir + Path.PathSeparator + oldPath);
+                Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "dummy-test-key");
+                Directory.SetCurrentDirectory(Directory.CreateDirectory(Path.Combine(repo, "labs", "deep")).FullName);
+                Console.SetOut(outWriter);
+                Options o = new() { TaskFile = ".lean-worker/inbox/wk/task.md", Model = "anthropic/claude-haiku-4-5", Mode = "bare", Name = "runs-root-anchor", Profile = "p1" };
+                code = await Launcher.RunAsync(o);
+            }
+            finally
+            {
+                Console.SetOut(oldOut);
+                Directory.SetCurrentDirectory(oldCwd);
+                Environment.SetEnvironmentVariable("PATH", oldPath);
+                Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", oldKey);
+            }
+
+            Assert.NotEqual(2, code);
+            string stdout = outWriter.ToString();
+            Assert.DoesNotContain("profiles.json does not exist", stdout, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(repo, "labs", "deep", ".lean-worker")), "a runs root leaked into the subdirectory");
+            Assert.True(Directory.Exists(Path.Combine(runsRoot, "runs")), "the run was not recorded under the workspace runs root");
+        }
+        finally
+        {
+            Directory.Delete(repo, recursive: true);
+            Directory.Delete(stubDir, recursive: true);
+        }
+    }
+
     private static string Quote(string s) => "'" + s.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
 
     private static string Resolve(string path) =>

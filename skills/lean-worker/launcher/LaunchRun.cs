@@ -260,6 +260,13 @@ internal sealed class LaunchRun
     private async Task LoadProfileAsync()
     {
         _runsRoot = _o.RunsRoot ?? ".lean-worker";
+        // The runs root is cwd-relative by default; when it does not exist under the launcher's
+        // cwd but does under the resolved workspace root (the task lives in this checkout, the
+        // shell does not), resolve it there — same rule as the task path itself.
+        if (!Path.IsPathRooted(_runsRoot) && !Directory.Exists(_runsRoot) && Directory.Exists(Path.Combine(_workspaceRoot, _runsRoot)))
+        {
+            _runsRoot = Path.Combine(_workspaceRoot, _runsRoot);
+        }
         JsonObject? prevSummary = null;
         if (_o.ContinueFrom is not null)
         {
