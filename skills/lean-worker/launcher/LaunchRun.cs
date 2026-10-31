@@ -23,7 +23,7 @@ internal sealed class LaunchRun
 
     // ResolveSettings (price book + runtime + chain)
     private PriceBook? _prices;
-    private List<string> _notes = [];
+    private readonly List<string> _notes = [];
     private string? _explicitRuntime;
     private string _runtimeName = string.Empty;
     private List<string> _chain = [];
@@ -221,10 +221,13 @@ internal sealed class LaunchRun
         return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
     }
 
-    // Resolved before everything else: LoadProfileAsync reads a relative --continue-from, and
-    // ResolveGate (inside ResolveSettings) anchors gate specs on the workspace. A relative task or
-    // continue-from path that misses under the launcher's cwd is retried against that cwd's git
-    // root first, so the anchor itself is as right as the checkout can make it.
+    // Resolved before everything else: LoadProfileAsync reads a relative --continue-from and
+    // anchors the runs root on the workspace, and ResolveGate (inside ResolveSettings) anchors
+    // gate specs on it. A relative task or continue-from path that misses under the launcher's
+    // cwd is retried against that cwd's git root first, so the anchor itself is as right as the
+    // checkout can make it. The note is the first one the run prints: it says where the worker
+    // ran and which directory was ignored, and everything after it (profiles, prices, gates) is
+    // read from that workspace.
     private async Task ResolveWorkspaceAsync()
     {
         if (_o.TaskFile is null && _o.ContinueFrom is null)
@@ -259,14 +262,7 @@ internal sealed class LaunchRun
 
     private async Task LoadProfileAsync()
     {
-        _runsRoot = _o.RunsRoot ?? ".lean-worker";
-        // The runs root is cwd-relative by default; when it does not exist under the launcher's
-        // cwd but does under the resolved workspace root (the task lives in this checkout, the
-        // shell does not), resolve it there — same rule as the task path itself.
-        if (!Path.IsPathRooted(_runsRoot) && !Directory.Exists(_runsRoot) && Directory.Exists(Path.Combine(_workspaceRoot, _runsRoot)))
-        {
-            _runsRoot = Path.Combine(_workspaceRoot, _runsRoot);
-        }
+        _runsRoot = ResolveRunsRoot(_o.RunsRoot ?? ".lean-worker");
         JsonObject? prevSummary = null;
         if (_o.ContinueFrom is not null)
         {
@@ -301,6 +297,33 @@ internal sealed class LaunchRun
         _profile = profile;
     }
 
+    /// <summary>
+    /// The runs root: the operator's value, or the default ".lean-worker". An absolute root is
+    /// used as given. A relative root is anchored on the workspace (the task's own git root),
+    /// and the workspace comes first: when the task's repo and the launcher's cwd disagree, the
+    /// profiles, the prices, the gate specs and the run record come from the task's repo — never
+    /// from the shell the launcher was typed into, whose own ".lean-worker" is not read when the
+    /// task's repo carries one. A relative root that misses under the workspace root falls back
+    /// exactly as before (the cwd's own, relative), and a task outside any tree keeps the cwd
+    /// bit-for-bit: the workspace is then the cwd and nothing is re-anchored.
+    /// </summary>
+    private string ResolveRunsRoot(string runsRoot)
+    {
+        if (Path.IsPathRooted(runsRoot))
+        {
+            return runsRoot;
+        }
+
+        string cwd = Directory.GetCurrentDirectory();
+        if (_workspaceRoot.Length is 0 || _workspaceRoot.Equals(cwd, StringComparison.Ordinal))
+        {
+            return runsRoot;
+        }
+
+        string candidate = Path.Combine(_workspaceRoot, runsRoot);
+        return Directory.Exists(candidate) ? candidate : runsRoot;
+    }
+
     private void ResolveSettings()
     {
         ResolvePriceBookAndChain();
@@ -316,7 +339,9 @@ internal sealed class LaunchRun
     {
         _pricesFile = _o.PricesFile ?? Json.Str(_profile, "prices");
         _prices = PriceBook.Load(_runsRoot, _pricesFile);
-        _notes = [.. _prices.Warnings];
+        // The notes list is append-only: the price book's warnings join the notes collected so
+        // far (the workspace note is the first of them) instead of replacing them.
+        _notes.AddRange(_prices.Warnings);
         // An explicit runtime holds for every model in the chain; otherwise each model gets the runtime its provider allows.
         _explicitRuntime = _o.Runtime ?? Json.Str(_profile, "runtime");
         if (_explicitRuntime is not null)

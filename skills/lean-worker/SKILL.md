@@ -160,6 +160,11 @@ the cwd is retried against that cwd's git root, so it resolves from any subdirec
 checkout. Never `cd` to a hand-typed path before delegating: if the shell's cwd does not exist the
 whole command is refused before it starts.
 
+A task file that sits inside its own git repo (a submodule, a nested checkout) anchors on that
+inner repo, not on the outer one. When the shell's cwd and the task's repo disagree, the profiles,
+the prices and the gate specs load from the task's repo — the workspace comes first — the gate
+runs in it, and the run is recorded under that repo's `.lean-worker`, not under the cwd's.
+
 ## 4. Read the result
 
 The script prints one block:

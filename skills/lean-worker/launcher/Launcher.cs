@@ -265,7 +265,8 @@ internal static class Launcher
                 psi.Environment[k] = v;
             }
         }
-        // opencode reads its project dir from the inherited PWD env var, so pin it to the launcher's cwd
+        // opencode reads its project dir from the inherited PWD env var, so pin it to the worker's
+        // working directory (the workspace root the task's location resolves to)
         psi.Environment["PWD"] = cwd;
         _ = psi.Environment.Remove("OLDPWD");
         return psi;
