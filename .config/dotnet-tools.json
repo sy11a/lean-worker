@@ -3,21 +3,21 @@
   "isRoot": true,
   "tools": {
     "sy11a.lint": {
-      "version": "0.33.0",
+      "version": "0.34.1",
       "commands": [
         "sy11a-lint"
       ],
       "rollForward": false
     },
     "sy11a.arch": {
-      "version": "0.33.0",
+      "version": "0.34.1",
       "commands": [
         "sy11a-arch"
       ],
       "rollForward": false
     },
     "sy11a.test": {
-      "version": "0.33.0",
+      "version": "0.34.1",
       "commands": [
         "sy11a-test"
       ],
