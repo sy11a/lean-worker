@@ -60,7 +60,7 @@ internal sealed class ClaudeRuntime : IRuntime
         // Partial messages carry each API call's final output tokens (message_delta); the assistant events only
         // repeat the count from the start of the message, which undercounts output.
         a.AddRange(["--no-session-persistence", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
-        return new Prepared(claude, a, env, "claude " + string.Join(' ', a.Select(arg => Runtimes.Quote(arg))), ScratchDirectory: null);
+        return new Prepared(claude, a, env, "claude " + string.Join(' ', a.Select(arg => Runtimes.Quote(arg))), ScratchDirectory: null, WorkingDirectory: s.WorkspaceRoot);
     }
 
     private static Dictionary<string, string?> BaseEnv(RunSpec s)

@@ -1,5 +1,5 @@
 // Subcommands besides launching a worker: the worker's pre-tool hook, subscription quota, pricing a manual
-// session, run statistics and the merged price book.
+// session, run statistics, the profiles mapping and the merged price book.
 
 using System.Diagnostics;
 using System.Globalization;
@@ -34,6 +34,31 @@ internal static partial class Commands
         }
         return d;
     }
+
+    /// <summary>
+    /// The runs root the read-only commands read: --runs-root, or ".lean-worker" beside the caller.
+    /// </summary>
+    private static string RunsRoot(Dictionary<string, string?> f) => f.GetValueOrDefault("--runs-root") ?? ".lean-worker";
+
+    /// <summary>
+    /// A file in the runs root that the command needs: its path, or the command's own complaint when it is
+    /// missing. Each command names its file and writes its complaint, so neither drifts from the other.
+    /// </summary>
+    private static string RequiredFile(Dictionary<string, string?> f, string name, Func<string, string> missing)
+    {
+        string path = Path.Combine(RunsRoot(f), name);
+        if (!File.Exists(path))
+        {
+            throw new LaunchException(missing(path));
+        }
+        return path;
+    }
+
+    /// <summary>
+    /// The price book the pricing commands read: the shipped file, the user's and the one in the runs root
+    /// (or --prices), merged in that order.
+    /// </summary>
+    private static PriceBook LoadPrices(Dictionary<string, string?> f) => PriceBook.Load(RunsRoot(f), f.GetValueOrDefault("--prices"));
 
     /// <summary>
     /// PreToolUse hook: once the launcher has written wrapup.json, deny every tool call with its reason.
@@ -75,7 +100,7 @@ internal static partial class Commands
     public static int Quota(string[] args)
     {
         Dictionary<string, string?> f = Flags(args, "--json");
-        PriceBook prices = PriceBook.Load(f.GetValueOrDefault("--runs-root") ?? ".lean-worker", f.GetValueOrDefault("--prices"));
+        PriceBook prices = LoadPrices(f);
         TimeSpan? maxAge = f.TryGetValue("--max-age", out string? s) && s is not null ? TimeSpan.FromSeconds(int.Parse(s, _ic)) : null;
         List<string> names = f.TryGetValue("--provider", out string? p) && p is not null ? [p] : prices.QuotaProviders();
         if (names.Count is 0)
@@ -122,7 +147,7 @@ internal static partial class Commands
     public static int Cost(string[] args)
     {
         Dictionary<string, string?> f = Flags(args);
-        PriceBook prices = PriceBook.Load(f.GetValueOrDefault("--runs-root") ?? ".lean-worker", f.GetValueOrDefault("--prices"));
+        PriceBook prices = LoadPrices(f);
         List<(string Provider, Usage Usage)> calls;
         string label;
         if (f.GetValueOrDefault("--claude") is { } claude)
@@ -274,11 +299,7 @@ internal static partial class Commands
     public static int Stats(string[] args)
     {
         Dictionary<string, string?> f = Flags(args, "--json");
-        string path = Path.Combine(f.GetValueOrDefault("--runs-root") ?? ".lean-worker", "runs.jsonl");
-        if (!File.Exists(path))
-        {
-            throw new LaunchException($"no runs recorded yet ({path})");
-        }
+        string path = RequiredFile(f, "runs.jsonl", p => $"no runs recorded yet ({p})");
 
         DateTimeOffset since = f.GetValueOrDefault("--since") is { } s ? DateTimeOffset.Parse(s, _ic) : DateTimeOffset.MinValue;
         List<JsonObject> runs = [.. File.ReadLines(path).Select(line => Json.TryParseObject(line)).OfType<JsonObject>().Where(r => Json.Str(r, "timestamp") is { } t && DateTimeOffset.Parse(t, _ic) >= since)];
@@ -323,10 +344,93 @@ internal static partial class Commands
         return 0;
     }
 
+    /// <summary>
+    /// Lists the profiles the runs root's profiles.json maps, so a delegator reads the local mapping instead of
+    /// trusting memory: name, runtime, model (a chain as "a -> b") and the default marked.
+    /// </summary>
+    public static int Profiles(string[] args)
+    {
+        Dictionary<string, string?> f = Flags(args, "--json");
+        string path = RequiredFile(f, "profiles.json", p => $"no profiles at {p}");
+
+        JsonObject doc;
+        try { doc = Json.ParseLenient(File.ReadAllText(path)).AsObject(); }
+        catch (Exception ex) { throw new LaunchException($"profiles.json is not valid JSON: {ex.Message}"); }
+        string? def = Json.Str(doc, "defaultProfile");
+        if (doc["profiles"] is not JsonObject profiles)
+        {
+            throw new LaunchException($"no \"profiles\" object in {path}");
+        }
+
+        // The default first, the rest by name: the same order in both modes.
+        List<(string Name, JsonObject? Profile)> rows =
+        [
+            .. profiles.Where(kv => kv.Key == def)
+                .Concat(profiles.Where(kv => kv.Key != def).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                .Select(kv => (kv.Key, kv.Value as JsonObject)),
+        ];
+
+        if (f.ContainsKey("--json"))
+        {
+            return ProfilesJson(rows, def);
+        }
+
+        ProfilesTable(rows, def);
+        if (def is not null && !profiles.ContainsKey(def))
+        {
+            Console.Out.WriteLine($"defaultProfile '{def}' not found in {path}");
+        }
+
+        return 0;
+    }
+
+    private static int ProfilesJson(List<(string Name, JsonObject? Profile)> rows, string? def)
+    {
+        JsonObject outDoc = new() { ["default"] = def };
+        JsonArray list = [];
+        foreach ((string name, JsonObject? profile) in rows)
+        {
+            list.Add(new JsonObject
+            {
+                ["name"] = name,
+                ["runtime"] = profile?["runtime"]?.DeepClone(),
+                ["model"] = profile?["model"]?.DeepClone(),
+            });
+        }
+
+        outDoc["profiles"] = list;
+        Console.Out.WriteLine(outDoc.ToJsonString(Json.Indented));
+        return 0;
+    }
+
+    private static void ProfilesTable(List<(string Name, JsonObject? Profile)> rows, string? def)
+    {
+        // Column widths follow the widest label and runtime, so a long default name does not shift the columns.
+        int w = rows.Count > 0 ? rows.Max(r => r.Name.Length + (r.Name == def ? 10 : 0)) : 18;
+        int rw = rows.Count > 0 ? rows.Max(r => (Json.Str(r.Profile, "runtime") ?? "-").Length) : 10;
+        foreach ((string name, JsonObject? profile) in rows)
+        {
+            string label = name == def ? $"{name} (default)" : name;
+            string runtime = Json.Str(profile, "runtime") ?? "-";
+            Console.Out.WriteLine($"{label.PadRight(w)} {runtime.PadRight(rw)} {ModelText(profile)}");
+        }
+    }
+
+    private static string ModelText(JsonObject? p)
+    {
+        if (p?["model"] is JsonArray arr)
+        {
+            return string.Join(" -> ", arr.Select(x => x is JsonValue v && v.TryGetValue(out string? s) ? s : x?.ToJsonString()));
+        }
+
+        // A model that is not a string is a schema surprise worth showing verbatim, not a dash.
+        return p?["model"] switch { null => "-", JsonValue v when v.TryGetValue(out string? s) => s, var n => n.ToJsonString() };
+    }
+
     public static int Prices(string[] args)
     {
         Dictionary<string, string?> f = Flags(args);
-        PriceBook prices = PriceBook.Load(f.GetValueOrDefault("--runs-root") ?? ".lean-worker", f.GetValueOrDefault("--prices"));
+        PriceBook prices = LoadPrices(f);
         Console.Out.WriteLine("sources (later ones override earlier):");
         foreach (string src in prices.Sources)
         {

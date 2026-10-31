@@ -235,7 +235,10 @@ internal static class Launcher
 
     internal static ProcessStartInfo StartInfo(Prepared prep)
     {
-        string cwd = Directory.GetCurrentDirectory();
+        // The worker's working directory is the workspace root resolved from the task (see
+        // Workspace.ResolveAsync); the launcher's own cwd is only a fallback for hand-built specs,
+        // so a wrong directory the launcher was typed into cannot become the worker's project.
+        string cwd = prep.WorkingDirectory ?? Directory.GetCurrentDirectory();
         ProcessStartInfo psi = new()
         {
             RedirectStandardInput = true,
@@ -262,7 +265,8 @@ internal static class Launcher
                 psi.Environment[k] = v;
             }
         }
-        // opencode reads its project dir from the inherited PWD env var, so pin it to the launcher's cwd
+        // opencode reads its project dir from the inherited PWD env var, so pin it to the worker's
+        // working directory (the workspace root the task's location resolves to)
         psi.Environment["PWD"] = cwd;
         _ = psi.Environment.Remove("OLDPWD");
         return psi;
