@@ -63,6 +63,14 @@ internal sealed class Options
                                      the profiles <runs-root>/profiles.json maps: name, runtime, model (a chain as "a -> b"),
                                      the default marked, so a delegator reads the local mapping instead of trusting memory
           prices                     the merged price book: sources and each entry's date
+          sweep-worktrees [--repo <path>]... [--root <dir>] [--older-than-days <n>] [--apply] [--protect <glob>]...
+                                     sweep the linked worktrees of the repositories (--repo, or every repository
+                                     under --root; default the parent of this repository): one line per worktree,
+                                     REMOVE|KEEP <reason> <path> (merged, landed, dirty, unmerged, locked, protected,
+                                     nested, in-use, young, missing); a clean worktree whose branch landed in
+                                     origin/<default branch>, that no process works in and that is older than
+                                     --older-than-days (default 3) goes; --apply removes it (a dry run otherwise);
+                                     locked or protected worktrees (*-pinned, --protect) stay
         """;
 
     public string? TaskFile;
@@ -101,14 +109,7 @@ internal sealed class Options
     public static Options Parse(string[] args)
     {
         Options o = new();
-        for (int i = 0; i < args.Length; i++)
-        {
-            string Next() => i + 1 < args.Length ? args[++i] : throw new LaunchException($"{args[i]} needs a value");
-            if (!o.TrySetText(args[i], () => Next()) && !o.TrySetParsed(args[i], () => Next()) && !o.TrySetFlag(args[i]))
-            {
-                throw new LaunchException($"unknown option '{args[i]}' (see --help)");
-            }
-        }
+        ArgReader.Read(args, (arg, next) => o.TrySetText(arg, next) || o.TrySetParsed(arg, next) || o.TrySetFlag(arg));
 
         return o;
     }
