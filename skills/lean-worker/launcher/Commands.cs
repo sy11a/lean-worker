@@ -1,5 +1,5 @@
 // Subcommands besides launching a worker: the worker's pre-tool hook, subscription quota, pricing a manual
-// session, run statistics, the profiles mapping and the merged price book.
+// session, run statistics, the profiles mapping, the merged price book and the worktree sweep.
 
 using System.Diagnostics;
 using System.Globalization;

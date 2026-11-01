@@ -518,7 +518,9 @@ A setting comes from the command-line option if one is given, otherwise from the
 otherwise from the built-in default. The worker always runs with `--strict-mcp-config`, so it
 gets no MCP server unless the profile or `--mcp-config` names one.
 
-Other commands (same `dotnet run ... --` prefix): `quota`, `cost`, `stats`, `prices` (see above), and
+Other commands (same `dotnet run ... --` prefix): `quota`, `cost`, `stats`, `prices` (see above),
+`sweep-worktrees` (sweeps the linked worktrees of the repositories: one line per worktree,
+`REMOVE|KEEP <reason> <path>`; a dry run without `--apply`), and
 `hook`, which the launcher installs into workers itself.
 
 Exit codes:

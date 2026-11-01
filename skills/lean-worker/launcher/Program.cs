@@ -29,6 +29,7 @@ internal static class Program
                 "stats" => Commands.Stats(args[1..]),
                 "profiles" => Commands.Profiles(args[1..]),
                 "prices" => Commands.Prices(args[1..]),
+                "sweep-worktrees" => await WorktreeSweep.RunAsync(args[1..]).ConfigureAwait(false),
                 _ => await Launcher.RunAsync(Options.Parse(args)).ConfigureAwait(false),
             };
         }
