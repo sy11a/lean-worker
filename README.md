@@ -563,7 +563,7 @@ Exit codes:
 - `settings.json` (claude runtime, lean mode) or `opencode-config.json` (opencode runtime)
 - `wrapup.json` when the wrap-up fired, and `hook.log`, one line per hook check
 - `summary.json`
-- `report.md`
+- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results and the files the run changed). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
 
 `.lean-worker/runs.jsonl` gets one JSON line per run, recording:
 
@@ -575,7 +575,8 @@ Exit codes:
 - first-call and peak context, the first call's cache-read tokens, and the cache-read share of the first call (3 decimals);
 - quota before and after the run, and the percentage it used, on a subscription with a quota adapter;
 - the next model the run offered (`escalate_to`), if any;
-- the write scope, the files the run changed in the git working tree, and those outside the scope.
+- the write scope, the files the run changed in the git working tree, and those outside the scope;
+- the evidence lines (`evidence_lines`): the same facts the report's evidence block carries, one string per line.
 
 Each row carries `schema_version` (currently 1). Fields may be added within a version. The version goes up
 when a field changes meaning or is removed. Rows written before the field existed count as version 0: the same

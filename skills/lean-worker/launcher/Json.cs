@@ -76,6 +76,13 @@ internal static class Json
             return l;
         }
 
+        // A value built in memory keeps its own type: an int-backed one does not answer a long
+        // request (a value parsed from text answers either).
+        if (v.TryGetValue(out int i))
+        {
+            return i;
+        }
+
         return v.TryGetValue(out double d) ? (long)d : 0;
     }
 

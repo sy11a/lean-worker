@@ -184,6 +184,7 @@ internal sealed class LaunchRun
     private string? _next;
     private JsonObject _summary = [];
     private string _report = string.Empty;
+    private List<string> _evidence = [];
 
     public LaunchRun(Options o, GateContext? gateContext = null)
     {
@@ -702,20 +703,8 @@ internal sealed class LaunchRun
         else if (_o.ContinueFrom is not null)
         {
             // Fresh worker, not a resumed session: the original task plus the previous worker's report.
-            string prevTask = await File.ReadAllTextAsync(Path.Combine(_o.ContinueFrom, "task.md"), Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-            int cut = prevTask.IndexOf(Launcher.ContinuationHeading, StringComparison.Ordinal);
-            if (cut >= 0)
-            {
-                prevTask = prevTask[..cut];
-            }
-
-            cut = prevTask.IndexOf(Launcher.GateHeading, StringComparison.Ordinal);
-            if (cut >= 0)
-            {
-                prevTask = prevTask[..cut];
-            }
-
-            string prevReport = File.Exists(Path.Combine(_o.ContinueFrom, "report.md")) ? (await File.ReadAllTextAsync(Path.Combine(_o.ContinueFrom, "report.md"), Json.Utf8, CancellationToken.None).ConfigureAwait(false)).Trim() : string.Empty;
+            string prevTask = CutSections(await ReadTextAsync(Path.Combine(_o.ContinueFrom, "task.md")).ConfigureAwait(false));
+            string prevReport = await ReadPreviousReportAsync().ConfigureAwait(false);
             string nl = Environment.NewLine;
             taskText = prevTask.TrimEnd() + nl + nl + Launcher.ContinuationHeading + nl + nl +
                        $"A previous worker on this task stopped before finishing (status: {Json.Str(_prevSummary, "status")}). Its report is below. " +
@@ -726,7 +715,7 @@ internal sealed class LaunchRun
         else
         {
             string taskPath = Path.GetFullPath(_o.TaskFile!);
-            taskText = await File.ReadAllTextAsync(taskPath, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            taskText = await ReadTextAsync(taskPath).ConfigureAwait(false);
             name = _o.Name ?? new DirectoryInfo(Path.GetDirectoryName(taskPath)!).Name;
         }
         _taskText = taskText;
@@ -749,23 +738,53 @@ internal sealed class LaunchRun
         await File.WriteAllTextAsync(Path.Combine(RunDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// A file's text, read as UTF-8 (the encoding every file the launcher writes uses).
+    /// </summary>
+    private static async Task<string> ReadTextAsync(string path) =>
+        await File.ReadAllTextAsync(path, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+
+    /// <summary>
+    /// A task text without its continuation and gate sections: the part that is the original task
+    /// (a fresh worker gets it, and a gate round builds on it).
+    /// </summary>
+    private static string CutSections(string text)
+    {
+        int cut = text.IndexOf(Launcher.ContinuationHeading, StringComparison.Ordinal);
+        if (cut >= 0)
+        {
+            text = text[..cut];
+        }
+
+        cut = text.IndexOf(Launcher.GateHeading, StringComparison.Ordinal);
+        if (cut >= 0)
+        {
+            text = text[..cut];
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// The previous run's report for the handoff: the worker's own text, without the launcher's
+    /// evidence block about that run (the block stays in the run dir).
+    /// </summary>
+    private async Task<string> ReadPreviousReportAsync()
+    {
+        string path = Path.Combine(_o.ContinueFrom!, "report.md");
+        if (!File.Exists(path))
+        {
+            return string.Empty;
+        }
+
+        string file = await ReadTextAsync(path).ConfigureAwait(false);
+        return EvidenceBlock.WorkerText(file).Trim();
+    }
+
     private static string BuildGateTaskText(GateContext context)
     {
         string nl = Environment.NewLine;
-        string baseText = context.OriginalTask ?? string.Empty;
-        int cut = baseText.IndexOf(Launcher.ContinuationHeading, StringComparison.Ordinal);
-        if (cut >= 0)
-        {
-            baseText = baseText[..cut];
-        }
-
-        cut = baseText.IndexOf(Launcher.GateHeading, StringComparison.Ordinal);
-        if (cut >= 0)
-        {
-            baseText = baseText[..cut];
-        }
-
-        baseText = baseText.TrimEnd();
+        string baseText = CutSections(context.OriginalTask ?? string.Empty).TrimEnd();
         // The commands form's aggregate Feedback is already the whole text under the heading (the
         // instruction line with the per-command counts, then one section per command with findings);
         // the single-command form builds its text here, exactly as before.
@@ -793,12 +812,12 @@ internal sealed class LaunchRun
         string projectNotes = Path.Combine(_runsRoot, "project.md");
         if (!_o.NoProjectNotes && File.Exists(projectNotes))
         {
-            parts.Add(await File.ReadAllTextAsync(projectNotes, Json.Utf8, CancellationToken.None).ConfigureAwait(false));
+            parts.Add(await ReadTextAsync(projectNotes).ConfigureAwait(false));
         }
 
         if (_o.SystemFile is not null)
         {
-            parts.Add(await File.ReadAllTextAsync(_o.SystemFile, Json.Utf8, CancellationToken.None).ConfigureAwait(false));
+            parts.Add(await ReadTextAsync(_o.SystemFile).ConfigureAwait(false));
         }
 
         string? runSystem = null;
@@ -1841,8 +1860,13 @@ internal sealed class LaunchRun
 
     private async Task WriteSummaryAsync()
     {
+        // The evidence block (issue #107): the launcher's own lines, built from the summary this
+        // method writes, so the report carries the run's facts and not only the worker's prose.
+        List<string> evidence = EvidenceBlock.Build(_summary);
+        _evidence = evidence;
+        _summary["evidence_lines"] = new JsonArray([.. evidence.Select(line => (JsonNode)line)]);
         await Launcher.WritePlainAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented)).ConfigureAwait(false);
-        await Launcher.WritePlainAsync(Path.Combine(RunDir, "report.md"), _report).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(Path.Combine(RunDir, "report.md"), EvidenceBlock.Render(_report, evidence)).ConfigureAwait(false);
         await File.AppendAllTextAsync(Path.Combine(_runsRoot, "runs.jsonl"), _summary.ToJsonString() + Environment.NewLine, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -1979,6 +2003,14 @@ internal sealed class LaunchRun
                     if (++stderrLines >= 40) { break; }
                 }
             }
+        }
+
+        // The evidence block (issue #107): the launcher's own lines, in full. They are the facts of
+        // the run, not the worker's prose, so they never count against --report-max-chars.
+        await Console.Out.WriteLineAsync(EvidenceBlock.Heading).ConfigureAwait(false);
+        foreach (string line in _evidence)
+        {
+            await Console.Out.WriteLineAsync(line).ConfigureAwait(false);
         }
     }
 
