@@ -41,8 +41,15 @@ internal static partial class RunAsyncGolden
         "duration_ms", "total_cost_usd", "reported_cost_usd", "budget_usd", "wrap_up_usd", "wrapped_up", "hook_checks",
         "continued_from", "escalate_to", "gate", "model_traits", "tokens", "context_first_call", "first_call_cache_read",
         "first_call_cache_read_share", "context_peak", "permission_denials", "write_scope", "changed_files", "out_of_scope",
-        "session_id", "quota_before", "quota_after", "quota_used_pct", "notes",
+        "session_id", "quota_before", "quota_after", "quota_used_pct", "notes", "evidence_lines",
     ];
+
+    /// <summary>
+    /// The report.md a run writes: the worker's text, then the evidence block built from the summary's own
+    /// <c>evidence_lines</c>. A crashed run has no worker text, so the block stands alone.
+    /// </summary>
+    public static string ReportWithEvidence(string workerText, JsonObject summary) =>
+        EvidenceBlock.Render(workerText, summary["evidence_lines"]!.AsArray().Select(n => n!.GetValue<string>()).ToList());
 
     public const string BareWrapUpNote = "bare mode skips hooks, so wrap-up is off; the budget is still enforced";
 
@@ -132,6 +139,17 @@ internal static partial class RunAsyncGolden
     private static partial Regex DurationPattern();
 
     public static string Lines(params string[] lines) => string.Join('\n', lines) + "\n";
+
+    /// <summary>
+    /// The expected stdout: the given lines, then the evidence block the launcher prints last (heading and the
+    /// run's own <c>evidence_lines</c>, read from that run's summary.json).
+    /// </summary>
+    public static string LinesWithEvidence(string stdout, params string[] lines)
+    {
+        JsonObject summary = Summary(RunDirFrom(stdout));
+        IEnumerable<string> evidence = summary["evidence_lines"]!.AsArray().Select(n => n!.GetValue<string>());
+        return Lines([.. lines, EvidenceBlock.Heading, .. evidence]);
+    }
 
     public static JsonObject Summary(string runDir) => JsonNode.Parse(File.ReadAllText(Path.Combine(runDir, "summary.json")))!.AsObject();
 

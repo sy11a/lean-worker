@@ -54,7 +54,7 @@ metric_debt:
     class_coupling: 86
   - project: "LeanWorker"
     symbol: "T:LeanWorker.LaunchRun"
-    class_coupling: 95
+    class_coupling: 96
   - project: "LeanWorker.Tests"
     symbol: "M:LeanWorker.Tests.GateLoopTests.Round_two_uses_round_ones_gate_spec_even_when_profiles_json_changedAsync"
     class_coupling: 38
