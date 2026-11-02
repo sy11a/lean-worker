@@ -100,6 +100,20 @@ internal sealed class LaunchRun
     // changed them, so it reports them (a note and an evidence line each) instead of counting
     // them as unchanged.
     private List<string> _unverified = [];
+
+    // The files of the repository's own git metadata (the config, the hooks, the worktree's own
+    // config) the run changed: the write-scope snapshot is git-status based and never sees them,
+    // so they are watched on their own (issue #114).
+    private List<string> _gitTamper = [];
+
+    // The processes of the worker's own group that were still alive when the worker exited: they
+    // are signalled right after (issue #116). -1 when the worker had no group of its own.
+    private int _leftovers = -1;
+
+    // The snapshots taken before the worker, compared with the ones taken after it.
+    private WriteScope.Snapshot? _treeBefore;
+    private WriteScope.Snapshot? _invokingBefore;
+    private WriteScope.Snapshot? _gitBefore;
     private QuotaReading? _quotaAfter;
 
     // Status
@@ -951,8 +965,6 @@ internal sealed class LaunchRun
         Meter meter = _meter;
         string streamPath = Path.Combine(RunDir, "stream.jsonl");
         _stderrPath = Path.Combine(RunDir, "stderr.txt");
-        WriteScope.Snapshot? treeBefore;
-        WriteScope.Snapshot? invokingBefore;
         Outcome outcome = _outcome;
         string model = _model;
         string? reportedModel = null;
@@ -962,10 +974,7 @@ internal sealed class LaunchRun
         try
         {
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
-            treeBefore = await WriteScope.TakeAsync(_workspaceRoot, _runsRoot).ConfigureAwait(false);
-            // With --worktree the repository the launcher was called in gets its own snapshot: the
-            // worker works in the worktree, so anything that changes there is work outside it.
-            invokingBefore = await SnapshotInvokingAsync().ConfigureAwait(false);
+            await TakeBeforeSnapshotsAsync().ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes,
                 line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel)).ConfigureAwait(false);
         }
@@ -977,9 +986,16 @@ internal sealed class LaunchRun
         _exitCode = exitCode;
         _timedOut = timedOut;
         _capKilled = capKilled;
+        // The processes the worker left behind: its own group was signalled right after it exited.
+        _leftovers = prepared.Leftovers;
+        if (prepared.GroupNote() is { } groupNote)
+        {
+            _notes.Add(groupNote);
+        }
         runtime.Finish(outcome, _exitCode);
         _elapsed = DateTimeOffset.Now - _started;
-        await SnapshotChangedAsync(treeBefore, invokingBefore).ConfigureAwait(false);
+        await SnapshotChangedAsync().ConfigureAwait(false);
+        await SnapshotGitMetadataAsync().ConfigureAwait(false);
         _notes.AddRange(_meter.Notes);
 
         QuotaReading? quotaAfter = null;
@@ -992,12 +1008,30 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
+    /// The snapshots taken before the worker: the working tree's own, the invoking repository's
+    /// (--worktree) and the git metadata the run shares with the repository. Each of them is
+    /// compared with the snapshot taken after the worker.
+    /// </summary>
+    private async Task TakeBeforeSnapshotsAsync()
+    {
+        _treeBefore = await WriteScope.TakeAsync(_workspaceRoot, _runsRoot).ConfigureAwait(false);
+        // With --worktree the repository the launcher was called in gets its own snapshot: the
+        // worker works in the worktree, so anything that changes there is work outside it.
+        _invokingBefore = await SnapshotInvokingAsync().ConfigureAwait(false);
+        // The git metadata (the config, the hooks) is watched on its own: the write scope is
+        // git-status based and never sees it (issue #114).
+        _gitBefore = await WriteScope.TakeGitMetadataAsync(_workspaceRoot, GitLabelBase()).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// The changed-files bookkeeping after the worker: the workspace's after-worker snapshot, the
     /// changed list and the out-of-scope list it yields, then the invoking repository's comparison
     /// (--worktree) on top.
     /// </summary>
-    private async Task SnapshotChangedAsync(WriteScope.Snapshot? treeBefore, WriteScope.Snapshot? invokingBefore)
+    private async Task SnapshotChangedAsync()
     {
+        WriteScope.Snapshot? treeBefore = _treeBefore;
+        WriteScope.Snapshot? invokingBefore = _invokingBefore;
         WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
         _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
         _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
@@ -1011,6 +1045,40 @@ internal sealed class LaunchRun
         foreach (string path in _unverified)
         {
             _notes.Add($"unverified: {EvidenceBlock.OneLine(path)}");
+        }
+    }
+
+    /// <summary>
+    /// The directory the labels of the watched git metadata are relative to: the repository that
+    /// owns the git dir. A run that owns a worktree shares the git dir of the repository the
+    /// launcher was called in, so that is the one the labels name.
+    /// </summary>
+    private string GitLabelBase() => _invokingRoot.Length > 0 ? _invokingRoot : _workspaceRoot;
+
+    /// <summary>
+    /// The git metadata after the worker: the watched files that differ from the before-worker
+    /// snapshot are out-of-scope findings — the run changed the repository's own git metadata
+    /// (the config, the hooks), which every later git call runs: the launcher's own and the
+    /// operator's next session (issue #114).
+    /// </summary>
+    private async Task SnapshotGitMetadataAsync()
+    {
+        WriteScope.Snapshot? before = _gitBefore;
+        if (before is null)
+        {
+            return;
+        }
+
+        WriteScope.Snapshot? after = await WriteScope.TakeGitMetadataAsync(_workspaceRoot, GitLabelBase()).ConfigureAwait(false);
+        if (after is null)
+        {
+            return;
+        }
+
+        _gitTamper = WriteScope.Changed(before, after);
+        foreach (string path in _gitTamper)
+        {
+            _notes.Add($"git-tamper: {EvidenceBlock.OneLine(path)}");
         }
     }
 
@@ -1687,6 +1755,15 @@ internal sealed class LaunchRun
         {
             status = "wrapped-up";
         }
+
+        if (status is "success" && _gitTamper.Count > 0)
+        {
+            // The run changed the repository's own git metadata: it is out of scope, whatever the
+            // worker said (issue #114). The status is not a success, so the run exits 1 like
+            // every other non-success.
+            status = "out-of-scope";
+        }
+
         return status;
     }
 
@@ -2143,7 +2220,7 @@ internal sealed class LaunchRun
     {
         // The evidence block (issue #107): the launcher's own lines, built from the summary this
         // method writes, so the report carries the run's facts and not only the worker's prose.
-        List<string> evidence = EvidenceBlock.Build(_summary, _unverified);
+        List<string> evidence = EvidenceBlock.Build(_summary, _unverified, _gitTamper, _leftovers);
         _evidence = evidence;
         _summary["evidence_lines"] = new JsonArray([.. evidence.Select(line => (JsonNode)line)]);
         await Launcher.WritePlainAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented)).ConfigureAwait(false);
@@ -2155,7 +2232,29 @@ internal sealed class LaunchRun
     {
         await PrintHeaderAsync().ConfigureAwait(false);
         await PrintNoticesAsync().ConfigureAwait(false);
+        await PrintTamperWarningAsync().ConfigureAwait(false);
         await PrintReportAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The loud warning on the error stream: the run changed the repository's own git metadata,
+    /// which every later git call runs. It goes to the error stream, so it is seen even when the
+    /// result block is read on the other one.
+    /// </summary>
+    private async Task PrintTamperWarningAsync()
+    {
+        if (_gitTamper.Count is 0)
+        {
+            return;
+        }
+
+        string extras = _gitTamper.Count > 5
+            ? string.Create(CultureInfo.InvariantCulture, $" (+{_gitTamper.Count - 5} more, see summary.json)")
+            : string.Empty;
+        await Console.Error.WriteLineAsync(
+            $"WARNING:  the run changed the repository's own git metadata: {string.Join(", ", _gitTamper.Take(5))}{extras}. " +
+            "Every later git call runs it (core.fsmonitor, core.hooksPath, a hook of its own); check it before accepting the run.")
+            .ConfigureAwait(false);
     }
 
     private async Task PrintHeaderAsync()

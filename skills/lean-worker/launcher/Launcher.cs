@@ -120,12 +120,16 @@ internal static class Launcher
 
     /// <summary>
     /// Runs the worker, handing every stdout line to onLine; onLine returns true to stop the worker (hard cap).
+    /// The worker leads a process group of its own (see <see cref="Prepared.Group"/>), and that group is
+    /// signalled after the worker exits: the processes it leaves behind are reparented to init then and
+    /// out of a tree kill's reach (issue #116).
     /// </summary>
     internal static async Task<(int ExitCode, bool TimedOut, bool CapKilled)> RunWorkerAsync(Prepared prep, string stdin,
         string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine)
     {
         ProcessStartInfo psi = StartInfo(prep);
         using Process p = Process.Start(psi) ?? throw new LaunchException($"could not start {prep.Executable}");
+        await prep.ResolveGroupAsync(p.Id).ConfigureAwait(false);
         using CancellationTokenSource cts = new();
         StreamWriter stream = new(streamPath, append: false, Json.Utf8);
         await using ConfiguredAsyncDisposable streamDisposal = stream.ConfigureAwait(false);
@@ -150,6 +154,10 @@ internal static class Launcher
         await p.StandardInput.WriteAsync(stdin).ConfigureAwait(false);
         p.StandardInput.Close();
         bool timedOut = await WaitForExitAsync(p, timeoutMinutes).ConfigureAwait(false);
+        // The worker has exited: whatever it left behind is reparented to init and out of a tree
+        // kill's reach, so the group it shared with the worker is signalled here — before the run
+        // decides what becomes of the worktree (issue #116).
+        await prep.FinishGroupAsync().ConfigureAwait(false);
         _ = await Task.WhenAny(Task.WhenAll(pumpTask, errDone.Task), Task.Delay(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None)).ConfigureAwait(false);
         lock (state.Gate) { state.Closed = true; }
         await cts.CancelAsync().ConfigureAwait(false);
@@ -270,6 +278,9 @@ internal static class Launcher
         // working directory (the workspace root the task's location resolves to)
         psi.Environment["PWD"] = cwd;
         _ = psi.Environment.Remove("OLDPWD");
+        // The worker leads a process group of its own, so the processes it leaves behind can be
+        // signalled after it exits (issue #116).
+        prep.ApplyGroup(psi);
         return psi;
     }
 

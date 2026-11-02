@@ -208,6 +208,10 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   step produced nothing, so the run is not a success even when the worker exited cleanly — the
   result block's `reason=length` says so. Nothing new was written: check `git status`, then run
   again with a narrower task, or with a model that has a bigger output budget.
+- `status: out-of-scope` (exit 1): the run changed the repository's own git metadata — the config or
+  the hooks of the shared `.git` — which every later git call runs. The changed files are listed in
+  the evidence block (`- git-tamper: .git/config`) and a warning goes to stderr. Show the user the
+  list and ask what to do with it; do not accept the run as it is.
 - Otherwise the worker's session is not kept. Sharpen `task.md` (goal, start-here paths, scope) or
   split the task, and run again. Each run gets its own directory.
 - If the cause is general (a missing command, an unknown convention), fix `project.md` or the

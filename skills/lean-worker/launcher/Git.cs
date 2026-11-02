@@ -10,6 +10,14 @@ internal static class Git
     /// </summary>
     internal sealed record Result(int ExitCode, string Stdout, string Stderr);
 
+    /// <summary>
+    /// The options every git call of the launcher carries, before the subcommand (where git reads
+    /// them): the fsmonitor hook and the hooks path are switched off. A worker that changed the
+    /// repository's own config (core.fsmonitor, core.hooksPath) or wrote a hook of its own would
+    /// otherwise have the launcher's own git calls — and the operator's next session — run it.
+    /// </summary>
+    private static readonly string[] _safe = ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"];
+
     internal static async Task<string?> RunAsync(string dir, params string[] args)
     {
         Result? result = await RunResultAsync(dir, args).ConfigureAwait(false);
@@ -30,6 +38,10 @@ internal static class Git
         ProcessStartInfo psi = new("git") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         psi.ArgumentList.Add("-C");
         psi.ArgumentList.Add(dir);
+        foreach (string safe in _safe)
+        {
+            psi.ArgumentList.Add(safe);
+        }
         foreach (string a in args)
         {
             psi.ArgumentList.Add(a);

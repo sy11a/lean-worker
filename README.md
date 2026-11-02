@@ -550,7 +550,8 @@ to sweep.
 Exit codes:
 - `0`: success. With a gate, the gate is clean.
 - `1`: the worker reported an error or failed. A run the provider's output limit cut off
-  (`status: truncated`) exits `1` too: it is not a success.
+  (`status: truncated`) exits `1` too: it is not a success, and neither is a run that changed the
+  repository's own git metadata (`status: out-of-scope`).
 - `2`: the launcher failed, including a gate configuration refused before the worker ran.
 - `3`: the worker wrapped up near its budget and left a handoff.
 - `4`: the gate is stuck.
@@ -561,6 +562,32 @@ limit and produced nothing (no final text, no output tokens), the run ends with
 `status: truncated` and `terminal_reason: length`, and it exits `1` like a failed run. The report
 of such a run is the text of an earlier step, or none at all, so treat it as a run to repeat — with
 a narrower task or a model with a bigger output budget — and not as a finished one.
+
+### The repository's own git metadata is watched
+
+A run shares the repository's git dir with it: a `--worktree` run shares the `.git` of the
+repository the launcher was called in, and a run without one works in the repository itself. A
+worker can therefore set `core.fsmonitor` or `core.hooksPath` in `.git/config`, or write a hook of
+its own into `.git/hooks` — and every git call after that runs it: the launcher's own and your next
+session's. The write-scope snapshot is `git status` based and never sees any of it, so the launcher
+watches the metadata itself: the config and every file under the hooks (by name, so an added or a
+removed hook counts) of the common git dir, and the worktree's own `config.worktree`, are hashed
+before the worker and after it, with the directories git itself resolves.
+
+A difference is an out-of-scope finding: the changed files are listed in the evidence block
+(`- git-tamper: .git/config`), a warning goes to the error stream, and the run ends with
+`status: out-of-scope` and exit `1` — whatever the worker said about itself. The launcher's own git
+calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the subcommand, so a changed
+config cannot run code through them either.
+
+### The worker runs in a process group of its own
+
+The worker leads a process group of its own (Linux, through `setsid`), and the group is signalled
+when the worker exits: the processes it leaves behind are reparented to init the moment it is gone
+and out of a tree kill's reach, so they could race the `--worktree` cleanup. The group gets a
+SIGTERM, the members that survive five seconds a SIGKILL, and the evidence block counts the members
+that were still alive (`- leftovers: N`). Without `setsid` the worker runs as before, whatever it
+leaves behind stays behind, and the run says so (`note: process-group: unavailable`).
 
 ## Cost notes from real runs
 
@@ -596,7 +623,7 @@ a narrower task or a model with a bigger output budget — and not as a finished
 - `settings.json` (claude runtime, lean mode) or `opencode-config.json` (opencode runtime)
 - `wrapup.json` when the wrap-up fired, and `hook.log`, one line per hook check
 - `summary.json`
-- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results, the files the run changed and the files the launcher could not read). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
+- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results, the files the run changed, the files the launcher could not read, the files of the repository's own git metadata the run changed and the processes the worker left behind). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
 
 `.lean-worker/runs.jsonl` gets one JSON line per run, recording:
 

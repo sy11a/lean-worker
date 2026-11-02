@@ -69,6 +69,19 @@ internal static class WriteScope
     }
 
     /// <summary>
+    /// The snapshot of the git metadata of a working tree: the config and the hooks of the common
+    /// git dir and the worktree's own config, hashed by name (".git/config" → its hash). The
+    /// write scope never sees them — it is git-status based — so they are watched on their own
+    /// (issue #114). The snapshot has the shape of every other one: the tree it was taken in and
+    /// the hash of every watched file. Null when the tree is not a git tree (or git is missing).
+    /// </summary>
+    public static async Task<Snapshot?> TakeGitMetadataAsync(string dir, string labelBase)
+    {
+        Dictionary<string, string>? files = await GitMetadata.TakeAsync(dir, labelBase).ConfigureAwait(false);
+        return files is null ? null : new Snapshot(dir, files);
+    }
+
+    /// <summary>
     /// The content hash of a file that the listing showed as present: a file that cannot be read
     /// (no permission, a directory in its way, an I/O error), or one that vanished between the
     /// listing and this read, is recorded by its metadata instead of throwing — an unreadable

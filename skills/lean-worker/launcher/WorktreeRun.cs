@@ -341,12 +341,9 @@ internal sealed class WorktreeRun
     /// worktree that git refuses to remove stays, and the error is the reason; a branch that stays
     /// behind after its worktree is gone is a note, not a reason.
     /// </summary>
-    // Residual of the ordering here: background processes the worker left behind are NOT killed
-    // before this decision — once the worker exits they are reparented to init and out of a tree
-    // kill's reach — so any of them can race the check before a delete. The re-check right before
-    // each delete narrows that window but does not close it, and the deletes are plain File.Delete
-    // and Directory.Delete calls, not unlinkat against a re-verified handle, so the window stays
-    // open by exactly that much. The fix is tracked in the issue tracker (issue #116).
+    // The processes the worker left behind cannot race the decision here: the worker's own process
+    // group is signalled when the worker exits, before this decision (issue #116). A process that
+    // leaves the group on its own is out of the launcher's reach either way.
     private async Task RemoveAsync()
     {
         // The same refusal once more, at the moment of deletion: a path turned dirty after the
