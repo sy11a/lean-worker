@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using System.Text.Json.Nodes;
 using Xunit;
 
@@ -447,5 +448,309 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         }));
 
         Assert.False(await BranchExistsAsync(Branch));
+    }
+
+    // ---- symlinks in the cleanup (lean-worker#113) ----
+
+    private static void SkipWithoutSymlinks() => Assert.SkipWhen(OperatingSystem.IsWindows(), "the symlink tests need a Unix file system");
+
+    private void AssertInvokingSetupIntact()
+    {
+        Assert.Equal("{\"profiles\":{}}", File.ReadAllText(Path.Combine(_setup, "profiles.json")));
+        Assert.Equal("project notes\n", File.ReadAllText(Path.Combine(_setup, "project.md")));
+        Assert.Equal("code a\n", File.ReadAllText(Path.Combine(_setup, "code-a.md")));
+        Assert.Equal("system notes\n", File.ReadAllText(Path.Combine(_setup, "system", "s.md")));
+        Assert.Equal("base\n", File.ReadAllText(Path.Combine(_repo, "README.md")));
+    }
+
+    [Fact]
+    public async Task A_copied_folder_replaced_by_a_symlink_to_the_invoking_folder_deletes_nothing_and_keeps_the_worktreeAsync()
+    {
+        SkipWithoutSymlinks();
+        WorktreeRun wt = await CreateAsync();
+        string linked = Path.Combine(wt.WorktreePath, ".lean-worker", "system");
+        Directory.Delete(linked, recursive: true);
+        _ = Directory.CreateSymbolicLink(linked, Path.Combine(_setup, "system"));
+
+        await AssertKeptAsync(wt, "changes");
+
+        AssertInvokingSetupIntact();
+        Assert.NotNull(wt.Note);
+        Assert.Contains(linked, wt.Note, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_copied_file_replaced_by_a_symlink_to_its_source_is_not_deleted_through_and_the_worktree_is_keptAsync()
+    {
+        SkipWithoutSymlinks();
+        WorktreeRun wt = await CreateAsync();
+        string linked = Path.Combine(wt.WorktreePath, ".lean-worker", "code-a.md");
+        File.Delete(linked);
+        _ = File.CreateSymbolicLink(linked, Path.Combine(_setup, "code-a.md"));
+
+        await AssertKeptAsync(wt, "changes");
+
+        AssertInvokingSetupIntact();
+        Assert.NotNull(wt.Note);
+        Assert.Contains(linked, wt.Note, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_worktree_root_replaced_by_a_symlink_to_the_invoking_repository_deletes_nothing_and_runs_no_status_thereAsync()
+    {
+        SkipWithoutSymlinks();
+        WorktreeRun wt = await CreateAsync();
+        string moved = wt.WorktreePath + "-moved";
+        Directory.Move(wt.WorktreePath, moved);
+        _ = Directory.CreateSymbolicLink(wt.WorktreePath, _repo);
+
+        // git consults core.fsmonitor on every status: a status run on the invoking repository's tree leaves the marker.
+        string marker = Path.Combine(_root, "status-ran");
+        string hook = Path.Combine(_root, "fsmonitor.sh");
+        WriteScript(hook, $"#!/bin/sh\ntouch '{marker}'\nexit 1\n");
+        _ = await GitAsync(_repo, "config", "core.fsmonitor", hook);
+
+        try
+        {
+            await wt.FinishAsync();
+
+            Assert.Equal("kept", wt.Action);
+            Assert.Equal("changes", wt.Reason);
+            Assert.NotNull(wt.Note);
+            Assert.Contains("check failed", wt.Note, StringComparison.Ordinal);
+            Assert.False(File.Exists(marker), "no status may run on the invoking repository's tree");
+            AssertInvokingSetupIntact();
+            Assert.True(Directory.Exists(Path.Combine(_repo, ".git")));
+            Assert.True(await BranchExistsAsync(Branch));
+            Assert.True(File.Exists(Path.Combine(moved, ".lean-worker", "code-a.md")));
+        }
+        finally
+        {
+            // Remove the link itself, never what it points at.
+            Directory.Delete(wt.WorktreePath);
+        }
+    }
+
+    /// <summary>
+    /// Commits a symlink at <c>.lean-worker/system</c> (pointing at a folder outside the repository), then restores the
+    /// real folder in the working tree: the base now tracks a symlink at a setup path.
+    /// </summary>
+    private async Task<string> TrackSymlinkedSystemFolderAsync()
+    {
+        string outside = Path.Combine(_root, "outside");
+        _ = Directory.CreateDirectory(outside);
+        string system = Path.Combine(_setup, "system");
+        string backup = Path.Combine(_root, "system-backup");
+        Directory.Move(system, backup);
+        _ = Directory.CreateSymbolicLink(system, outside);
+        _ = await GitAsync(_repo, "add", "-f", "--", ".lean-worker/system");
+        _ = await GitAsync(_repo, "commit", "-m", "track a symlink");
+        Directory.Delete(system);
+        Directory.Move(backup, system);
+        return outside;
+    }
+
+    [Fact]
+    public async Task A_base_that_tracks_a_symlink_at_a_setup_path_is_refused_and_nothing_is_written_through_itAsync()
+    {
+        SkipWithoutSymlinks();
+        string outside = await TrackSymlinkedSystemFolderAsync();
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync());
+
+        Assert.Contains("tracks a symlink", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+    }
+
+    [Fact]
+    public async Task A_launch_whose_base_tracks_a_symlink_at_a_setup_path_is_refused_before_the_worker_runsAsync()
+    {
+        SkipWithoutSymlinks();
+        string outside = await TrackSymlinkedSystemFolderAsync();
+        string workerMarker = Path.Combine(_root, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await LaunchAsync(Success("touch '" + workerMarker + "'"), o =>
+        {
+            o.Name = RunName;
+            o.Worktree = Branch;
+            o.WorktreeBase = "HEAD";
+        }));
+
+        Assert.Contains("tracks a symlink", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+    }
+
+    // ---- the invoking repository stays in the checks (lean-worker#113) ----
+
+    private static string[] OutOfScope(JsonObject summary) =>
+        summary["out_of_scope"] is JsonArray a ? [.. a.Select(n => n!.GetValue<string>())] : [];
+
+    private async Task<(int Code, string Stdout, JsonObject Summary)> LaunchWorktreeAsync(string workerShell, Action<Options>? more = null)
+    {
+        return await LaunchAsync(Success(workerShell), o =>
+        {
+            o.Name = RunName;
+            o.Worktree = Branch;
+            more?.Invoke(o);
+        });
+    }
+
+    [UnsupportedOSPlatform("windows")]
+    private static async Task WriteLockedAsync(string path)
+    {
+        await File.WriteAllTextAsync(path, "secret\n", TestContext.Current.CancellationToken);
+        File.SetUnixFileMode(path, UnixFileMode.None);
+    }
+
+    [UnsupportedOSPlatform("windows")]
+    private static void Unlock(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    [Fact]
+    public async Task A_worker_that_writes_into_the_invoking_repository_is_reported_with_the_invoking_prefix_and_the_plain_messageAsync()
+    {
+        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("echo leak > '" + _repo + "/leak.txt'");
+
+        Assert.Equal(0, code);
+        Assert.Contains("<invoking>/leak.txt", OutOfScope(s), StringComparer.Ordinal);
+        Assert.Contains("1 changed in the invoking repository", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain("outside the write scope", stdout, StringComparison.Ordinal);
+        Assert.Contains("WARNING:", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task With_a_write_scope_the_invoking_repository_path_counts_as_outside_the_write_scopeAsync()
+    {
+        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("echo leak > '" + _repo + "/leak.txt'", o => o.WriteScope.Add("src/**"));
+
+        Assert.Equal(0, code);
+        Assert.Equal(["<invoking>/leak.txt"], OutOfScope(s));
+        Assert.Contains("1 outside the write scope", stdout, StringComparison.Ordinal);
+        Assert.Contains("changed outside the write scope: <invoking>/leak.txt", stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_launchers_own_run_directory_and_ledger_in_the_invoking_repository_are_not_reportedAsync()
+    {
+        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("true");
+
+        Assert.Equal(0, code);
+        Assert.Empty(OutOfScope(s));
+        Assert.DoesNotContain("<invoking>", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain("changed in the invoking repository", stdout, StringComparison.Ordinal);
+        Assert.DoesNotContain("invoking repository not checked", string.Join('\n', RunAsyncGolden.Notes_(s)), StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(_setup, "runs.jsonl")));
+    }
+
+    [Fact]
+    public async Task A_gate_PATH_directory_inside_the_invoking_repository_is_refused_like_one_inside_the_worktreeAsync()
+    {
+        SkipWithoutSymlinks();
+        string bin = Path.Combine(_repo, "gatebin");
+        _ = Directory.CreateDirectory(bin);
+        string gate = Path.Combine(_root, "gate.sh");
+        WriteScript(gate, "#!/bin/sh\nexit 0\n");
+        RunAsyncGolden.WriteProfile(_setup, "test", GateLoopTests.GateProfile(gate));
+        string workerMarker = Path.Combine(_root, "worker-ran");
+
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await LaunchWorktreeAsync("touch '" + workerMarker + "'", o =>
+        {
+            o.Profile = "test";
+            Environment.SetEnvironmentVariable("PATH", bin + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"));
+        }));
+
+        Assert.Equal("gate PATH directory '" + bin + "' is inside the working tree", ex.Message);
+        Assert.False(File.Exists(workerMarker), "the worker must not run");
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task An_unreadable_file_in_the_invoking_repository_hashes_as_a_question_mark_and_does_not_crash_the_snapshotAsync()
+    {
+        SkipWithoutSymlinks();
+        string locked = Path.Combine(_repo, "locked.txt");
+        await WriteLockedAsync(locked);
+        try
+        {
+            Assert.SkipWhen(CanRead(locked), "the file is readable anyway (running as root)");
+
+            WriteScope.Snapshot snapshot = (await WriteScope.TakeAsync(_repo))!;
+
+            Assert.Equal("?", snapshot.Dirty["locked.txt"]);
+        }
+        finally
+        {
+            Unlock(locked);
+        }
+    }
+
+    private static bool CanRead(string path)
+    {
+        try
+        {
+            _ = File.ReadAllBytes(path);
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task A_worker_that_leaves_an_unreadable_file_in_the_invoking_repository_is_reported_and_the_run_does_not_crashAsync()
+    {
+        SkipWithoutSymlinks();
+        string locked = Path.Combine(_repo, "locked.txt");
+        try
+        {
+            (int code, _, JsonObject s) = await LaunchWorktreeAsync("echo x > '" + locked + "'; chmod 000 '" + locked + "'");
+
+            Assert.Equal(0, code);
+            Assert.Contains("<invoking>/locked.txt", OutOfScope(s), StringComparer.Ordinal);
+        }
+        finally
+        {
+            Unlock(locked);
+        }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task An_unreadable_file_already_in_the_invoking_repository_before_the_run_is_not_reportedAsync()
+    {
+        SkipWithoutSymlinks();
+        string locked = Path.Combine(_repo, "locked.txt");
+        await WriteLockedAsync(locked);
+        try
+        {
+            (int code, _, JsonObject s) = await LaunchWorktreeAsync("true");
+
+            Assert.Equal(0, code);
+            Assert.Empty(OutOfScope(s));
+        }
+        finally
+        {
+            Unlock(locked);
+        }
+    }
+
+    [Fact]
+    public async Task A_failed_invoking_repository_snapshot_after_the_worker_is_a_run_noteAsync()
+    {
+        // The worker breaks the invoking repository's HEAD: git cannot run in it any more.
+        (int code, _, JsonObject s) = await LaunchWorktreeAsync("echo garbage > '" + Path.Combine(_repo, ".git", "HEAD") + "'");
+
+        Assert.Equal(0, code);
+        Assert.Contains(RunAsyncGolden.Notes_(s), n => n.StartsWith("invoking repository not checked: ", StringComparison.Ordinal));
     }
 }

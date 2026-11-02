@@ -17,9 +17,11 @@ internal static class WriteScope
     internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty);
 
     /// <summary>
-    /// Null when <paramref name="cwd"/> is not inside a git working tree (or git is missing).
+    /// Null when <paramref name="cwd"/> is not inside a git working tree (or git is missing). The
+    /// excluded paths (the launcher's own bookkeeping) leave both snapshots of a comparison when
+    /// they lie in the tree; an exclude outside it is ignored.
     /// </summary>
-    public static async Task<Snapshot?> TakeAsync(string cwd, string? exclude = null)
+    public static async Task<Snapshot?> TakeAsync(string cwd, params string?[] excludes)
     {
         string? root = (await Git.RunAsync(cwd, "rev-parse", "--show-toplevel").ConfigureAwait(false))?.Trim();
         if (string.IsNullOrEmpty(root))
@@ -33,7 +35,10 @@ internal static class WriteScope
             return null;
         }
 
-        string? skip = exclude is null ? null : Relative(root, exclude);
+        string[] skips = [.. excludes.Where(e => e is not null)
+            .Select(e => Relative(root, e!))
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal),];
         Dictionary<string, string> dirty = new(StringComparer.Ordinal);
         string[] entries = status.Split('\0', StringSplitOptions.RemoveEmptyEntries);
         for (int i = 0; i < entries.Length; i++)
@@ -48,16 +53,36 @@ internal static class WriteScope
             IEnumerable<string> paths = e[0] == 'R' && source is not null ? [e[3..], source] : new[] { e[3..] };
             foreach (string path in paths)
             {
-                if (skip is not null && (path == skip || path.StartsWith(skip + "/", StringComparison.Ordinal)))
+                if (skips.Any(skip => path == skip || path.StartsWith(skip + "/", StringComparison.Ordinal)))
                 {
                     continue;
                 }
 
                 string full = Path.Combine(root, path);
-                dirty[path] = File.Exists(full) ? Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(full, CancellationToken.None).ConfigureAwait(false))) : "-";
+                dirty[path] = File.Exists(full) ? await HashAsync(full).ConfigureAwait(false) : "-";
             }
         }
         return new Snapshot(root, dirty);
+    }
+
+    /// <summary>
+    /// The content hash of a file that the listing showed as present: a file that cannot be read
+    /// (no permission, a directory in its way, an I/O error), or one that vanished between the
+    /// listing and this read, hashes as <c>"?"</c> instead of throwing — an unreadable file must
+    /// not crash the run. The marker differs from every real hash (and from <c>-</c>, deleted), so
+    /// a file that is readable in only one of the two snapshots is reported as changed; a file
+    /// unreadable in both snapshots hashes <c>"?"</c> in both and is not reported as changed.
+    /// </summary>
+    private static async Task<string> HashAsync(string full)
+    {
+        try
+        {
+            return Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(full, CancellationToken.None).ConfigureAwait(false)));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "?";
+        }
     }
 
     /// <summary>

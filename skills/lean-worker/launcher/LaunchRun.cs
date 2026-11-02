@@ -944,6 +944,7 @@ internal sealed class LaunchRun
         string streamPath = Path.Combine(RunDir, "stream.jsonl");
         _stderrPath = Path.Combine(RunDir, "stderr.txt");
         WriteScope.Snapshot? treeBefore;
+        WriteScope.Snapshot? invokingBefore;
         Outcome outcome = _outcome;
         string model = _model;
         string? reportedModel = null;
@@ -954,6 +955,9 @@ internal sealed class LaunchRun
         {
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             treeBefore = await WriteScope.TakeAsync(_workspaceRoot, _runsRoot).ConfigureAwait(false);
+            // With --worktree the repository the launcher was called in gets its own snapshot: the
+            // worker works in the worktree, so anything that changes there is work outside it.
+            invokingBefore = await SnapshotInvokingAsync().ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes,
                 line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel)).ConfigureAwait(false);
         }
@@ -967,9 +971,7 @@ internal sealed class LaunchRun
         _capKilled = capKilled;
         runtime.Finish(outcome, _exitCode);
         _elapsed = DateTimeOffset.Now - _started;
-        WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
-        _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
-        _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
+        await SnapshotChangedAsync(treeBefore, invokingBefore).ConfigureAwait(false);
         _notes.AddRange(_meter.Notes);
 
         QuotaReading? quotaAfter = null;
@@ -979,6 +981,115 @@ internal sealed class LaunchRun
             catch (Exception ex) when (Quota.IsReadFailure(ex)) { _notes.Add($"quota re-read failed: {ex.Message}"); }
         }
         _quotaAfter = quotaAfter;
+    }
+
+    /// <summary>
+    /// The changed-files bookkeeping after the worker: the workspace's after-worker snapshot, the
+    /// changed list and the out-of-scope list it yields, then the invoking repository's comparison
+    /// (--worktree) on top.
+    /// </summary>
+    private async Task SnapshotChangedAsync(WriteScope.Snapshot? treeBefore, WriteScope.Snapshot? invokingBefore)
+    {
+        WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
+        _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
+        _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
+        // The invoking repository's comparison (--worktree): every path that changed in the
+        // repository the launcher was called in joins the out-of-scope report, prefixed with
+        // <invoking>/ so it reads as the invoking repo's.
+        _outOfScope = await AddInvokingOutOfScopeAsync(_outOfScope, invokingBefore).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Prefix of an invoking-repository path in the out-of-scope reporting: the workspace's own
+    /// out-of-scope paths are repository-relative, so the prefix is what says the path is the
+    /// invoking repo's, not the workspace's.
+    /// </summary>
+    private const string InvokingPrefix = "<invoking>/";
+
+    /// <summary>
+    /// What the launcher itself writes in the invoking repository, and its snapshot therefore
+    /// ignores: the run directories and the ledger, both under the runs root — the same two paths
+    /// <see cref="PrepareTaskAsync"/> and <see cref="WriteSummaryAsync"/> build their writes from.
+    /// </summary>
+    private (string RunsDir, string Ledger) InvokingExcludes() =>
+        (Path.Combine(_runsRoot, "runs"), Path.Combine(_runsRoot, "runs.jsonl"));
+
+    /// <summary>
+    /// The note when the invoking repository's snapshot cannot be taken or compared (--worktree):
+    /// the check is reported, never skipped silently. The reason names what failed.
+    /// </summary>
+    private const string InvokingUncheckedReason = "git could not be run or its status could not be read";
+
+    /// <summary>
+    /// Records the note and answers null, so the snapshot call sites can fold the report into the
+    /// null path they already handle.
+    /// </summary>
+    private WriteScope.Snapshot? NoteInvokingUnchecked(string reason)
+    {
+        _notes.Add($"invoking repository not checked: {reason}");
+        return null;
+    }
+
+    /// <summary>
+    /// The invoking repository's before-worker snapshot (--worktree): the same snapshot mechanism
+    /// the workspace gets (<see cref="WriteScope.TakeAsync"/>), over the repository the launcher was
+    /// called in. Null without --worktree — the workspace's own snapshot covers the repository then.
+    /// A snapshot that comes back null, or one that fails, is noted (never skipped silently).
+    /// </summary>
+    private async Task<WriteScope.Snapshot?> SnapshotInvokingAsync()
+    {
+        if (_invokingRoot.Length is 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            (string runsDir, string ledger) = InvokingExcludes();
+            return await WriteScope.TakeAsync(_invokingRoot, runsDir, ledger).ConfigureAwait(false)
+                ?? NoteInvokingUnchecked(InvokingUncheckedReason);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return NoteInvokingUnchecked(EvidenceBlock.OneLine(ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// The out-of-scope list with the invoking repository's changes added (--worktree): the paths
+    /// that changed between its before-worker and after-worker snapshots — every one of them, the
+    /// run's write scope speaks about the workspace — each prefixed so it reads as the invoking
+    /// repo's, and reported (and warned about) beside the workspace's own out-of-scope writes.
+    /// Returns <paramref name="outOfScope"/> unchanged without --worktree, without a before
+    /// snapshot, or when nothing changed there. An after-snapshot that comes back null, or one
+    /// that fails, is noted (never skipped silently).
+    /// </summary>
+    private async Task<List<string>?> AddInvokingOutOfScopeAsync(List<string>? outOfScope, WriteScope.Snapshot? invokingBefore)
+    {
+        if (invokingBefore is null)
+        {
+            return outOfScope;
+        }
+
+        WriteScope.Snapshot? invokingAfter;
+        try
+        {
+            (string runsDir, string ledger) = InvokingExcludes();
+            invokingAfter = await WriteScope.TakeAsync(invokingBefore.Root, runsDir, ledger).ConfigureAwait(false)
+                ?? NoteInvokingUnchecked(InvokingUncheckedReason);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            invokingAfter = NoteInvokingUnchecked(EvidenceBlock.OneLine(ex.Message));
+        }
+
+        if (invokingAfter is null)
+        {
+            return outOfScope;
+        }
+
+        List<string> changed = WriteScope.Changed(invokingBefore, invokingAfter);
+        return changed.Count is 0 ? outOfScope : [.. outOfScope ?? [], .. changed.Select(f => InvokingPrefix + f)];
     }
 
     private static bool HandleUsageLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model, ref string? reportedModel)
@@ -1076,7 +1187,7 @@ internal sealed class LaunchRun
 
         GatePathNames = GateTrust.SnapshotPathNames(GateTrust.SplitGatePath(gatePath));
         string workspace = _workspaceRoot;
-        RefuseGatePathInsideWorkingTree(await RepoToken.RootAsync(workspace).ConfigureAwait(false) ?? workspace, workspace);
+        RefuseGatePathInsideWorkingTree(await RepoToken.RootAsync(workspace).ConfigureAwait(false) ?? workspace, workspace, _invokingRoot.Length is 0 ? null : _invokingRoot);
     }
 
     /// <summary>
@@ -1085,25 +1196,31 @@ internal sealed class LaunchRun
     /// spawns) write the gate's own PATH, and a symlink entry whose final target lies there lets it
     /// rewrite what the link resolves to while the PATH directory's listing stays intact — the
     /// listing check would only notice after a full worker run, and the restore-mtime gap can hide
-    /// it altogether. A PATH directory whose listing can be neither read nor confirmed missing is
-    /// refused in its own right: an unreadable directory is invisible to every later listing
-    /// comparison (baseline and current would both say <c>unreadable</c>), so a worker that can
-    /// write it could plant a tool the gate would still run. Both sides of every
-    /// inside-the-working-tree comparison are canonicalised (<see cref="GateTrust.Canonical"/>),
-    /// so a PATH entry through a symlinked directory or a git root behind a symlinked home is judged
-    /// by the files the paths really name, and a link on the way to a PATH directory or to a final
-    /// target is refused in its own right when the link path itself sits in the tree: the worker can
-    /// retarget it even though the resolution lands outside today. Like every other round-1 refusal
-    /// this is a launch error (exit 2), thrown before the run directory is created; the frozen
-    /// listing the later rounds compare against exists only when this check passed.
+    /// it altogether. With <c>--worktree</c> the repository the launcher was called in
+    /// (<paramref name="invokingRoot"/>) is refused like the rest: the worker does not live in it,
+    /// but it holds the launcher's own bookkeeping (the run directory, the ledger), and the same
+    /// message form names a PATH directory found there. A PATH directory whose listing can be
+    /// neither read nor confirmed missing is refused in its own right: an unreadable directory is
+    /// invisible to every later listing comparison (baseline and current would both say
+    /// <c>unreadable</c>), so a worker that can write it could plant a tool the gate would still
+    /// run. Both sides of every inside-the-working-tree comparison are canonicalised
+    /// (<see cref="GateTrust.Canonical"/>), so a PATH entry through a symlinked directory or a git
+    /// root behind a symlinked home is judged by the files the paths really name, and a link on the
+    /// way to a PATH directory or to a final target is refused in its own right when the link path
+    /// itself sits in the tree: the worker can retarget it even though the resolution lands outside
+    /// today. Like every other round-1 refusal this is a launch error (exit 2), thrown before the
+    /// run directory is created; the frozen listing the later rounds compare against exists only
+    /// when this check passed.
     /// </summary>
-    private void RefuseGatePathInsideWorkingTree(string gitRoot, string workingDirectory)
+    private void RefuseGatePathInsideWorkingTree(string gitRoot, string workingDirectory, string? invokingRoot)
     {
-        // The three roots, canonicalised once for this check: every comparison below runs against
-        // the same resolved trees.
+        // The roots, canonicalised once for this check: every comparison below runs against the
+        // same resolved trees. The invoking root is null without --worktree (the git root and the
+        // working directory are that repository then).
         string gitRootCanonical = CanonicalRootOrRefuse(gitRoot, $"git root '{gitRoot}'").Path;
         string workingDirectoryCanonical = CanonicalRootOrRefuse(workingDirectory, $"working directory '{workingDirectory}'").Path;
         string runsRootCanonical = CanonicalRootOrRefuse(Path.GetFullPath(_runsRoot), $"runs root '{Path.GetFullPath(_runsRoot)}'").Path;
+        string? invokingRootCanonical = invokingRoot is null ? null : CanonicalRootOrRefuse(invokingRoot, $"invoking repository '{invokingRoot}'").Path;
         string? gatePath = ChainGate.GatePath;
         if (gatePath is not null)
         {
@@ -1111,19 +1228,18 @@ internal sealed class LaunchRun
             {
                 GateTrust.CanonicalPath canonical = GateTrust.Canonical(dir);
                 RefuseUnresolvedCanonical(canonical, $"gate PATH directory '{dir}'");
-                if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
-                {
-                    throw new LaunchException($"gate PATH directory '{dir}' is inside the working tree");
-                }
-
-                if (canonical.Links.FirstOrDefault(link => InsideWorkingTree(link, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical)) is { } via)
-                {
-                    throw new LaunchException($"gate PATH directory '{dir}' resolves into the working tree via '{via}'");
-                }
+                RefuseCanonicalInsideWorkingTree(
+                    canonical,
+                    gitRootCanonical,
+                    workingDirectoryCanonical,
+                    runsRootCanonical,
+                    invokingRootCanonical,
+                    $"gate PATH directory '{dir}'",
+                    $"gate PATH directory '{dir}' is inside the working tree");
             }
         }
 
-        RefuseGatePathListingDangers(gitRootCanonical, workingDirectoryCanonical, runsRootCanonical);
+        RefuseGatePathListingDangers(gitRootCanonical, workingDirectoryCanonical, runsRootCanonical, invokingRootCanonical);
     }
 
     /// <summary>
@@ -1137,7 +1253,7 @@ internal sealed class LaunchRun
     /// entry whose own canonical resolution gives up (a link loop, too many links), which like an
     /// unreadable directory is invisible to the later entry comparison.
     /// </summary>
-    private void RefuseGatePathListingDangers(string gitRootCanonical, string workingDirectoryCanonical, string runsRootCanonical)
+    private void RefuseGatePathListingDangers(string gitRootCanonical, string workingDirectoryCanonical, string runsRootCanonical, string? invokingRootCanonical)
     {
         if (GatePathNames is null)
         {
@@ -1173,28 +1289,50 @@ internal sealed class LaunchRun
                     throw new LaunchException($"gate PATH entry '{entryPath}' cannot be resolved: {canonical.Unreadable}");
                 }
 
-                if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical))
-                {
-                    throw new LaunchException($"gate PATH entry '{entryPath}' links into the working tree: {target}");
-                }
-
-                if (canonical.Links.FirstOrDefault(link => InsideWorkingTree(link, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical)) is { } via)
-                {
-                    throw new LaunchException($"gate PATH entry '{entryPath}' resolves into the working tree via '{via}'");
-                }
+                RefuseCanonicalInsideWorkingTree(
+                    canonical,
+                    gitRootCanonical,
+                    workingDirectoryCanonical,
+                    runsRootCanonical,
+                    invokingRootCanonical,
+                    $"gate PATH entry '{entryPath}'",
+                    $"gate PATH entry '{entryPath}' links into the working tree: {target}");
             }
         }
     }
 
     /// <summary>
-    /// Whether <paramref name="path"/> (canonical) is at or under any of the three canonical roots
-    /// the round-1 refusal judges the gate PATH by.
+    /// Whether <paramref name="path"/> (canonical) is at or under any of the canonical roots the
+    /// round-1 refusal judges the gate PATH by: the git root, the working directory, the runs root —
+    /// and the invoking repository when the run owns a worktree (null otherwise).
     /// </summary>
-    private static bool InsideWorkingTree(string path, string gitRoot, string workingDirectory, string runsRoot)
+    private static bool InsideWorkingTree(string path, string gitRoot, string workingDirectory, string runsRoot, string? invokingRoot)
     {
         return GateTrust.IsAtOrUnder(path, gitRoot)
             || GateTrust.IsAtOrUnder(path, workingDirectory)
-            || GateTrust.IsAtOrUnder(path, runsRoot);
+            || GateTrust.IsAtOrUnder(path, runsRoot)
+            || (invokingRoot is not null && GateTrust.IsAtOrUnder(path, invokingRoot));
+    }
+
+    /// <summary>
+    /// The round-1 refusal shared by a gate PATH directory and a listing entry: the canonical path
+    /// itself, or any link on the way to it, at or under the working tree is a launch error —
+    /// <paramref name="insideMessage"/> names the first case, <paramref name="label"/> the path in
+    /// the "resolves into the working tree" message.
+    /// </summary>
+    private static void RefuseCanonicalInsideWorkingTree(GateTrust.CanonicalPath canonical, string gitRootCanonical, string workingDirectoryCanonical, string runsRootCanonical, string? invokingRootCanonical, string label, string insideMessage)
+    {
+        if (InsideWorkingTree(canonical.Path, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical, invokingRootCanonical))
+        {
+            throw new LaunchException(insideMessage);
+        }
+
+        if (canonical.Links.FirstOrDefault(link => InsideWorkingTree(link, gitRootCanonical, workingDirectoryCanonical, runsRootCanonical, invokingRootCanonical)) is not { } via)
+        {
+            return;
+        }
+
+        throw new LaunchException($"{label} resolves into the working tree via '{via}'");
     }
 
     /// <summary>
@@ -2038,7 +2176,28 @@ internal sealed class LaunchRun
             return;
         }
 
-        await w.WriteLineAsync($"files:    {_changed.Count} changed in the working tree{(_outOfScope is null ? " (no write scope given)" : $", {_outOfScope.Count} outside the write scope")}").ConfigureAwait(false);
+        await w.WriteLineAsync($"files:    {_changed.Count} changed in the working tree{FilesTail(ic)}").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The tail of the files line. With a write scope: how many changed files are outside it.
+    /// Without one: the invoking repository's changes (--worktree) — never "outside the write
+    /// scope", there is no scope to be outside of — or the plain no-scope note when nothing was
+    /// reported.
+    /// </summary>
+    private string FilesTail(CultureInfo ic)
+    {
+        if (_writeScope is not null)
+        {
+            return string.Create(ic, $", {_outOfScope!.Count} outside the write scope");
+        }
+
+        if (_outOfScope is { Count: > 0 } invokingOnly)
+        {
+            return $", {invokingOnly.Count} changed in the invoking repository";
+        }
+
+        return " (no write scope given)";
     }
 
     /// <summary>
@@ -2108,7 +2267,10 @@ internal sealed class LaunchRun
         }
 
         string extras = _outOfScope.Count > 5 ? string.Create(CultureInfo.InvariantCulture, $" (+{_outOfScope.Count - 5} more, see summary.json)") : string.Empty;
-        await Console.Out.WriteLineAsync($"WARNING:  {_outOfScope.Count} file(s) changed outside the write scope: {string.Join(", ", _outOfScope.Take(5))}{extras}. Check them before accepting the run.").ConfigureAwait(false);
+        // Without a write scope the list holds only the invoking repository's changes (--worktree),
+        // so the warning names them for what they are instead of "outside the write scope".
+        string what = _writeScope is null ? "file(s) changed in the invoking repository" : "file(s) changed outside the write scope";
+        await Console.Out.WriteLineAsync($"WARNING:  {_outOfScope.Count} {what}: {string.Join(", ", _outOfScope.Take(5))}{extras}. Check them before accepting the run.").ConfigureAwait(false);
     }
 
     private async Task PrintReportAsync()

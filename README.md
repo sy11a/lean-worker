@@ -534,9 +534,18 @@ beyond the base, and the branch still at the commit it was created from — and 
 case, naming the path and the reason in the result block and in `summary.json`. Nothing is ever
 removed by force: the launcher deletes the files it copied in itself, asks git to remove the worktree
 (a refusal keeps the worktree and names the reason) and deletes the branch with a compare-and-delete,
-so a branch that moved stays. Ignored files (the build output of the run) are discarded with the
-worktree; the reason says how many there were — so the worktrees a run leaves behind are the ones a
-human still has to look at, and `sweep-worktrees` has nothing of the run's own to sweep.
+so a branch that moved stays. A copied path that is not a plain path inside the worktree — a symlink
+on the way to it, or one whose full path leaves the worktree — stops the cleanup: nothing is read or
+deleted through it, the worktree stays (reason `changes`) and a note names the path; a symlink the
+base itself tracks at such a path refuses the launch before the worker runs. While a run owns a
+worktree the repository the launcher was called in is watched too: a gate PATH directory at or under
+it is refused like one inside the worktree, and every file that changes there while the worker runs —
+changes made by others in the invoking repository just as much as any other — is reported beside the
+other out-of-scope writes, prefixed `<invoking>/`; the launcher's own run directories (earlier runs'
+included) and the ledger are excepted from the watch. Ignored files (the build output of the run)
+are discarded with the worktree; the reason says how many there were — so the worktrees a run leaves
+behind are the ones a human still has to look at, and `sweep-worktrees` has nothing of the run's own
+to sweep.
 
 Exit codes:
 - `0`: success. With a gate, the gate is clean.
