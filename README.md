@@ -523,6 +523,21 @@ Other commands (same `dotnet run ... --` prefix): `quota`, `cost`, `stats`, `pri
 `REMOVE|KEEP <reason> <path>`; a dry run without `--apply`), and
 `hook`, which the launcher installs into workers itself.
 
+A run can own its worktree: `--worktree <branch>` creates a worktree of the repository beside it —
+named after the repository and the run, so `--name` is required — branches it from `--worktree-base`
+(the default branch of `origin` by default; the base is resolved to a commit once, in the repository
+the launcher was called in) and copies the `.lean-worker` setup into it. The worker, the write scope
+and the gate then work in that worktree, while the run directory and `runs.jsonl` stay in the
+repository the launcher was called in, so the ledger holds one row per run. After the worker the
+launcher removes the worktree and its branch when the run left nothing behind — no change, no commit
+beyond the base, and the branch still at the commit it was created from — and keeps it in every other
+case, naming the path and the reason in the result block and in `summary.json`. Nothing is ever
+removed by force: the launcher deletes the files it copied in itself, asks git to remove the worktree
+(a refusal keeps the worktree and names the reason) and deletes the branch with a compare-and-delete,
+so a branch that moved stays. Ignored files (the build output of the run) are discarded with the
+worktree; the reason says how many there were — so the worktrees a run leaves behind are the ones a
+human still has to look at, and `sweep-worktrees` has nothing of the run's own to sweep.
+
 Exit codes:
 - `0`: success. With a gate, the gate is clean.
 - `1`: the worker reported an error or failed.
@@ -578,6 +593,7 @@ Exit codes:
 - quota before and after the run, and the percentage it used, on a subscription with a quota adapter;
 - the next model the run offered (`escalate_to`), if any;
 - the write scope, the files the run changed in the git working tree, and those outside the scope;
+- the worktree the run owned (`worktree`: its path, its branch, whether it was removed or kept and why), when it had one;
 - the evidence lines (`evidence_lines`): the same facts the report's evidence block carries, one string per line.
 
 Each row carries `schema_version` (currently 1). Fields may be added within a version. The version goes up

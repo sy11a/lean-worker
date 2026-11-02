@@ -620,9 +620,10 @@ internal static class WorktreeSweep
 
     /// <summary>
     /// The branch the worktrees are compared against: the default branch of origin, as origin/HEAD names it,
-    /// or origin/main or origin/master when origin/HEAD is not set.
+    /// or origin/main or origin/master when origin/HEAD is not set. Shared with the launcher, which
+    /// branches a new worktree from the same branch.
     /// </summary>
-    private static async Task<string?> DefaultBranchAsync(string repo)
+    internal static async Task<string?> DefaultBranchAsync(string repo)
     {
         string? head = await Git.RunAsync(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").ConfigureAwait(false);
         string? name = head?.Trim();

@@ -32,6 +32,11 @@ internal sealed class Options
           --prices <file>            price file merged over the shipped and user ones (default <runs-root>/prices.json)
           --permission-mode <mode>   acceptEdits | dontAsk | plan | manual | auto | bypassPermissions
           --runs-root <dir>          default .lean-worker
+          --worktree <branch>        run the worker in a new worktree of this repository, created from
+                                     --worktree-base (needs --name); the worktree is removed again when
+                                     the run leaves it empty
+          --worktree-base <ref>      the ref the new worktree is branched from (default: the default
+                                     branch of origin, the one the sweep compares the worktrees against)
           --claude-settings <file>   passed to claude as --settings (e.g. an apiKeyHelper for --bare)
           --timeout-minutes <n>      kill the worker after n minutes (default 60)
           --report-max-chars <n>     truncate the printed report (default 6000)
@@ -106,10 +111,14 @@ internal sealed class Options
     public bool Help;
     public string Mode = "auto";
 
+    // The worktree the run owns (--worktree): the branch and the ref it is branched from.
+    public string? Worktree;
+    public string? WorktreeBase;
+
     public static Options Parse(string[] args)
     {
         Options o = new();
-        ArgReader.Read(args, (arg, next) => o.TrySetText(arg, next) || o.TrySetParsed(arg, next) || o.TrySetFlag(arg));
+        ArgReader.Read(args, (arg, next) => o.TrySetText(arg, next) || o.TrySetWorktree(arg, next) || o.TrySetParsed(arg, next) || o.TrySetFlag(arg));
 
         return o;
     }
@@ -134,6 +143,20 @@ internal sealed class Options
             case "--claude-settings": { ClaudeSettings = next(); return true; }
             case "--mode": { Mode = next(); return true; }
             case "--cache-ttl": { CacheTtl = next(); return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The worktree options: the branch the run owns and the ref it is branched from.
+    /// </summary>
+    private bool TrySetWorktree(string arg, Func<string> next)
+    {
+        switch (arg)
+        {
+            case "--worktree": { Worktree = next(); return true; }
+            case "--worktree-base": { WorktreeBase = next(); return true; }
         }
 
         return false;

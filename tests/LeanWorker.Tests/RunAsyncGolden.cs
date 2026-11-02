@@ -39,7 +39,7 @@ internal static partial class RunAsyncGolden
         "schema_version", "timestamp", "name", "run_dir", "profile", "runtime", "provider", "model", "model_reason", "effort",
         "mode", "billing", "cache_ttl", "hooks", "status", "subtype", "terminal_reason", "exit_code", "num_turns", "api_calls",
         "duration_ms", "total_cost_usd", "reported_cost_usd", "budget_usd", "wrap_up_usd", "wrapped_up", "hook_checks",
-        "continued_from", "escalate_to", "gate", "model_traits", "tokens", "context_first_call", "first_call_cache_read",
+        "continued_from", "escalate_to", "worktree", "gate", "model_traits", "tokens", "context_first_call", "first_call_cache_read",
         "first_call_cache_read_share", "context_peak", "permission_denials", "write_scope", "changed_files", "out_of_scope",
         "session_id", "quota_before", "quota_after", "quota_used_pct", "notes", "evidence_lines",
     ];
