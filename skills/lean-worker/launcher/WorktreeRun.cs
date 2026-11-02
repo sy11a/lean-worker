@@ -753,13 +753,9 @@ internal sealed class WorktreeRun
             }
         }
 
-        string system = Path.Combine(setup, "system");
-        if (Directory.Exists(system))
+        foreach (string file in FileTree.FilesUnder(setup, "system"))
         {
-            foreach (string file in Directory.EnumerateFiles(system, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
-            {
-                files.Add(new SetupFile(Relative(setup, file), file));
-            }
+            files.Add(new SetupFile(Relative(setup, file), file));
         }
 
         foreach (string file in Directory.EnumerateFiles(setup, "code-*.md").Order(StringComparer.Ordinal))

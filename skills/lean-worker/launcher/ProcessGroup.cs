@@ -1,6 +1,10 @@
 // The process group of the worker: setsid gives the worker a session (and with it a process group)
 // of its own, and the launcher signals that group after the worker exits.
+//
+// Nothing here calls into libc: the group a process is in is read from /proc, and the signal to a
+// group is sent by the kill program, by its full path.
 
+using System.Diagnostics;
 using System.Globalization;
 
 namespace LeanWorker;
@@ -30,8 +34,19 @@ internal static class ProcessGroup
     /// </summary>
     internal const string UnknownNote = "process-group: unknown";
 
-    internal const int Sigkill = 9;
-    internal const int Sigterm = 15;
+    /// <summary>
+    /// The signals the group gets: first the one that asks its members to stop, then the one that
+    /// leaves nothing behind.
+    /// </summary>
+    private const string Sigterm = "TERM";
+
+    private const string Sigkill = "KILL";
+
+    /// <summary>
+    /// The kill program by its full paths, in the order they are tried: a bare name would be
+    /// looked up in the PATH, which the worker and the profile's PATH can change.
+    /// </summary>
+    private static readonly string[] _killPaths = ["/usr/bin/kill", "/bin/kill"];
 
     /// <summary>
     /// The number of checks of a group that did not go on SIGTERM: fifty steps of a tenth of a
@@ -45,9 +60,17 @@ internal static class ProcessGroup
     private static readonly TimeSpan _waitStep = TimeSpan.FromMilliseconds(100);
 
     /// <summary>
-    /// Whether the worker can get a process group of its own: Linux with setsid in /usr/bin.
+    /// How long the launcher waits for the kill program before it stops waiting for it.
     /// </summary>
-    public static bool Available => !OperatingSystem.IsWindows() && File.Exists(SetsidPath);
+    private const int KillTimeoutMs = 10_000;
+
+    /// <summary>
+    /// Whether the worker can get a process group of its own: Linux with /proc, setsid in /usr/bin
+    /// and a kill program to signal the group with. Without the kill program the group could not
+    /// be emptied, so there is no group to speak of.
+    /// </summary>
+    public static bool Available =>
+        !OperatingSystem.IsWindows() && Directory.Exists("/proc") && File.Exists(SetsidPath) && KillPath() is not null;
 
     /// <summary>
     /// The group the worker leads: the id of the group it is in. It is read from /proc, so it is
@@ -102,7 +125,7 @@ internal static class ProcessGroup
             return alive;
         }
 
-        Signal(pgid, Sigterm);
+        await SignalAsync(pgid, Sigterm).ConfigureAwait(false);
         for (int step = 0; step < WaitSteps && Alive(pgid) > 0; step++)
         {
             await Task.Delay(_waitStep, TimeProvider.System, CancellationToken.None).ConfigureAwait(false);
@@ -110,7 +133,7 @@ internal static class ProcessGroup
 
         if (Alive(pgid) > 0)
         {
-            Signal(pgid, Sigkill);
+            await SignalAsync(pgid, Sigkill).ConfigureAwait(false);
         }
 
         return alive;
@@ -144,34 +167,83 @@ internal static class ProcessGroup
     }
 
     /// <summary>
-    /// A signal to a whole group: the negative pid addresses the group, not one process.
+    /// A signal to a whole group: the negative pid addresses the group, not one process. The kill
+    /// program sends the signal — by its full path, with the group as its argument and without a
+    /// shell around it.
     /// </summary>
-    private static void Signal(int pgid, int sig)
+    private static async Task SignalAsync(int pgid, string signal)
     {
+        string? kill = KillPath();
+        if (kill is null)
+        {
+            // No kill program: nothing can be signalled.
+            return;
+        }
+
+        ProcessStartInfo psi = new(kill) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+        psi.ArgumentList.Add("-s");
+        psi.ArgumentList.Add(signal);
+        psi.ArgumentList.Add("--");
+        psi.ArgumentList.Add("-" + pgid.ToString(CultureInfo.InvariantCulture));
+
         try
         {
-            _ = NativeMethods.Kill(-pgid, sig);
+            using Process? p = Process.Start(psi);
+            if (p is null)
+            {
+                return;
+            }
+
+            // The kill program says what it could not do on its error stream: both streams are
+            // read to their end, so the launcher waits for the program and not for a pipe.
+            Task<string> output = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            Task<string> error = p.StandardError.ReadToEndAsync(CancellationToken.None);
+            if (!p.WaitForExit(KillTimeoutMs))
+            {
+                try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                return;
+            }
+
+            _ = await Task.WhenAll(output, error).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or IOException)
         {
-            // No libc: nothing can be signalled.
+            // The kill program could not be run: nothing can be signalled.
         }
+    }
+
+    /// <summary>
+    /// The kill program by its full path: /usr/bin/kill, else /bin/kill. Null when there is none.
+    /// </summary>
+    private static string? KillPath()
+    {
+        foreach (string path in _killPaths)
+        {
+            if (File.Exists(path))
+            {
+                return path;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
     /// The launcher's own process group: the one that is never signalled, whatever the worker
     /// claims. -1 when it cannot be read.
     /// </summary>
-    private static int OwnGroup()
+    private static int OwnGroup() => GroupOf(Environment.ProcessId);
+
+    /// <summary>
+    /// The group a process is in: the pgrp of its stat line in /proc — the fifth field of the
+    /// line, counted after the closing parenthesis of the command name (the name may hold spaces
+    /// and parentheses of its own). -1 when it cannot be told: the process is gone or its line
+    /// cannot be read.
+    /// </summary>
+    public static int GroupOf(int pid)
     {
-        try
-        {
-            return NativeMethods.GetPgid(0);
-        }
-        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
-        {
-            return -1;
-        }
+        ProcStat? stat = Stat(pid);
+        return stat?.Pgrp ?? -1;
     }
 
     /// <summary>
@@ -206,8 +278,10 @@ internal static class ProcessGroup
     private readonly record struct ProcStat(char State, int Ppid, int Pgrp, int Sid);
 
     /// <summary>
-    /// The stat line of a process, read from /proc. Null when the process is gone or its line
-    /// cannot be read.
+    /// The stat line of a process, read from /proc: its state (the third field of the line), its
+    /// parent (the fourth), its process group (the fifth) and its session (the sixth) — counted
+    /// after the command name, which sits in parentheses and may hold spaces and parentheses of
+    /// its own. Null when the process is gone or its line cannot be read.
     /// </summary>
     private static ProcStat? Stat(int pid)
     {

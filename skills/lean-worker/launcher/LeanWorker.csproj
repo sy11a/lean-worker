@@ -9,8 +9,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- The launcher's libc calls (the signal to a process group) are declared with LibraryImport. -->
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>LeanWorker</AssemblyName>
     <RootNamespace>LeanWorker</RootNamespace>
   </PropertyGroup>

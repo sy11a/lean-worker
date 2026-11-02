@@ -38,13 +38,9 @@ internal static class GitMetadata
             files[Label(config, labelBase)] = await HashAsync(config).ConfigureAwait(false);
         }
 
-        string hooks = Path.Combine(commonDir, "hooks");
-        if (Directory.Exists(hooks))
+        foreach (string file in FileTree.FilesUnder(commonDir, "hooks"))
         {
-            foreach (string file in Directory.EnumerateFiles(hooks, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
-            {
-                files[Label(file, labelBase)] = await HashAsync(file).ConfigureAwait(false);
-            }
+            files[Label(file, labelBase)] = await HashAsync(file).ConfigureAwait(false);
         }
 
         // The worktree's own config: it lives in the per-worktree git dir and only exists when the

@@ -60,15 +60,8 @@ internal static class EvidenceBlock
     /// The git-tamper lines: one per file of the repository's own git metadata (the config, the
     /// hooks, the worktree's own config) the run changed. The run had no business there.
     /// </summary>
-    private static List<string> GitTamperLines(IReadOnlyList<string>? gitTamper)
-    {
-        if (gitTamper is null || gitTamper.Count is 0)
-        {
-            return [];
-        }
-
-        return [.. gitTamper.Select(path => $"- git-tamper: {OneLine(path)}")];
-    }
+    private static List<string> GitTamperLines(IReadOnlyList<string>? gitTamper) =>
+        PathLines(gitTamper, "git-tamper");
 
     /// <summary>
     /// The leftovers line: how many processes of the worker's own group were still alive when the
@@ -83,14 +76,21 @@ internal static class EvidenceBlock
     /// could not tell whether the run changed it. The run says so instead of counting the path as
     /// unchanged.
     /// </summary>
-    private static List<string> UnverifiedLines(IReadOnlyList<string>? unverified)
+    private static List<string> UnverifiedLines(IReadOnlyList<string>? unverified) =>
+        PathLines(unverified, "unverified");
+
+    /// <summary>
+    /// The lines of one kind of path: one line per path, each of them named by its kind, and none
+    /// when there is no path to name.
+    /// </summary>
+    private static List<string> PathLines(IReadOnlyList<string>? paths, string kind)
     {
-        if (unverified is null || unverified.Count is 0)
+        if (paths is null || paths.Count is 0)
         {
             return [];
         }
 
-        return [.. unverified.Select(path => $"- unverified: {OneLine(path)}")];
+        return [.. paths.Select(path => $"- {kind}: {OneLine(path)}")];
     }
 
     /// <summary>
