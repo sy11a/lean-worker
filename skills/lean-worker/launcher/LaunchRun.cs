@@ -19,7 +19,19 @@ internal sealed class LaunchRun
     // continue-from run dir, else that directory itself. Every anchor that used to read the
     // launcher's own working directory reads this instead — the worker's cwd/PWD, the write-scope
     // snapshot, the <repo> token, gate command resolution and the gate child's cwd.
+    // With --worktree it becomes the worktree the run owns: the worker, the write scope and the
+    // gate work there, while the run directory and the ledger stay in the repository the launcher
+    // was called in.
     private string _workspaceRoot = string.Empty;
+
+    // The repository the launcher was called in: the worktree is created there and removed from
+    // there, and the run's own bookkeeping (the run directory, the ledger) stays there.
+    private string _invokingRoot = string.Empty;
+
+    // The worktree this run owns (--worktree): created before the worker starts, and removed again
+    // when the run leaves nothing behind. It carries what became of it, which the summary and the
+    // evidence block record.
+    private WorktreeRun? _worktree;
 
     // ResolveSettings (price book + runtime + chain)
     private PriceBook? _prices;
@@ -201,25 +213,37 @@ internal sealed class LaunchRun
 
     public async Task<int> RunAsync()
     {
-        await ResolveWorkspaceAsync().ConfigureAwait(false);
-        await LoadProfileAsync().ConfigureAwait(false);
-        ResolveSettings();
-        await ValidateInputsAsync().ConfigureAwait(false);
-        PickModel();
-        ApplyModelTraits();
-        await ResolveRepoTokenAsync().ConfigureAwait(false);
-        ResolveMode();
-        await SnapshotTrustAsync().ConfigureAwait(false);
-        await PrepareTaskAsync().ConfigureAwait(false);
-        await WriteSystemAsync().ConfigureAwait(false);
-        await ExecuteAsync().ConfigureAwait(false);
-        _status = Status();
-        await RunGateAsync().ConfigureAwait(false);
-        await ComputeSummaryStatsAsync().ConfigureAwait(false);
-        BuildSummary();
-        await WriteSummaryAsync().ConfigureAwait(false);
-        await PrintAsync().ConfigureAwait(false);
-        return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
+        try
+        {
+            await ResolveWorkspaceAsync().ConfigureAwait(false);
+            await LoadProfileAsync().ConfigureAwait(false);
+            await PrepareWorktreeAsync().ConfigureAwait(false);
+            ResolveSettings();
+            await ValidateInputsAsync().ConfigureAwait(false);
+            PickModel();
+            ApplyModelTraits();
+            await ResolveRepoTokenAsync().ConfigureAwait(false);
+            ResolveMode();
+            await SnapshotTrustAsync().ConfigureAwait(false);
+            await PrepareTaskAsync().ConfigureAwait(false);
+            await WriteSystemAsync().ConfigureAwait(false);
+            await ExecuteAsync().ConfigureAwait(false);
+            _status = Status();
+            await RunGateAsync().ConfigureAwait(false);
+            await FinishWorktreeAsync().ConfigureAwait(false);
+            await ComputeSummaryStatsAsync().ConfigureAwait(false);
+            BuildSummary();
+            await WriteSummaryAsync().ConfigureAwait(false);
+            await PrintAsync().ConfigureAwait(false);
+            return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
+        }
+        catch
+        {
+            // A launch that dies leaves no worktree behind either: the same decision as after a
+            // finished run, reported on the error stream (the run's own report is never written).
+            await FinishWorktreeOnFailureAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     // Resolved before everything else: LoadProfileAsync reads a relative --continue-from and
@@ -259,6 +283,79 @@ internal sealed class LaunchRun
         }
 
         _notes.Add($"workspace {_workspaceRoot} (anchored on the task's location; the launcher's own cwd {cwd} is ignored)");
+    }
+
+    /// <summary>
+    /// The worktree the run owns (--worktree): created before the worker starts, and the workspace
+    /// root from then on, so the worker, the write scope and the gate all work in it. The run's own
+    /// bookkeeping stays in the repository the launcher was called in: the run directory, the ledger
+    /// and the profiles are read from there, so the ledger holds one row per run.
+    /// </summary>
+    private async Task PrepareWorktreeAsync()
+    {
+        if (_o.Worktree is null)
+        {
+            return;
+        }
+
+        _invokingRoot = _workspaceRoot;
+        // The setup to copy: the .lean-worker folder of the repository the launcher was called in.
+        string setup = Path.Combine(_invokingRoot, ".lean-worker");
+        _worktree = await Workspace.WorktreeAsync(_o, _invokingRoot, setup, GateContext is not null).ConfigureAwait(false);
+        _workspaceRoot = _worktree.WorktreePath;
+        _notes.Add(EvidenceBlock.OneLine($"worktree {_worktree.WorktreePath} (branch {_worktree.Branch}, from {_worktree.Base})"));
+    }
+
+    /// <summary>
+    /// The worktree after the worker: it goes when it holds no change and its branch no commit
+    /// beyond the base, and it stays otherwise. A gate chain that continues keeps it for the next
+    /// round.
+    /// </summary>
+    private async Task FinishWorktreeAsync()
+    {
+        WorktreeRun? worktree = _worktree;
+        if (worktree is null || worktree.Action.Length > 0)
+        {
+            return;
+        }
+
+        if (LastGate is { Decision: GateChain.Continue })
+        {
+            // The chain continues: the worktree stays for the next round.
+            worktree.KeepForChain();
+            return;
+        }
+
+        await worktree.FinishAsync().ConfigureAwait(false);
+        _notes.AddRange(worktree.Note is { Length: > 0 } note ? [EvidenceBlock.OneLine(note)] : []);
+    }
+
+    /// <summary>
+    /// The worktree after a failed launch: the same decision as after a finished run, so a launch
+    /// that dies before the worker leaves nothing behind either.
+    /// </summary>
+    private async Task FinishWorktreeOnFailureAsync()
+    {
+        WorktreeRun? worktree = _worktree;
+        if (worktree is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (worktree.Action.Length is 0)
+            {
+                await worktree.FinishAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or FormatException)
+        {
+            await Console.Error.WriteLineAsync($"worktree: kept (the decision failed: {EvidenceBlock.OneLine(ex.Message)}) {EvidenceBlock.OneLine(worktree.WorktreePath)}").ConfigureAwait(false);
+            return;
+        }
+
+        await Console.Error.WriteLineAsync($"worktree: {worktree.Action} {EvidenceBlock.OneLine(worktree.Reason)} {EvidenceBlock.OneLine(worktree.WorktreePath)}").ConfigureAwait(false);
     }
 
     private async Task LoadProfileAsync()
@@ -726,7 +823,7 @@ internal sealed class LaunchRun
             OriginalTask = taskText;
             OriginalName = name;
         }
-        string safeName = new([.. name.Select(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '-')]);
+        string safeName = Launcher.SafeName(name);
         _started = DateTimeOffset.Now;
         RunDir = Path.Combine(_runsRoot, "runs", string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"));
         if (GateContext is null)
@@ -1800,6 +1897,7 @@ internal sealed class LaunchRun
             ["hook_checks"] = _hookChecks,
             ["continued_from"] = _o.ContinueFrom is not null && GateContext is null ? Path.GetFullPath(_o.ContinueFrom) : null,
             ["escalate_to"] = _next,
+            ["worktree"] = BuildWorktreeSection(),
             ["gate"] = BuildGateSection(),
             ["model_traits"] = _traits?.Key,
             ["tokens"] = _tok,
@@ -1824,6 +1922,26 @@ internal sealed class LaunchRun
     {
         if (!AliasResolved) { return; }
         _summary["model_requested"] = _model;
+    }
+
+    /// <summary>
+    /// The worktree section of the summary: the path, the branch, what became of it and why. Null
+    /// for a run without a worktree.
+    /// </summary>
+    private JsonNode? BuildWorktreeSection()
+    {
+        if (_worktree is null)
+        {
+            return null;
+        }
+
+        return new JsonObject
+        {
+            ["path"] = _worktree.WorktreePath,
+            ["branch"] = _worktree.Branch,
+            ["action"] = _worktree.Action,
+            ["reason"] = _worktree.Reason,
+        };
     }
 
     private JsonNode? BuildGateSection()
@@ -1913,12 +2031,28 @@ internal sealed class LaunchRun
             await w.WriteLineAsync($"quota:    {_quotaAfter.Line(_quotaBefore)}").ConfigureAwait(false);
         }
 
+        await PrintWorktreeAsync().ConfigureAwait(false);
+
         if (_changed is null)
         {
             return;
         }
 
         await w.WriteLineAsync($"files:    {_changed.Count} changed in the working tree{(_outOfScope is null ? " (no write scope given)" : $", {_outOfScope.Count} outside the write scope")}").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The worktree line of the result block: what became of the worktree the run owned and where
+    /// it is. A run without a worktree prints no line.
+    /// </summary>
+    private async Task PrintWorktreeAsync()
+    {
+        if (_worktree is null)
+        {
+            return;
+        }
+
+        await Console.Out.WriteLineAsync($"worktree: {_worktree.Action} {EvidenceBlock.OneLine(_worktree.Reason)} {EvidenceBlock.OneLine(_worktree.WorktreePath)}").ConfigureAwait(false);
     }
 
     private string? FormatGateLine(CultureInfo ic)

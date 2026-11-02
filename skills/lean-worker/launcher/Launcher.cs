@@ -352,6 +352,14 @@ internal static class Launcher
         return Convert.ToHexString(hash, 0, 6).ToLowerInvariant();
     }
 
+    /// <summary>
+    /// A run name that is safe in a path: the letters, digits, dots, underscores and dashes of the
+    /// name itself, every other character a dash. The run directory and the worktree of a run are
+    /// named after it.
+    /// </summary>
+    internal static string SafeName(string name) =>
+        new([.. name.Select(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '-')]);
+
     internal static async Task<int> CountLinesAsync(string path)
     {
         int n = 0;

@@ -3,6 +3,11 @@
 // launcher command; a wrong working directory (a typo'd cd, a konsole that fell back to $HOME on a
 // missing --workdir) must not silently become the worker's project directory — opencode reads it
 // from PWD — or the anchor the write scope is resolved against.
+//
+// With --worktree the workspace is a worktree of the repository instead of the repository itself:
+// the launcher creates it, copies the setup into it and removes it again when the run leaves it
+// empty. The run's own bookkeeping (the run directory, the ledger) stays in the repository the
+// launcher was called in.
 
 namespace LeanWorker;
 
@@ -21,6 +26,33 @@ internal static class Workspace
     {
         string? root = await RepoToken.RootAsync(anchorDir).ConfigureAwait(false);
         return root ?? cwd;
+    }
+
+    /// <summary>
+    /// The worktree a run owns (--worktree): created in the parent folder of the repository, named
+    /// after the repository and the run, with the setup of the repository (<paramref name="setup"/>)
+    /// copied into it. The worker, the write scope and the gate work in it, so it is the workspace
+    /// root of the run. A later round of the gate chain reuses the worktree the first round created
+    /// (<paramref name="reuse"/>).
+    /// </summary>
+    public static async Task<WorktreeRun> WorktreeAsync(Options o, string repoRoot, string setup, bool reuse)
+    {
+        (string branch, string name, string baseRef) = await WorktreeFactsAsync(o, repoRoot).ConfigureAwait(false);
+        return reuse
+            ? await WorktreeRun.ReuseAsync(repoRoot, branch, baseRef, name, setup).ConfigureAwait(false)
+            : await WorktreeRun.CreateAsync(repoRoot, branch, baseRef, name, setup).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The facts a worktree is built from: the branch it checks out, the name of the run (its
+    /// folder is named after it) and the ref it is branched from.
+    /// </summary>
+    private static async Task<(string Branch, string Name, string Base)> WorktreeFactsAsync(Options o, string repoRoot)
+    {
+        string branch = o.Worktree ?? throw new LaunchException("--worktree needs a branch");
+        string name = o.Name ?? throw new LaunchException("--worktree needs --name <name>: the worktree's folder is named after the run");
+        string baseRef = await WorktreeRun.BaseRefAsync(repoRoot, o.WorktreeBase).ConfigureAwait(false);
+        return (branch, name, baseRef);
     }
 
     /// <summary>

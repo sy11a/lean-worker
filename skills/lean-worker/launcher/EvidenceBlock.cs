@@ -45,6 +45,7 @@ internal static class EvidenceBlock
         ];
         lines.AddRange(GateLines(summary["gate"] as JsonObject));
         lines.AddRange(ChangedLines(summary));
+        lines.AddRange(WorktreeLines(summary["worktree"] as JsonObject));
         return lines;
     }
 
@@ -187,12 +188,29 @@ internal static class EvidenceBlock
     }
 
     /// <summary>
+    /// The worktree line: what became of the worktree the run owned — its action, its reason and
+    /// its path. A run without a worktree has no line.
+    /// </summary>
+    private static List<string> WorktreeLines(JsonObject? worktree)
+    {
+        if (worktree is null)
+        {
+            return [];
+        }
+
+        string action = OneLine(Json.Str(worktree, "action") ?? "(none)");
+        string reason = OneLine(Json.Str(worktree, "reason") ?? "(none)");
+        string path = OneLine(Json.Str(worktree, "path") ?? "(none)");
+        return [$"- worktree: {action} {reason} {path}"];
+    }
+
+    /// <summary>
     /// A value on one line: every character that could end the line — a carriage return, a line feed,
     /// any other control character, and the line and paragraph separators — becomes the two characters
     /// <c>\n</c>. A path from <c>git status -z</c> or a message from a gate can carry a newline, and
     /// without this it would start a line of its own in the block.
     /// </summary>
-    private static string OneLine(string value)
+    internal static string OneLine(string value)
     {
         StringBuilder sb = new(value.Length);
         foreach (char c in value)
