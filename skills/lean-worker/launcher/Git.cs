@@ -15,6 +15,9 @@ internal static class Git
     /// them): the fsmonitor hook and the hooks path are switched off. A worker that changed the
     /// repository's own config (core.fsmonitor, core.hooksPath) or wrote a hook of its own would
     /// otherwise have the launcher's own git calls — and the operator's next session — run it.
+    /// These options stop the fsmonitor and the hooks only: a clean filter the worker planted
+    /// (filter.&lt;x&gt;.clean) still runs under `git status`, which is why a run whose git
+    /// metadata changed skips the git-status pass altogether (LaunchRun.SnapshotChangedAsync).
     /// </summary>
     private static readonly string[] _safe = ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"];
 

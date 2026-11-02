@@ -1,5 +1,3 @@
-using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -15,9 +13,11 @@ namespace LeanWorker;
 internal static class WriteScope
 {
     /// <summary>
-    /// The dirty files of a working tree: path relative to the repository root → content hash.
+    /// The dirty files of a working tree: path relative to the repository root → content hash. A
+    /// snapshot of the repository's own git metadata carries the git dirs it was taken over as well
+    /// (<see cref="GitDirs"/>): the after pass hashes exactly those dirs and runs no git at all.
     /// </summary>
-    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty);
+    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty, GitMetadata.Dirs? GitDirs = null);
 
     /// <summary>
     /// Null when <paramref name="cwd"/> is not inside a git working tree (or git is missing). The
@@ -62,86 +62,54 @@ internal static class WriteScope
                 }
 
                 string full = Path.Combine(root, path);
-                dirty[path] = File.Exists(full) ? await HashAsync(full).ConfigureAwait(false) : "-";
+                dirty[path] = File.Exists(full) ? await FileHash.OfAsync(full).ConfigureAwait(false) : "-";
             }
         }
         return new Snapshot(root, dirty);
     }
 
     /// <summary>
-    /// The snapshot of the git metadata of a working tree: the config and the hooks of the common
-    /// git dir and the worktree's own config, hashed by name (".git/config" → its hash). The
-    /// write scope never sees them — it is git-status based — so they are watched on their own
-    /// (issue #114). The snapshot has the shape of every other one: the tree it was taken in and
-    /// the hash of every watched file. Null when the tree is not a git tree (or git is missing).
+    /// The snapshot of the git metadata of a working tree: the git dirs git resolves and the hashes
+    /// of the watched files (the config, the hooks, the attributes file, the per-worktree config
+    /// and the files that redirect a worktree to its git dir). The write scope never sees them — it
+    /// is git-status based — so they are watched on their own (issue #114). Null when the tree is
+    /// not a git tree (or git is missing).
     /// </summary>
     public static async Task<Snapshot?> TakeGitMetadataAsync(string dir, string labelBase)
     {
-        Dictionary<string, string>? files = await GitMetadata.TakeAsync(dir, labelBase).ConfigureAwait(false);
-        return files is null ? null : new Snapshot(dir, files);
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(dir).ConfigureAwait(false);
+        return dirs is null ? null : await TakeGitMetadataAsync(dirs, dir, labelBase).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The content hash of a file that the listing showed as present: a file that cannot be read
-    /// (no permission, a directory in its way, an I/O error), or one that vanished between the
-    /// listing and this read, is recorded by its metadata instead of throwing — an unreadable
-    /// file must not crash the run. The marker differs from every real hash (and from <c>-</c>,
-    /// deleted), so a file that is readable in only one of the two snapshots is reported as
-    /// changed; a file unreadable in both snapshots is only equal when its metadata is equal, and
-    /// is then reported as unverified (<see cref="Unverified"/>).
+    /// The same snapshot, taken again over the git dirs the before pass resolved: no git call at
+    /// all, so a worker that rewrote the git dirs (the commondir, the gitdir file) cannot make the
+    /// after pass hash the copy it made — the redirect itself is a watched file.
     /// </summary>
-    private static async Task<string> HashAsync(string full)
+    public static async Task<Snapshot?> TakeGitMetadataAsync(Snapshot before, string labelBase)
     {
-        try
-        {
-            return Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(full, CancellationToken.None).ConfigureAwait(false)));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return Unreadable(full);
-        }
+        GitMetadata.Dirs? dirs = before.GitDirs;
+        return dirs is null ? null : await TakeGitMetadataAsync(dirs, before.Root, labelBase).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The entry of a file the launcher could not read: the marker <c>"?"</c> plus the metadata
-    /// that is still readable — the size, the mtime (in ticks) and the unix mode. A file that
-    /// changed while it stayed unreadable (a write that kept the mode) changes its size or its
-    /// mtime, so it counts as changed instead of slipping through as unchanged. When even the
-    /// metadata cannot be read, the entry is the bare marker: nothing could be told about the
-    /// file at all.
+    /// The hashes of the watched files of the two git dirs.
     /// </summary>
-    private static string Unreadable(string full)
+    private static async Task<Snapshot?> TakeGitMetadataAsync(GitMetadata.Dirs dirs, string root, string labelBase)
     {
-        try
-        {
-            FileInfo info = new(full);
-            return string.Create(CultureInfo.InvariantCulture, $"?|{info.Length}|{File.GetLastWriteTimeUtc(full).Ticks}|{Mode(full)}");
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return "?";
-        }
+        Dictionary<string, string>? files = await GitMetadata.HashAsync(dirs, labelBase).ConfigureAwait(false);
+        return files is null ? null : new Snapshot(root, files, dirs);
     }
 
     /// <summary>
-    /// The unix mode of a file, or <c>"-"</c> where the platform has none (Windows) or the mode
-    /// cannot be read.
+    /// The watched files that were readable before the run and cannot be read after it: the
+    /// launcher cannot tell whether the run changed them.
     /// </summary>
-    private static string Mode(string full)
+    public static List<string> UnreadableNow(Snapshot before, Snapshot after)
     {
-        if (OperatingSystem.IsWindows())
-        {
-            return "-";
-        }
-
-        try
-        {
-            return ((int)File.GetUnixFileMode(full)).ToString(CultureInfo.InvariantCulture);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return "-";
-        }
+        return [.. after.Dirty.Keys.Intersect(before.Dirty.Keys, StringComparer.Ordinal)
+            .Where(p => !FileHash.IsUnreadable(before.Dirty[p]) && FileHash.IsUnreadable(after.Dirty[p]))
+            .Order(StringComparer.Ordinal),];
     }
 
     /// <summary>
@@ -152,17 +120,22 @@ internal static class WriteScope
     public static List<string> Unverified(Snapshot before, Snapshot after)
     {
         return [.. before.Dirty.Keys.Intersect(after.Dirty.Keys, StringComparer.Ordinal)
-            .Where(p => before.Dirty[p] == after.Dirty[p] && before.Dirty[p].StartsWith('?'))
+            .Where(p => before.Dirty[p] == after.Dirty[p] && FileHash.IsUnreadable(before.Dirty[p]))
             .Order(StringComparer.Ordinal),];
     }
 
     /// <summary>
     /// Paths whose state differs between the two snapshots, in ordinal order.
     /// </summary>
-    public static List<string> Changed(Snapshot before, Snapshot after)
+    public static List<string> Changed(Snapshot before, Snapshot after) => Changed(before.Dirty, after.Dirty);
+
+    /// <summary>
+    /// The paths whose state differs between the two sets of watched files, in ordinal order.
+    /// </summary>
+    private static List<string> Changed(Dictionary<string, string> before, Dictionary<string, string> after)
     {
-        return [.. before.Dirty.Keys.Union(after.Dirty.Keys, StringComparer.Ordinal)
-            .Where(p => !before.Dirty.TryGetValue(p, out string? a) || !after.Dirty.TryGetValue(p, out string? b) || a != b)
+        return [.. before.Keys.Union(after.Keys, StringComparer.Ordinal)
+            .Where(p => !before.TryGetValue(p, out string? a) || !after.TryGetValue(p, out string? b) || a != b)
             .Order(StringComparer.Ordinal),];
     }
 

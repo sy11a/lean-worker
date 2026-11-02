@@ -994,8 +994,11 @@ internal sealed class LaunchRun
         }
         runtime.Finish(outcome, _exitCode);
         _elapsed = DateTimeOffset.Now - _started;
-        await SnapshotChangedAsync().ConfigureAwait(false);
+        // The git metadata first, straight after the worker exited: a worker that changed the
+        // repository's own git metadata planted a clean filter, and `git status` (the changed-files
+        // pass) would run it. The metadata pass runs no git, so it sees the tampering as it is.
         await SnapshotGitMetadataAsync().ConfigureAwait(false);
+        await SnapshotChangedAsync().ConfigureAwait(false);
         _notes.AddRange(_meter.Notes);
 
         QuotaReading? quotaAfter = null;
@@ -1024,12 +1027,30 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
+    /// The note when the changed-files pass is skipped: the run changed the repository's own git
+    /// metadata, and the git-status pass would run the clean filter the worker planted.
+    /// </summary>
+    private const string ChangedFilesSkipped = "changed-files: skipped, the run changed the repository's git metadata";
+
+    /// <summary>
     /// The changed-files bookkeeping after the worker: the workspace's after-worker snapshot, the
     /// changed list and the out-of-scope list it yields, then the invoking repository's comparison
     /// (--worktree) on top.
     /// </summary>
     private async Task SnapshotChangedAsync()
     {
+        if (_gitTamper.Count > 0)
+        {
+            // The run changed the repository's own git metadata, so the working tree is not
+            // trusted any more: `git status` would run the clean filter the worker planted (the
+            // launcher's own -c options stop the fsmonitor and the hooks, not the filters). The
+            // changed files stay unknown — the "could not tell" path — and the note says why.
+            _changed = null;
+            _outOfScope = null;
+            _notes.Add(ChangedFilesSkipped);
+            return;
+        }
+
         WriteScope.Snapshot? treeBefore = _treeBefore;
         WriteScope.Snapshot? invokingBefore = _invokingBefore;
         WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
@@ -1059,7 +1080,9 @@ internal sealed class LaunchRun
     /// The git metadata after the worker: the watched files that differ from the before-worker
     /// snapshot are out-of-scope findings — the run changed the repository's own git metadata
     /// (the config, the hooks), which every later git call runs: the launcher's own and the
-    /// operator's next session (issue #114).
+    /// operator's next session (issue #114). The after pass hashes the very directories the
+    /// before pass resolved and runs no git at all, so a worker that redirected the worktree to a
+    /// copy of the git dir it made cannot hide behind the copy.
     /// </summary>
     private async Task SnapshotGitMetadataAsync()
     {
@@ -1069,9 +1092,12 @@ internal sealed class LaunchRun
             return;
         }
 
-        WriteScope.Snapshot? after = await WriteScope.TakeGitMetadataAsync(_workspaceRoot, GitLabelBase()).ConfigureAwait(false);
+        WriteScope.Snapshot? after = await WriteScope.TakeGitMetadataAsync(before, GitLabelBase()).ConfigureAwait(false);
         if (after is null)
         {
+            // The metadata could not be read after the run: the launcher cannot tell whether the
+            // run changed it, and that is a finding, never silence (issue #114).
+            AddGitTamper(GitMetadataUnreadable);
             return;
         }
 
@@ -1080,6 +1106,35 @@ internal sealed class LaunchRun
         {
             _notes.Add($"git-tamper: {EvidenceBlock.OneLine(path)}");
         }
+
+        // A watched file that was readable before the run and cannot be read after it: the
+        // launcher cannot tell whether the run changed it, and that is a finding too.
+        if (WriteScope.UnreadableNow(before, after).Count is 0)
+        {
+            return;
+        }
+
+        AddGitTamper(GitMetadataUnreadable);
+    }
+
+    /// <summary>
+    /// The finding of a git metadata watch that is not a path: the metadata could not be read
+    /// after the run, so the launcher cannot tell whether the run changed it.
+    /// </summary>
+    private const string GitMetadataUnreadable = "git-metadata: unreadable after the run";
+
+    /// <summary>
+    /// A finding of the git metadata watch, noted and kept once.
+    /// </summary>
+    private void AddGitTamper(string finding)
+    {
+        if (_gitTamper.Contains(finding, StringComparer.Ordinal))
+        {
+            return;
+        }
+
+        _gitTamper.Add(finding);
+        _notes.Add($"git-tamper: {EvidenceBlock.OneLine(finding)}");
     }
 
     /// <summary>
@@ -1756,11 +1811,12 @@ internal sealed class LaunchRun
             status = "wrapped-up";
         }
 
-        if (status is "success" && _gitTamper.Count > 0)
+        if ((status is "success" or "wrapped-up") && _gitTamper.Count > 0)
         {
             // The run changed the repository's own git metadata: it is out of scope, whatever the
             // worker said (issue #114). The status is not a success, so the run exits 1 like
-            // every other non-success.
+            // every other non-success. A wrap-up counts too: it exits 3 and invites a
+            // continuation, and a tampered run must not be one of those.
             status = "out-of-scope";
         }
 
@@ -2371,8 +2427,11 @@ internal sealed class LaunchRun
         }
 
         Meter meter = NonNull(_meter);
-        if (meter.WrappedUp)
+        if (meter.WrappedUp && _status is not "out-of-scope")
         {
+            // A run that changed the repository's own git metadata is out of scope, wrap-up or
+            // not: it must not invite a continuation, the operator has to look at the metadata
+            // first (issue #114).
             await Console.Out.WriteLineAsync($"continue: --continue-from \"{Path.GetFullPath(RunDir)}\" (fresh worker, original task + this handoff; ask the operator first)").ConfigureAwait(false);
         }
         else if (_next is not null)

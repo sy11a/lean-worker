@@ -553,7 +553,8 @@ Exit codes:
   (`status: truncated`) exits `1` too: it is not a success, and neither is a run that changed the
   repository's own git metadata (`status: out-of-scope`).
 - `2`: the launcher failed, including a gate configuration refused before the worker ran.
-- `3`: the worker wrapped up near its budget and left a handoff.
+- `3`: the worker wrapped up near its budget and left a handoff. A run that changed the repository's
+  own git metadata is never a wrap-up: it exits `1`, and it does not invite a continuation.
 - `4`: the gate is stuck.
 - `5`: the gate failed, or a trusted input changed.
 
@@ -571,14 +572,30 @@ worker can therefore set `core.fsmonitor` or `core.hooksPath` in `.git/config`, 
 its own into `.git/hooks` — and every git call after that runs it: the launcher's own and your next
 session's. The write-scope snapshot is `git status` based and never sees any of it, so the launcher
 watches the metadata itself: the config and every file under the hooks (by name, so an added or a
-removed hook counts) of the common git dir, and the worktree's own `config.worktree`, are hashed
-before the worker and after it, with the directories git itself resolves.
+removed hook counts) of the common git dir, the `info/attributes` file, the per-worktree
+`config.worktree` and the two files that redirect a worktree to the git dir it belongs to
+(`commondir`, `gitdir`) are hashed before the worker and after it. A hook is hashed with its mode,
+so an exec bit added to an existing hook counts, and a hooks directory that is a link is hashed as
+the link it is — never followed.
+
+The directories are the ones git itself resolves, and they are resolved once: before the worker.
+The after pass hashes exactly those paths and runs no git at all, so a worker that redirected the
+worktree to a copy of the git dir it made cannot make the copy hash clean: the redirect is a
+watched file itself, and the copy is never looked at.
 
 A difference is an out-of-scope finding: the changed files are listed in the evidence block
 (`- git-tamper: .git/config`), a warning goes to the error stream, and the run ends with
-`status: out-of-scope` and exit `1` — whatever the worker said about itself. The launcher's own git
-calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the subcommand, so a changed
-config cannot run code through them either.
+`status: out-of-scope` and exit `1` — whatever the worker said about itself. A wrap-up is no
+exception: it ends with `status: out-of-scope` and exit `1` too, not `3`, and it does not invite a
+continuation. Metadata the launcher cannot read after the run is a finding as well
+(`- git-tamper: git-metadata: unreadable after the run`), never silence.
+
+The launcher's own git calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the
+subcommand: that stops the fsmonitor and the hooks, nothing else. A clean filter the worker
+planted (`filter.<x>.clean` in the config, named by a `.gitattributes`) still runs under
+`git status` — so a run whose git metadata changed skips the git-status pass altogether: its
+changed files stay unknown, and the run says why
+(`note: changed-files: skipped, the run changed the repository's git metadata`).
 
 ### The worker runs in a process group of its own
 
