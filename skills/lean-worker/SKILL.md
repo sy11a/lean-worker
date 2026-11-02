@@ -204,6 +204,10 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   Offer it to the user in one sentence; run it only on their go.
 - `status: budget-exceeded`: the launcher stopped the worker at the budget before it could hand off.
   Check the state with `git status`, then lower `wrapUpAt` for that profile or raise its budget.
+- `status: truncated` (exit 1): the provider's output limit cut the worker's last step off and that
+  step produced nothing, so the run is not a success even when the worker exited cleanly — the
+  result block's `reason=length` says so. Nothing new was written: check `git status`, then run
+  again with a narrower task, or with a model that has a bigger output budget.
 - Otherwise the worker's session is not kept. Sharpen `task.md` (goal, start-here paths, scope) or
   split the task, and run again. Each run gets its own directory.
 - If the cause is general (a missing command, an unknown convention), fix `project.md` or the
@@ -219,8 +223,10 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
 - Give a task that edits code its write scope: `--write-scope "src/Foo/**"` (repeatable, relative to the git
   root; a directory covers everything under it) or the profile key `writeScope`. The launcher compares the
   working tree before and after the run: the `files:` line counts what changed, `summary.json` lists it
-  (`changed_files`, `out_of_scope`), and a `WARNING` names the files outside the scope. The status does not
-  change: check those files (revert or accept them) before you accept the run. A continuation keeps the scope.
+  (`changed_files`, `out_of_scope`), and a `WARNING` names the files outside the scope. A file the launcher
+  cannot read (no permission) is listed as `unverified: <path>`: it could not tell whether the run changed
+  it. The status does not change: check those files (revert or accept them) before you accept the run. A
+  continuation keeps the scope.
 
 ## Gate (optional): the run ends when a check passes
 

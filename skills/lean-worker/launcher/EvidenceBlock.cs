@@ -26,10 +26,11 @@ internal static class EvidenceBlock
     /// The evidence lines of one run, in the order they appear in the block: the run's status, exit
     /// code, terminal reason and duration; one line per gate command (its outcome, exit code and
     /// duration) with its report path on a line of its own when it has one, or a single "not run"
-    /// line when no gate ran; then one line per changed file and one line per file outside the write
-    /// scope. Every value is put on one line, so nothing in it can start a line of its own.
+    /// line when no gate ran; then one line per changed file, one line per file outside the write
+    /// scope and one line per file the launcher could not read; then the worktree's line. Every
+    /// value is put on one line, so nothing in it can start a line of its own.
     /// </summary>
-    public static List<string> Build(JsonObject summary)
+    public static List<string> Build(JsonObject summary, IReadOnlyList<string>? unverified = null)
     {
         string status = OneLine(Json.Str(summary, "status") ?? "(none)");
         string terminalReason = OneLine(Json.Str(summary, "terminal_reason") ?? "(none)");
@@ -45,8 +46,24 @@ internal static class EvidenceBlock
         ];
         lines.AddRange(GateLines(summary["gate"] as JsonObject));
         lines.AddRange(ChangedLines(summary));
+        lines.AddRange(UnverifiedLines(unverified));
         lines.AddRange(WorktreeLines(summary["worktree"] as JsonObject));
         return lines;
+    }
+
+    /// <summary>
+    /// The unverified lines: one per path the launcher could not read in either snapshot, so it
+    /// could not tell whether the run changed it. The run says so instead of counting the path as
+    /// unchanged.
+    /// </summary>
+    private static List<string> UnverifiedLines(IReadOnlyList<string>? unverified)
+    {
+        if (unverified is null || unverified.Count is 0)
+        {
+            return [];
+        }
+
+        return [.. unverified.Select(path => $"- unverified: {OneLine(path)}")];
     }
 
     /// <summary>

@@ -549,11 +549,18 @@ to sweep.
 
 Exit codes:
 - `0`: success. With a gate, the gate is clean.
-- `1`: the worker reported an error or failed.
+- `1`: the worker reported an error or failed. A run the provider's output limit cut off
+  (`status: truncated`) exits `1` too: it is not a success.
 - `2`: the launcher failed, including a gate configuration refused before the worker ran.
 - `3`: the worker wrapped up near its budget and left a handoff.
 - `4`: the gate is stuck.
 - `5`: the gate failed, or a trusted input changed.
+
+A run the provider's output limit cut off is never a success: when the last step stopped on the
+limit and produced nothing (no final text, no output tokens), the run ends with
+`status: truncated` and `terminal_reason: length`, and it exits `1` like a failed run. The report
+of such a run is the text of an earlier step, or none at all, so treat it as a run to repeat — with
+a narrower task or a model with a bigger output budget — and not as a finished one.
 
 ## Cost notes from real runs
 
@@ -589,7 +596,7 @@ Exit codes:
 - `settings.json` (claude runtime, lean mode) or `opencode-config.json` (opencode runtime)
 - `wrapup.json` when the wrap-up fired, and `hook.log`, one line per hook check
 - `summary.json`
-- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results and the files the run changed). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
+- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results, the files the run changed and the files the launcher could not read). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
 
 `.lean-worker/runs.jsonl` gets one JSON line per run, recording:
 

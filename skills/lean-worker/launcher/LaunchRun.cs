@@ -95,6 +95,11 @@ internal sealed class LaunchRun
     private TimeSpan _elapsed;
     private List<string>? _changed;
     private List<string>? _outOfScope;
+
+    // The paths the launcher could not read in either snapshot: it could not tell whether the run
+    // changed them, so it reports them (a note and an evidence line each) instead of counting
+    // them as unchanged.
+    private List<string> _unverified = [];
     private QuotaReading? _quotaAfter;
 
     // Status
@@ -235,6 +240,9 @@ internal sealed class LaunchRun
             BuildSummary();
             await WriteSummaryAsync().ConfigureAwait(false);
             await PrintAsync().ConfigureAwait(false);
+            // The exit code of the launcher: 0 for a success, 3 for a wrap-up (the run continues on the
+            // operator's go), 1 for every other status — a failed run, and a run the provider's
+            // output limit truncated (issue #115) alike.
             return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
         }
         catch
@@ -993,10 +1001,17 @@ internal sealed class LaunchRun
         WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
         _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
         _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
+        // The paths both snapshots could not read (issue #118): the launcher could not tell whether
+        // the run changed them, so it says so instead of counting them as unchanged.
+        _unverified = treeBefore is null || treeAfter is null ? [] : WriteScope.Unverified(treeBefore, treeAfter);
         // The invoking repository's comparison (--worktree): every path that changed in the
         // repository the launcher was called in joins the out-of-scope report, prefixed with
         // <invoking>/ so it reads as the invoking repo's.
         _outOfScope = await AddInvokingOutOfScopeAsync(_outOfScope, invokingBefore).ConfigureAwait(false);
+        foreach (string path in _unverified)
+        {
+            _notes.Add($"unverified: {EvidenceBlock.OneLine(path)}");
+        }
     }
 
     /// <summary>
@@ -1089,6 +1104,9 @@ internal sealed class LaunchRun
         }
 
         List<string> changed = WriteScope.Changed(invokingBefore, invokingAfter);
+        // The paths the launcher could not read in the invoking repository: reported like the
+        // repository's other paths, prefixed so it reads as the invoking repo's.
+        _unverified.AddRange(WriteScope.Unverified(invokingBefore, invokingAfter).Select(f => InvokingPrefix + f));
         return changed.Count is 0 ? outOfScope : [.. outOfScope ?? [], .. changed.Select(f => InvokingPrefix + f)];
     }
 
@@ -1635,6 +1653,13 @@ internal sealed class LaunchRun
         {
             status = "budget-exceeded";
         }
+        else if (_outcome.Truncated)
+        {
+            // The provider's output limit cut the last step off and that step produced nothing:
+            // the run was truncated, not finished (issue #115). It is never a success, even when
+            // the worker itself exited cleanly.
+            status = "truncated";
+        }
         else if (!_outcome.HasResult)
         {
             if (_timedOut)
@@ -2118,7 +2143,7 @@ internal sealed class LaunchRun
     {
         // The evidence block (issue #107): the launcher's own lines, built from the summary this
         // method writes, so the report carries the run's facts and not only the worker's prose.
-        List<string> evidence = EvidenceBlock.Build(_summary);
+        List<string> evidence = EvidenceBlock.Build(_summary, _unverified);
         _evidence = evidence;
         _summary["evidence_lines"] = new JsonArray([.. evidence.Select(line => (JsonNode)line)]);
         await Launcher.WritePlainAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented)).ConfigureAwait(false);

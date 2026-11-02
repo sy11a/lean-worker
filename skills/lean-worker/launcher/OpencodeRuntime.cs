@@ -381,6 +381,8 @@ internal sealed class OpencodeRuntime : IRuntime
                 {
                     o.Turns++;
                     o.LastStepReason = Json.Str(part, "reason");
+                    // The step's own output tokens: zero means the step produced nothing.
+                    o.LastStepOutput = Json.Num(tok["output"]);
                     o.Thinking += Json.Num(tok["reasoning"]);
                     JsonObject? cache = tok["cache"] as JsonObject;
                     return new Usage(Json.Str(part, "id") ?? Guid.NewGuid().ToString(), Json.Str(part, "modelID") ?? string.Empty,
@@ -403,6 +405,14 @@ internal sealed class OpencodeRuntime : IRuntime
         // opencode has no final result event: the run ends when the session goes idle. A last step that asked for
         // tools means the session was cut off before the model could answer (an auto-rejected permission prompt).
         o.HasResult = o.Texts.Count > 0 && o.LastStepReason is not "tool-calls";
+        // The provider's output limit cut the last step off: it is the terminal reason of the run,
+        // and a step that produced nothing makes the run truncated (Outcome.Truncated), not a
+        // success.
+        if (o.LastStepReason is "length")
+        {
+            o.TerminalReason = "length";
+        }
+
         if (exitCode is not 0)
         {
             o.IsError = true;

@@ -6,9 +6,10 @@ internal sealed class Options
 {
     public const string Usage = """
         LeanWorker: run one task in a minimal-context worker (Claude Code or opencode).
-        Exit codes: 0 = worker finished without error (or a gate chain ended clean); 1 = worker reported an error;
-        2 = launcher failed; 3 = worker wrapped up near its budget; 4 = a gate chain ended stuck (no decrease in
-        two consecutive rounds, max rounds reached, or cost cap exceeded); 5 = a gate chain ended in an error.
+        Exit codes: 0 = worker finished without error (or a gate chain ended clean); 1 = worker reported an error
+        (or the provider's output limit truncated the run); 2 = launcher failed; 3 = worker wrapped up near its
+        budget; 4 = a gate chain ended stuck (no decrease in two consecutive rounds, max rounds reached, or cost
+        cap exceeded); 5 = a gate chain ended in an error.
 
           --task <file>              task prompt (required unless --continue-from)
           --continue-from <run-dir>  fresh worker on a stopped run: its original task + its report as the handoff

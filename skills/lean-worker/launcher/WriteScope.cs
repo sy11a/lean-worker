@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -7,7 +8,9 @@ namespace LeanWorker;
 /// <summary>
 /// Which files a run changed in its git working tree, and which of them fall outside the task's write scope.
 /// A file counts as changed when its state (content hash, or deleted) differs between the snapshots taken
-/// before and after the worker, so edits to files that were already dirty are caught too.
+/// before and after the worker, so edits to files that were already dirty are caught too. A file the launcher
+/// cannot read is recorded by its metadata instead, and a file that stays unreadable is reported as
+/// unverified rather than counted as unchanged.
 /// </summary>
 internal static class WriteScope
 {
@@ -68,10 +71,11 @@ internal static class WriteScope
     /// <summary>
     /// The content hash of a file that the listing showed as present: a file that cannot be read
     /// (no permission, a directory in its way, an I/O error), or one that vanished between the
-    /// listing and this read, hashes as <c>"?"</c> instead of throwing — an unreadable file must
-    /// not crash the run. The marker differs from every real hash (and from <c>-</c>, deleted), so
-    /// a file that is readable in only one of the two snapshots is reported as changed; a file
-    /// unreadable in both snapshots hashes <c>"?"</c> in both and is not reported as changed.
+    /// listing and this read, is recorded by its metadata instead of throwing — an unreadable
+    /// file must not crash the run. The marker differs from every real hash (and from <c>-</c>,
+    /// deleted), so a file that is readable in only one of the two snapshots is reported as
+    /// changed; a file unreadable in both snapshots is only equal when its metadata is equal, and
+    /// is then reported as unverified (<see cref="Unverified"/>).
     /// </summary>
     private static async Task<string> HashAsync(string full)
     {
@@ -81,8 +85,62 @@ internal static class WriteScope
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            return Unreadable(full);
+        }
+    }
+
+    /// <summary>
+    /// The entry of a file the launcher could not read: the marker <c>"?"</c> plus the metadata
+    /// that is still readable — the size, the mtime (in ticks) and the unix mode. A file that
+    /// changed while it stayed unreadable (a write that kept the mode) changes its size or its
+    /// mtime, so it counts as changed instead of slipping through as unchanged. When even the
+    /// metadata cannot be read, the entry is the bare marker: nothing could be told about the
+    /// file at all.
+    /// </summary>
+    private static string Unreadable(string full)
+    {
+        try
+        {
+            FileInfo info = new(full);
+            return string.Create(CultureInfo.InvariantCulture, $"?|{info.Length}|{File.GetLastWriteTimeUtc(full).Ticks}|{Mode(full)}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
             return "?";
         }
+    }
+
+    /// <summary>
+    /// The unix mode of a file, or <c>"-"</c> where the platform has none (Windows) or the mode
+    /// cannot be read.
+    /// </summary>
+    private static string Mode(string full)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return "-";
+        }
+
+        try
+        {
+            return ((int)File.GetUnixFileMode(full)).ToString(CultureInfo.InvariantCulture);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "-";
+        }
+    }
+
+    /// <summary>
+    /// The paths both snapshots saw as unreadable with the same metadata: the launcher could not
+    /// read them, so it could not tell whether the run changed them. They are reported (never
+    /// counted as unchanged silently).
+    /// </summary>
+    public static List<string> Unverified(Snapshot before, Snapshot after)
+    {
+        return [.. before.Dirty.Keys.Intersect(after.Dirty.Keys, StringComparer.Ordinal)
+            .Where(p => before.Dirty[p] == after.Dirty[p] && before.Dirty[p].StartsWith('?'))
+            .Order(StringComparer.Ordinal),];
     }
 
     /// <summary>

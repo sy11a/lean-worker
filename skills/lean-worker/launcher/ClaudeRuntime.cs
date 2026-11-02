@@ -250,12 +250,22 @@ internal sealed class ClaudeRuntime : IRuntime
         o.SessionId = Json.Str(line, "session_id");
         o.Subtype = Json.Str(line, "subtype");
         o.TerminalReason = Json.Str(line, "terminal_reason");
+        // The run's output tokens, as the result line reports them: claude has no per-step stop
+        // reason of its own, so the result's usage is what tells whether the run produced
+        // anything (Outcome.Truncated).
+        o.LastStepOutput = OutputTokens(line);
         o.ReportedCost = Json.Dec(line, "total_cost_usd");
         o.Turns = Json.Num(line["num_turns"]);
         o.Denials = line["permission_denials"] is JsonArray d ? d.Count : 0;
         o.Thinking = Json.Num(line["usage"]?["output_tokens_details"]?["thinking_tokens"]);
         return null;
     }
+
+    /// <summary>
+    /// The output tokens the result line reports for the run: zero when the line carries no
+    /// usage. The run's own usage is what claude offers in place of a per-step stop reason.
+    /// </summary>
+    private static long OutputTokens(JsonObject line) => Json.Num(line["usage"]?["output_tokens"]);
 
     public void Finish(Outcome o, int exitCode)
     {
