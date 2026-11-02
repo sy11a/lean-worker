@@ -231,7 +231,19 @@ internal sealed class WorktreeRun
             return;
         }
 
-        // The working tree must hold nothing but the files the launcher itself copied in.
+        // A copied path that is not a plain path inside the worktree (a symlink or reparse point on
+        // the way, or one that leaves the worktree) stops the decision before anything is read or
+        // any status is taken: the emptiness check below runs git status in the worktree and must
+        // not do so through a link, and SameContent and the removal must neither read through nor
+        // delete along one.
+        if (UnsafeCopiedPath() is { } unsafePath)
+        {
+            KeptForUnsafeCopiedPath(unsafePath);
+            return;
+        }
+
+        // The link check above passed, so every copied path is plain: the working tree must hold
+        // nothing but the files the launcher itself copied in.
         if (!await EmptyAsync(Exempt()).ConfigureAwait(false))
         {
             return;
@@ -254,6 +266,11 @@ internal sealed class WorktreeRun
     /// </summary>
     private async Task<bool> AtBaseAsync()
     {
+        if (!await OwnsGitDirAsync().ConfigureAwait(false))
+        {
+            return false;
+        }
+
         Git.Result? head = await Git.RunResultAsync(WorktreePath, "rev-parse", "--verify", "HEAD").ConfigureAwait(false);
         Git.Result? branch = await Git.RunResultAsync(_repo, "rev-parse", "--verify", "--end-of-options", "refs/heads/" + Branch).ConfigureAwait(false);
         if (head is null || branch is null)
@@ -290,6 +307,11 @@ internal sealed class WorktreeRun
     /// </summary>
     private async Task<bool> EmptyAsync(IReadOnlySet<string> exempt)
     {
+        if (!await OwnsGitDirAsync().ConfigureAwait(false))
+        {
+            return false;
+        }
+
         Git.Result? status = await StatusAsync().ConfigureAwait(false);
         if (status is null)
         {
@@ -319,8 +341,22 @@ internal sealed class WorktreeRun
     /// worktree that git refuses to remove stays, and the error is the reason; a branch that stays
     /// behind after its worktree is gone is a note, not a reason.
     /// </summary>
+    // Residual of the ordering here: background processes the worker left behind are NOT killed
+    // before this decision — once the worker exits they are reparented to init and out of a tree
+    // kill's reach — so any of them can race the check before a delete. The re-check right before
+    // each delete narrows that window but does not close it, and the deletes are plain File.Delete
+    // and Directory.Delete calls, not unlinkat against a re-verified handle, so the window stays
+    // open by exactly that much. The fix is tracked in the issue tracker (issue #116).
     private async Task RemoveAsync()
     {
+        // The same refusal once more, at the moment of deletion: a path turned dirty after the
+        // first check still deletes nothing.
+        if (UnsafeCopiedPath() is { } unsafePath)
+        {
+            KeptForUnsafeCopiedPath(unsafePath);
+            return;
+        }
+
         try
         {
             DeleteCopied();
@@ -376,6 +412,170 @@ internal sealed class WorktreeRun
     {
         Action = "kept";
         Reason = "kept: " + EvidenceBlock.OneLine(why);
+    }
+
+    /// <summary>
+    /// The worktree stays because a copied path is not a plain path inside it: the ordinary
+    /// "changes" reason, and the note names the worktree-path check that failed — nothing was read
+    /// through the offending path and nothing was deleted along it.
+    /// </summary>
+    private void KeptForUnsafeCopiedPath(string path)
+    {
+        Action = "kept";
+        Reason = "changes";
+        Note = $"worktree path check failed: '{path}' is not a plain path inside the worktree; nothing read through it, nothing deleted";
+    }
+
+    /// <summary>
+    /// The git directory this worktree must belong to: the invoking repository's common git dir,
+    /// then <c>worktrees/</c>, then the worktree's own name — the registration
+    /// <c>git worktree add</c> created for this run. Both the common dir and the name are resolved
+    /// the way git resolves them (canonical, symlinks expanded), so a repository behind a symlinked
+    /// home still compares equal. Empty when the common git dir cannot be read: the check then
+    /// fails.
+    /// </summary>
+    private async Task<string> ExpectedGitDirAsync()
+    {
+        string? common = await Git.RunAsync(_repo, "rev-parse", "--git-common-dir").ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(common))
+        {
+            return string.Empty;
+        }
+
+        GateTrust.CanonicalPath canonical = GateTrust.Canonical(Path.GetFullPath(Path.Combine(_repo, common.Trim())));
+        return canonical.Resolved
+            ? Path.Combine(canonical.Path, "worktrees", Path.GetFileName(WorktreePath))
+            : string.Empty;
+    }
+
+    /// <summary>
+    /// Whether the worktree directory is still the one git registered for this run:
+    /// <c>git -C &lt;WorktreePath&gt; rev-parse --absolute-git-dir</c> — a path with symlinks
+    /// resolved — must name the invoking repository's own <c>worktrees/&lt;name&gt;</c> directory.
+    /// A directory swapped for another checkout, another worktree of the same repository or a
+    /// foreign repository names something else, and every further git call would read a tree this
+    /// decision cannot judge. Runs before every git call of <see cref="AtBaseAsync"/> and
+    /// <see cref="EmptyAsync"/>.
+    /// </summary>
+    private async Task<bool> OwnsGitDirAsync()
+    {
+        string expected = await ExpectedGitDirAsync().ConfigureAwait(false);
+        Git.Result? actual = await Git.RunResultAsync(WorktreePath, "rev-parse", "--absolute-git-dir").ConfigureAwait(false);
+        string actualDir = actual is { ExitCode: 0 } ? actual.Stdout.Trim() : string.Empty;
+        if (expected.Length > 0
+            && actualDir.Length > 0
+            && GateTrust.Canonical(actualDir) is { Resolved: true } resolved
+            && resolved.Path.Equals(expected, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        string why;
+        if (expected.Length is 0)
+        {
+            why = "the common git dir cannot be read";
+        }
+        else if (actualDir.Length is 0)
+        {
+            why = "git failed in the worktree";
+        }
+        else
+        {
+            why = $"expected '{expected}', got '{actualDir}'";
+        }
+
+        KeptForGitDirCheck(why);
+        return false;
+    }
+
+    /// <summary>
+    /// The worktree stays because its git directory is not the run's own: the ordinary "changes"
+    /// reason, and the note names the git-dir check that failed. Nothing was deleted and no further
+    /// git call ran on the unverified tree.
+    /// </summary>
+    private void KeptForGitDirCheck(string why)
+    {
+        Action = "kept";
+        Reason = "changes";
+        Note = $"git dir check failed ({why}): nothing deleted, no further git run";
+    }
+
+    /// <summary>
+    /// The first copied path whose way from the worktree down to the file is not clean, or null
+    /// when every copied path is plain and stays inside the worktree. The folders
+    /// <see cref="DeleteCopied"/> removes are components of these file paths, so the file walk
+    /// covers them too.
+    /// </summary>
+    private string? UnsafeCopiedPath()
+    {
+        foreach (string relative in _copied.Select(f => f.Relative))
+        {
+            if (FirstLinkedComponent(WorktreePath, relative) is { } offender)
+            {
+                return offender;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The first component of the way from <paramref name="root"/> down through
+    /// <paramref name="relative"/> (the file included) that is a symlink or reparse point — or the
+    /// full path itself when it lands outside <paramref name="root"/>. Null when the way is clean.
+    /// A component that cannot be examined counts as linked: nothing is read through, or deleted
+    /// along, a path the launcher cannot prove plain.
+    /// </summary>
+    private static string? FirstLinkedComponent(string root, string relative)
+    {
+        string fullRoot = Path.GetFullPath(root);
+
+        // The root itself is the first component of every way down: a root that is a symlink, or
+        // whose canonical path is not the recorded one (a link on the way to it, or a path that
+        // resolves elsewhere), makes the whole way untrustworthy, so the root is the offender.
+        if (IsLinked(root)
+            || GateTrust.Canonical(root) is not { Resolved: true } rootCanonical
+            || !rootCanonical.Path.Equals(fullRoot, StringComparison.Ordinal))
+        {
+            return root;
+        }
+
+        string full = Path.GetFullPath(Path.Combine(fullRoot, relative.Replace('/', Path.DirectorySeparatorChar)));
+        if (!GateTrust.IsAtOrUnder(full, fullRoot))
+        {
+            return full;
+        }
+
+        string current = fullRoot;
+        foreach (string segment in relative.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            if (IsLinked(current))
+            {
+                return current;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether the path is a symlink or reparse point: the link target is read without following
+    /// the link (it answers even when the target is missing), and the reparse-point attribute is
+    /// the second opinion. An unexaminable path counts as a link.
+    /// </summary>
+    private static bool IsLinked(string path)
+    {
+        try
+        {
+            FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
+            return info.LinkTarget is not null
+                || (info.Exists && info.Attributes.HasFlag(FileAttributes.ReparsePoint));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 
     /// <summary>
@@ -583,7 +783,10 @@ internal sealed class WorktreeRun
     /// <summary>
     /// Copies the setup into the worktree and records every file it created: the launcher deletes
     /// exactly those files again when it removes the worktree. A file the base tracks is never
-    /// overwritten — it is skipped, and nothing is recorded for it.
+    /// overwritten — it is skipped, and nothing is recorded for it. A symlink on the way to a
+    /// destination (the base may track one at the .lean-worker folder, the system folder or the
+    /// file itself) refuses the copy before anything is written: copying through it would write
+    /// outside the worktree.
     /// </summary>
     private static List<SetupFile> CopySetup(string setup, string worktree, IReadOnlySet<string> tracked)
     {
@@ -593,6 +796,11 @@ internal sealed class WorktreeRun
             if (tracked.Contains(file.Relative))
             {
                 continue;
+            }
+
+            if (FirstLinkedComponent(worktree, file.Relative) is { } linked)
+            {
+                throw new LaunchException($"the base tracks a symlink at '{linked}'");
             }
 
             string destination = Path.Combine(worktree, file.Relative);

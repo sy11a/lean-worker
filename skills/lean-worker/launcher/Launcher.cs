@@ -272,6 +272,8 @@ internal static class Launcher
         return psi;
     }
 
+    // The kill the timeout and cap paths use (the worker's whole process tree, quietly). On a
+    // process that has already exited (or been disposed) the kill is a caught no-op.
     private static void KillQuietly(Process p)
     {
         try { p.Kill(entireProcessTree: true); } catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }

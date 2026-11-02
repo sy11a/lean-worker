@@ -125,18 +125,27 @@ internal static partial class RunAsyncGolden
         stdout.Split('\n').First(l => l.StartsWith("run:", StringComparison.Ordinal)).Split("run:", 2)[1].Trim();
 
     /// <summary>
-    /// Paths become &lt;ROOT&gt; / &lt;RUN&gt;, the "0m00s" duration &lt;DUR&gt;, a run dir's timestamp &lt;TS&gt;.
+    /// Paths become &lt;ROOT&gt; / &lt;RUN&gt;, the "0m00s" duration &lt;DUR&gt;, a run dir's timestamp &lt;TS&gt;, and the number on
+    /// the evidence block's "- duration_ms: N" line &lt;MS&gt;.
     /// </summary>
     public static string Normalize(string text, string root)
     {
         string t = text.Replace("\r\n", "\n", StringComparison.Ordinal);
         t = Regex.Replace(t, Regex.Escape(Path.Combine(root, "runs")) + @"/\d{8}-\d{6}-([A-Za-z0-9._-]+)", "<RUN:$1>", RegexOptions.None, TimeSpan.FromSeconds(5));
         t = t.Replace(root, "<ROOT>", StringComparison.Ordinal);
-        return DurationPattern().Replace(t, "<DUR>");
+        return MaskMs(DurationPattern().Replace(t, "<DUR>"));
     }
+
+    /// <summary>
+    /// The evidence block's "- duration_ms: N" number becomes &lt;MS&gt; (it differs between runs).
+    /// </summary>
+    private static string MaskMs(string text) => DurationMsPattern().Replace(text, "${head}<MS>");
 
     [GeneratedRegex(@"\b\d+m\d{2}s\b", RegexOptions.None, matchTimeoutMilliseconds: 5000)]
     private static partial Regex DurationPattern();
+
+    [GeneratedRegex(@"(?m)^(?<head>\s*- duration_ms: )\d+", RegexOptions.None, matchTimeoutMilliseconds: 5000)]
+    private static partial Regex DurationMsPattern();
 
     public static string Lines(params string[] lines) => string.Join('\n', lines) + "\n";
 
@@ -148,7 +157,7 @@ internal static partial class RunAsyncGolden
     {
         JsonObject summary = Summary(RunDirFrom(stdout));
         IEnumerable<string> evidence = summary["evidence_lines"]!.AsArray().Select(n => n!.GetValue<string>());
-        return Lines([.. lines, EvidenceBlock.Heading, .. evidence]);
+        return MaskMs(Lines([.. lines, EvidenceBlock.Heading, .. evidence]));
     }
 
     public static JsonObject Summary(string runDir) => JsonNode.Parse(File.ReadAllText(Path.Combine(runDir, "summary.json")))!.AsObject();

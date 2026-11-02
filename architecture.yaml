@@ -27,7 +27,7 @@ metric_debt:
     cyclomatic_complexity: 16
   - project: "LeanWorker"
     symbol: "M:LeanWorker.LaunchRun.PrintHeaderAsync"
-    cyclomatic_complexity: 18
+    cyclomatic_complexity: 17
   - project: "LeanWorker"
     symbol: "M:LeanWorker.LaunchRun.ResolveOptions"
     cyclomatic_complexity: 19
@@ -42,9 +42,6 @@ metric_debt:
     cyclomatic_complexity: 16
   - project: "LeanWorker"
     symbol: "M:LeanWorker.Quota.ParseMinimax(System.String,System.String)"
-    cyclomatic_complexity: 16
-  - project: "LeanWorker"
-    symbol: "M:LeanWorker.WriteScope.TakeAsync(System.String,System.String)"
     cyclomatic_complexity: 16
   - project: "LeanWorker"
     symbol: "T:LeanWorker.Gate"
