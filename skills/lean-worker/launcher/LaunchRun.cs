@@ -111,6 +111,11 @@ internal sealed class LaunchRun
     // touched the metadata, and no decision over the repository may be made (issue #114).
     private bool _gitTamperKnown;
 
+    // Whether the workspace is a git working tree: the run's own git metadata (the config, the
+    // hooks) is watched then, and the summary carries the verdict over it. Outside a working tree
+    // there is no metadata to watch, and the summary leaves the verdict out (issue #114).
+    private bool _gitWatched;
+
     // Why the run the caller wanted to continue was refused: its summary records git tamper, so a
     // fresh worker would run on a repository whose config carries what that run planted. Null when
     // there is no refusal (issue #114).
@@ -470,9 +475,17 @@ internal sealed class LaunchRun
                 // The run changed the repository's own git metadata: a fresh worker would run on a
                 // repository whose config carries what that run planted (issue #114). The operator
                 // has to look at the metadata first.
-                _continueRefusal =
-                    $"the run at {_o.ContinueFrom} changed the repository's own git metadata (git tamper). " +
-                    "Look at the metadata (the changed files are in the run's summary.json) before continuing it.";
+                _continueRefusal = TamperRefusal();
+                return;
+            }
+
+            if (SummaryGitMetadataUnverified(prevSummary))
+            {
+                // The run could not vouch for the repository's own git metadata: the watch over it
+                // never started, so the launcher cannot tell whether that run changed it. A fresh
+                // worker would run on a repository whose config may carry what that run planted
+                // (issue #114). The operator has to look at the metadata first.
+                _continueRefusal = UnverifiedRefusal();
                 return;
             }
         }
@@ -498,6 +511,39 @@ internal sealed class LaunchRun
         }
         _profile = profile;
     }
+
+    /// <summary>
+    /// Why a run whose summary records git tamper is not continued: the operator has to look at
+    /// the repository's own git metadata first (issue #114).
+    /// </summary>
+    private string TamperRefusal()
+    {
+        return $"the run at {_o.ContinueFrom} changed the repository's own git metadata (git tamper). " +
+            "Look at the metadata (the changed files are in the run's summary.json) before continuing it.";
+    }
+
+    /// <summary>
+    /// Why a run whose summary says that the git metadata was not verified is not continued: the
+    /// launcher cannot tell whether that run changed the repository's own git metadata, and a
+    /// fresh worker would run on a repository whose config may carry what that run planted
+    /// (issue #114).
+    /// </summary>
+    private string UnverifiedRefusal()
+    {
+        return $"the run at {_o.ContinueFrom} could not verify the repository's own git metadata (git metadata not verified). " +
+            "Look at the metadata before continuing it.";
+    }
+
+    /// <summary>
+    /// Whether a run's summary says that the repository's own git metadata was not verified: the
+    /// watch over it never started, so the launcher cannot tell whether that run changed it. Such
+    /// a run is not continued either: every later git call runs what the run may have planted
+    /// (issue #114).
+    ///
+    /// A summary written before the field existed says nothing about the verdict and is accepted:
+    /// only a summary that states the metadata was not verified is refused.
+    /// </summary>
+    private static bool SummaryGitMetadataUnverified(JsonObject summary) => summary["git_metadata_verified"] is JsonValue value && value.TryGetValue(out bool verified) && !verified;
 
     /// <summary>
     /// Whether a run's summary records git tamper: the files of the repository's own git metadata
@@ -898,6 +944,10 @@ internal sealed class LaunchRun
     private async Task ResolveRepoTokenAsync()
     {
         string? root = await RepoToken.RootAsync(_workspaceRoot).ConfigureAwait(false);
+        // The workspace is a git working tree: the run's own git metadata (the config, the hooks)
+        // is watched then, and the summary carries the verdict over it. Outside a working tree
+        // there is no metadata to watch, and the summary leaves the verdict out (issue #114).
+        _gitWatched = root is not null;
         _allowed = RepoToken.Expand(_allowed, root);
         _denied = RepoToken.ExpandDenied(_denied, root);
     }
@@ -2327,10 +2377,12 @@ internal sealed class LaunchRun
         _firstCallCacheReadShare = firstCallCacheReadShare;
 
         _hookChecks = File.Exists(Path.Combine(RunDir, "hook.log")) ? await Launcher.CountLinesAsync(Path.Combine(RunDir, "hook.log")).ConfigureAwait(false) : 0;
-        // A run that changed the repository's own git metadata gets no invitation of its own: the
-        // operator has to look at the metadata first, and a fresh worker would run on a repository
-        // whose config carries what this one planted (issue #114).
-        _next = _gitTamper.Count > 0 || _status is "wrapped-up" or "success"
+        // A run whose repository metadata the launcher cannot vouch for gets no invitation of its
+        // own: the operator has to look at the metadata first, and a fresh worker would run on a
+        // repository whose config carries what this one planted (issue #114). The rule is the one
+        // of the worktree decision: a known verdict and no findings — an unknown verdict (the
+        // watch never started) is no invitation either.
+        _next = !TamperAllowsDecision() || _status is "wrapped-up" or "success"
             ? null
             : Launcher.NextInChain(_chain, _provider, _model);
     }
@@ -2395,12 +2447,29 @@ internal sealed class LaunchRun
             ["notes"] = new JsonArray([.. _notes.Select(n => (JsonNode)n)]),
         };
         AddModelRequested();
+        AddGitMetadataVerified();
     }
 
     private void AddModelRequested()
     {
         if (!AliasResolved) { return; }
         _summary["model_requested"] = _model;
+    }
+
+    /// <summary>
+    /// The verdict over the repository's own git metadata: true when the launcher knows the run
+    /// did not touch it, false when it knows it did or when it could not tell (the watch over the
+    /// metadata never started). A workspace that is not a git working tree has no metadata to
+    /// watch: the field is left out there, and such a run is not held back by it (issue #114).
+    /// </summary>
+    private void AddGitMetadataVerified()
+    {
+        if (!_gitWatched)
+        {
+            return;
+        }
+
+        _summary["git_metadata_verified"] = TamperAllowsDecision();
     }
 
     /// <summary>
@@ -2610,11 +2679,13 @@ internal sealed class LaunchRun
         }
 
         Meter meter = NonNull(_meter);
-        if (meter.WrappedUp && _status is not "out-of-scope" && _gitTamper.Count is 0)
+        if (meter.WrappedUp && _status is not "out-of-scope" && TamperAllowsDecision())
         {
-            // A run that changed the repository's own git metadata is out of scope, wrap-up or
-            // not: it must not invite a continuation, the operator has to look at the metadata
-            // first (issue #114).
+            // A run whose repository metadata the launcher cannot vouch for must not invite a
+            // continuation, wrap-up or not: the operator has to look at the metadata first, and a
+            // fresh worker would run on a repository whose config may carry what this one planted
+            // (issue #114). The rule is the one of the worktree decision: a known verdict and no
+            // findings — an unknown verdict (the watch never started) is no invitation either.
             await Console.Out.WriteLineAsync($"continue: --continue-from \"{Path.GetFullPath(RunDir)}\" (fresh worker, original task + this handoff; ask the operator first)").ConfigureAwait(false);
         }
         else if (_next is not null)

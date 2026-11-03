@@ -554,7 +554,8 @@ Exit codes:
   repository's own git metadata (`status: out-of-scope`).
 - `2`: the launcher failed, including a gate configuration refused before the worker ran.
 - `3`: the worker wrapped up near its budget and left a handoff. A run that changed the repository's
-  own git metadata is never a wrap-up: it exits `1`, and it does not invite a continuation.
+  own git metadata is never a wrap-up: it exits `1`, and it does not invite a continuation. A run
+  whose git metadata the launcher could not verify does not invite a continuation either.
 - `4`: the gate is stuck.
 - `5`: the gate failed, or a trusted input changed.
 
@@ -595,6 +596,17 @@ continuation. A tampered run gets no invitation at all — no `escalate:` line e
 worker cannot run on the repository the first one changed. Metadata the launcher cannot read after
 the run is a finding as well
 (`- git-tamper: git-metadata: unreadable after the run`), never silence.
+
+The same rule holds when the launcher cannot tell at all: the invitations (the `continue:` line of
+a wrap-up, the `escalate:` line of a failed run) need a known verdict and no findings — the rule
+the worktree decision uses. A run whose metadata watch never started has no verdict, so it gets no
+invitation either, and its summary records `git_metadata_verified: false`. `--continue-from`
+refuses such a run directory as well (exit `1`, the same message style as the refusal of a
+tampered one): a fresh worker must not run on a repository whose config may carry what the first
+one planted. A summary written before the field existed says nothing about the verdict and is
+continued as before. A workspace that is not a git working tree has no metadata to watch at all: the
+field is left out there, `--continue-from` continues such a run as before — and no invitation is
+offered either, since the launcher cannot tell that there is no repository there.
 
 The launcher's own git calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the
 subcommand: that stops the fsmonitor and the hooks, nothing else. A clean filter the worker
@@ -673,6 +685,7 @@ there after the SIGKILL are reported too (`note: process-group: N processes surv
 - quota before and after the run, and the percentage it used, on a subscription with a quota adapter;
 - the next model the run offered (`escalate_to`), if any;
 - the write scope, the files the run changed in the git working tree, and those outside the scope;
+- the verdict over the repository's own git metadata (`git_metadata_verified`: true when the launcher knows the run left the config and the hooks alone, false when it knows it changed them or could not tell), in a git working tree; a workspace that is not one has no metadata to watch, and the field is left out there;
 - the worktree the run owned (`worktree`: its path, its branch, whether it was removed or kept and why), when it had one;
 - the evidence lines (`evidence_lines`): the same facts the report's evidence block carries, one string per line.
 

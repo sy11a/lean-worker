@@ -220,6 +220,10 @@ cgroup).
   list and ask what to do with it; do not accept the run as it is. Such a run gets no continuation
   invitation, and `--continue-from` on its run directory is refused (exit 1): look at the metadata
   before running anything else.
+- A wrap-up without a `continue:` line, or a failed run without an `escalate:` line: the launcher
+  could not verify the repository's own git metadata (its `summary.json` records
+  `git_metadata_verified: false`), so it invites nothing. Look at the metadata before running
+  anything else; `--continue-from` on that run directory is refused (exit 1) too.
 - Otherwise the worker's session is not kept. Sharpen `task.md` (goal, start-here paths, scope) or
   split the task, and run again. Each run gets its own directory.
 - If the cause is general (a missing command, an unknown convention), fix `project.md` or the
