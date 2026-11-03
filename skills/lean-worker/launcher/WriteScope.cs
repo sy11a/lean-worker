@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -7,19 +6,33 @@ namespace LeanWorker;
 /// <summary>
 /// Which files a run changed in its git working tree, and which of them fall outside the task's write scope.
 /// A file counts as changed when its state (content hash, or deleted) differs between the snapshots taken
-/// before and after the worker, so edits to files that were already dirty are caught too.
+/// before and after the worker, so edits to files that were already dirty are caught too. A file the launcher
+/// cannot read is recorded by its metadata instead, and a file that stays unreadable is reported as
+/// unverified rather than counted as unchanged.
 /// </summary>
 internal static class WriteScope
 {
     /// <summary>
-    /// The dirty files of a working tree: path relative to the repository root → content hash.
+    /// The dirty files of a working tree: path relative to the repository root → content hash. A
+    /// snapshot of the repository's own git metadata carries the git dirs it was taken over as well
+    /// (<see cref="GitDirs"/>): the after pass hashes exactly those dirs and runs no git at all.
     /// </summary>
-    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty);
+    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty, GitMetadata.Dirs? GitDirs = null)
+    {
+        /// <summary>
+        /// The pin of the git calls that read this tree: its own git dir, the tree itself and the
+        /// common git dir, all as they were when the snapshot was taken. Null when the snapshot
+        /// carries no git dir (the tree was not a git tree, or git could not resolve one).
+        /// </summary>
+        public Git.Pin? Pin() => GitDirs is { } dirs && dirs.Own is { } own ? new Git.Pin(own, Root, dirs.Common) : null;
+    }
 
     /// <summary>
     /// Null when <paramref name="cwd"/> is not inside a git working tree (or git is missing). The
     /// excluded paths (the launcher's own bookkeeping) leave both snapshots of a comparison when
-    /// they lie in the tree; an exclude outside it is ignored.
+    /// they lie in the tree; an exclude outside it is ignored. The snapshot carries the git dirs
+    /// of the tree as well (<see cref="Snapshot.GitDirs"/>): they are resolved now, before the
+    /// worker runs, and the after pass is pinned to them.
     /// </summary>
     public static async Task<Snapshot?> TakeAsync(string cwd, params string?[] excludes)
     {
@@ -29,12 +42,48 @@ internal static class WriteScope
             return null;
         }
 
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(root).ConfigureAwait(false);
         string? status = await Git.RunAsync(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
         if (status is null)
         {
             return null;
         }
 
+        return new Snapshot(root, await DirtyAsync(root, status, excludes).ConfigureAwait(false), dirs);
+    }
+
+    /// <summary>
+    /// The same snapshot, taken again after the worker ran: the call is pinned to the git dir and
+    /// the work tree the before pass resolved, so it reads the repository the launcher started in
+    /// and not the one a worker pointed it at (a ".git" file it rewrote, a git dir of its own with
+    /// a clean filter in its config). The root is the one the before pass found: it is not looked
+    /// up again, because a lookup would follow what the worker wrote.
+    /// Null when the before snapshot carries no git dir to pin the call to.
+    /// </summary>
+    public static async Task<Snapshot?> TakeAsync(Snapshot before, params string?[] excludes)
+    {
+        Git.Pin? pin = before.Pin();
+        if (pin is null)
+        {
+            return null;
+        }
+
+        string? status = await Git.RunPinnedAsync(pin,
+            "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
+        if (status is null)
+        {
+            return null;
+        }
+
+        return new Snapshot(before.Root, await DirtyAsync(before.Root, status, excludes).ConfigureAwait(false), before.GitDirs);
+    }
+
+    /// <summary>
+    /// The dirty files of a status: path relative to the repository root → content hash. A file
+    /// that is not there any more is recorded as deleted.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> DirtyAsync(string root, string status, string?[] excludes)
+    {
         string[] skips = [.. excludes.Where(e => e is not null)
             .Select(e => Relative(root, e!))
             .OfType<string>()
@@ -59,39 +108,82 @@ internal static class WriteScope
                 }
 
                 string full = Path.Combine(root, path);
-                dirty[path] = File.Exists(full) ? await HashAsync(full).ConfigureAwait(false) : "-";
+                dirty[path] = File.Exists(full) ? await FileHash.OfAsync(full).ConfigureAwait(false) : "-";
             }
         }
-        return new Snapshot(root, dirty);
+
+        return dirty;
     }
 
     /// <summary>
-    /// The content hash of a file that the listing showed as present: a file that cannot be read
-    /// (no permission, a directory in its way, an I/O error), or one that vanished between the
-    /// listing and this read, hashes as <c>"?"</c> instead of throwing — an unreadable file must
-    /// not crash the run. The marker differs from every real hash (and from <c>-</c>, deleted), so
-    /// a file that is readable in only one of the two snapshots is reported as changed; a file
-    /// unreadable in both snapshots hashes <c>"?"</c> in both and is not reported as changed.
+    /// The snapshot of the git metadata of a working tree: the git dirs git resolves and the hashes
+    /// of the watched files (the config, the hooks, the attributes file, the per-worktree config
+    /// and the files that redirect a worktree to its git dir). The write scope never sees them — it
+    /// is git-status based — so they are watched on their own (issue #114). Null when the tree is
+    /// not a git tree (or git is missing).
     /// </summary>
-    private static async Task<string> HashAsync(string full)
+    public static async Task<Snapshot?> TakeGitMetadataAsync(string dir, string labelBase)
     {
-        try
-        {
-            return Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(full, CancellationToken.None).ConfigureAwait(false)));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return "?";
-        }
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(dir).ConfigureAwait(false);
+        return dirs is null ? null : await TakeGitMetadataAsync(dirs, dir, labelBase).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The same snapshot, taken again over the git dirs the before pass resolved: no git call at
+    /// all, so a worker that rewrote the git dirs (the commondir, the gitdir file) cannot make the
+    /// after pass hash the copy it made — the redirect itself is a watched file.
+    /// </summary>
+    public static async Task<Snapshot?> TakeGitMetadataAsync(Snapshot before, string labelBase)
+    {
+        GitMetadata.Dirs? dirs = before.GitDirs;
+        return dirs is null ? null : await TakeGitMetadataAsync(dirs, before.Root, labelBase).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The hashes of the watched files of the two git dirs. The root is the top level of the
+    /// working tree: its ".git" is watched as well.
+    /// </summary>
+    private static async Task<Snapshot?> TakeGitMetadataAsync(GitMetadata.Dirs dirs, string root, string labelBase)
+    {
+        Dictionary<string, string>? files = await GitMetadata.HashAsync(dirs, labelBase, root).ConfigureAwait(false);
+        return files is null ? null : new Snapshot(root, files, dirs);
+    }
+
+    /// <summary>
+    /// The watched files that were readable before the run and cannot be read after it: the
+    /// launcher cannot tell whether the run changed them.
+    /// </summary>
+    public static List<string> UnreadableNow(Snapshot before, Snapshot after)
+    {
+        return [.. after.Dirty.Keys.Intersect(before.Dirty.Keys, StringComparer.Ordinal)
+            .Where(p => !FileHash.IsUnreadable(before.Dirty[p]) && FileHash.IsUnreadable(after.Dirty[p]))
+            .Order(StringComparer.Ordinal),];
+    }
+
+    /// <summary>
+    /// The paths both snapshots saw as unreadable with the same metadata: the launcher could not
+    /// read them, so it could not tell whether the run changed them. They are reported (never
+    /// counted as unchanged silently).
+    /// </summary>
+    public static List<string> Unverified(Snapshot before, Snapshot after)
+    {
+        return [.. before.Dirty.Keys.Intersect(after.Dirty.Keys, StringComparer.Ordinal)
+            .Where(p => before.Dirty[p] == after.Dirty[p] && FileHash.IsUnreadable(before.Dirty[p]))
+            .Order(StringComparer.Ordinal),];
     }
 
     /// <summary>
     /// Paths whose state differs between the two snapshots, in ordinal order.
     /// </summary>
-    public static List<string> Changed(Snapshot before, Snapshot after)
+    public static List<string> Changed(Snapshot before, Snapshot after) => Changed(before.Dirty, after.Dirty);
+
+    /// <summary>
+    /// The paths whose state differs between the two sets of watched files, in ordinal order.
+    /// </summary>
+    private static List<string> Changed(Dictionary<string, string> before, Dictionary<string, string> after)
     {
-        return [.. before.Dirty.Keys.Union(after.Dirty.Keys, StringComparer.Ordinal)
-            .Where(p => !before.Dirty.TryGetValue(p, out string? a) || !after.Dirty.TryGetValue(p, out string? b) || a != b)
+        return [.. before.Keys.Union(after.Keys, StringComparer.Ordinal)
+            .Where(p => !before.TryGetValue(p, out string? a) || !after.TryGetValue(p, out string? b) || a != b)
             .Order(StringComparer.Ordinal),];
     }
 

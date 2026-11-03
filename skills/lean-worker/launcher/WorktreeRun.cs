@@ -64,6 +64,21 @@ internal sealed class WorktreeRun
     private readonly string _repo;
 
     /// <summary>
+    /// The git calls of the decision, pinned to the repository they read: the worktree's own git
+    /// dir (with the worktree as its work tree) and the repository's own git dir (with the
+    /// repository as its work tree). Both are resolved before the worker runs, so a worker that
+    /// rewrote a ".git" file, a "commondir" file or a config cannot move the decision to a
+    /// repository of its own — one whose config would run its clean filter under the decision
+    /// (issue #114).
+    /// </summary>
+    private readonly Git.Pin? _worktreePin;
+
+    /// <summary>
+    /// The pin of the calls that run in the repository the launcher was called in.
+    /// </summary>
+    private readonly Git.Pin? _repoPin;
+
+    /// <summary>
     /// The files the launcher copied into the worktree: it deletes exactly these files again when
     /// it removes the worktree, and nothing else.
     /// </summary>
@@ -81,7 +96,8 @@ internal sealed class WorktreeRun
     /// </summary>
     private sealed record SetupFile(string Relative, string Source);
 
-    private WorktreeRun(string repo, string path, string branch, string baseRef, string baseSha, List<SetupFile> copied, string unverifiable)
+    private WorktreeRun(string repo, string path, string branch, string baseRef, string baseSha, List<SetupFile> copied,
+        string unverifiable, Git.Pin? worktreePin, Git.Pin? repoPin)
     {
         _repo = repo;
         WorktreePath = path;
@@ -90,6 +106,8 @@ internal sealed class WorktreeRun
         BaseSha = baseSha;
         _copied = copied;
         _unverifiable = unverifiable;
+        _worktreePin = worktreePin;
+        _repoPin = repoPin;
     }
 
     /// <summary>
@@ -159,7 +177,8 @@ internal sealed class WorktreeRun
         {
             HashSet<string> tracked = await TrackedAtAsync(repoRoot, sha).ConfigureAwait(false);
             List<SetupFile> copied = CopySetup(setup, path, tracked);
-            return new WorktreeRun(repoRoot, path, branch, baseRef, sha, copied, string.Empty);
+            (Git.Pin? worktreePin, Git.Pin? repoPin, string unverifiable) = await DecisionPinsAsync(repoRoot, path).ConfigureAwait(false);
+            return new WorktreeRun(repoRoot, path, branch, baseRef, sha, copied, unverifiable, worktreePin, repoPin);
         }
         catch (Exception ex)
         {
@@ -188,7 +207,8 @@ internal sealed class WorktreeRun
         (string? sha, string error) = await ResolveBaseAsync(repoRoot, baseRef).ConfigureAwait(false);
         if (sha is null)
         {
-            return new WorktreeRun(repoRoot, path, branch, baseRef, string.Empty, [], $"the base '{baseRef}' cannot be resolved: {EvidenceBlock.OneLine(error)}");
+            return new WorktreeRun(repoRoot, path, branch, baseRef, string.Empty, [],
+                $"the base '{baseRef}' cannot be resolved: {EvidenceBlock.OneLine(error)}", worktreePin: null, repoPin: null);
         }
 
         // The files of the setup the first round copied in: they are the launcher's own and go with
@@ -199,7 +219,9 @@ internal sealed class WorktreeRun
             .. SetupFiles(setup).Where(f => !tracked.Contains(f.Relative) && File.Exists(Path.Combine(path, f.Relative))),
         ];
 
-        return new WorktreeRun(repoRoot, path, branch, baseRef, sha, copied, string.Empty);
+        // The pins of the decision, resolved now — before this round's worker runs.
+        (Git.Pin? worktreePin, Git.Pin? repoPin, string unverifiable) = await DecisionPinsAsync(repoRoot, path).ConfigureAwait(false);
+        return new WorktreeRun(repoRoot, path, branch, baseRef, sha, copied, unverifiable, worktreePin, repoPin);
     }
 
     /// <summary>
@@ -212,11 +234,24 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
+    /// The worktree stays because the repository's own git metadata cannot be trusted: the run
+    /// changed it, or the launcher never got to look. The decision would run git over that
+    /// repository, and a worker that planted a clean filter there would have it run (issue #114).
+    /// </summary>
+    public void KeepForTamper(string reason)
+    {
+        Action = "kept";
+        Reason = reason;
+    }
+
+    /// <summary>
     /// The decision after the worker: the worktree goes when it holds no change and its branch no
     /// commit beyond the base, and it stays otherwise. A git error never removes anything: the
-    /// worktree stays and the error is the reason.
+    /// worktree stays and the error is the reason. Every git call of the decision is pinned to the
+    /// repository it read before the worker ran — the pins of the before-worker snapshots the
+    /// caller passes, or, when it passes none, the ones resolved when the worktree was created.
     /// </summary>
-    public async Task FinishAsync()
+    public async Task FinishAsync(WriteScope.Snapshot? worktreeBefore = null, WriteScope.Snapshot? repoBefore = null)
     {
         if (_unverifiable.Length > 0)
         {
@@ -224,9 +259,18 @@ internal sealed class WorktreeRun
             return;
         }
 
+        Git.Pin? worktree = worktreeBefore?.Pin() ?? _worktreePin;
+        Git.Pin? repo = repoBefore?.Pin() ?? _repoPin;
+        if (worktree is null || repo is null)
+        {
+            // The pins of the decision could not be resolved: no git call runs unpinned.
+            Kept("the git dir of the worktree cannot be resolved");
+            return;
+        }
+
         // The branch and the worktree must still point at the commit the branch was created from:
         // a commit the worker made is work that stays.
-        if (!await AtBaseAsync().ConfigureAwait(false))
+        if (!await AtBaseAsync(worktree, repo).ConfigureAwait(false))
         {
             return;
         }
@@ -244,7 +288,7 @@ internal sealed class WorktreeRun
 
         // The link check above passed, so every copied path is plain: the working tree must hold
         // nothing but the files the launcher itself copied in.
-        if (!await EmptyAsync(Exempt()).ConfigureAwait(false))
+        if (!await EmptyAsync(worktree, repo, Exempt()).ConfigureAwait(false))
         {
             return;
         }
@@ -257,22 +301,22 @@ internal sealed class WorktreeRun
             return;
         }
 
-        await RemoveAsync().ConfigureAwait(false);
+        await RemoveAsync(worktree, repo).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Whether the branch and the worktree still point at the commit the branch was created from.
     /// A commit the worker made is work that stays: the worktree is kept and the reason says why.
     /// </summary>
-    private async Task<bool> AtBaseAsync()
+    private async Task<bool> AtBaseAsync(Git.Pin worktree, Git.Pin repo)
     {
-        if (!await OwnsGitDirAsync().ConfigureAwait(false))
+        if (!await OwnsGitDirAsync(worktree, repo).ConfigureAwait(false))
         {
             return false;
         }
 
-        Git.Result? head = await Git.RunResultAsync(WorktreePath, "rev-parse", "--verify", "HEAD").ConfigureAwait(false);
-        Git.Result? branch = await Git.RunResultAsync(_repo, "rev-parse", "--verify", "--end-of-options", "refs/heads/" + Branch).ConfigureAwait(false);
+        Git.Result? head = await Git.RunPinnedResultAsync(worktree, "rev-parse", "--verify", "HEAD").ConfigureAwait(false);
+        Git.Result? branch = await Git.RunPinnedResultAsync(repo, "rev-parse", "--verify", "--end-of-options", "refs/heads/" + Branch).ConfigureAwait(false);
         if (head is null || branch is null)
         {
             Kept("git failed");
@@ -305,14 +349,14 @@ internal sealed class WorktreeRun
     /// Whether the worktree holds nothing but the exempt paths: the emptiness check. A git error
     /// keeps the worktree, and the error is the reason.
     /// </summary>
-    private async Task<bool> EmptyAsync(IReadOnlySet<string> exempt)
+    private async Task<bool> EmptyAsync(Git.Pin worktree, Git.Pin repo, IReadOnlySet<string> exempt)
     {
-        if (!await OwnsGitDirAsync().ConfigureAwait(false))
+        if (!await OwnsGitDirAsync(worktree, repo).ConfigureAwait(false))
         {
             return false;
         }
 
-        Git.Result? status = await StatusAsync().ConfigureAwait(false);
+        Git.Result? status = await StatusAsync(worktree).ConfigureAwait(false);
         if (status is null)
         {
             Kept("git failed");
@@ -341,13 +385,10 @@ internal sealed class WorktreeRun
     /// worktree that git refuses to remove stays, and the error is the reason; a branch that stays
     /// behind after its worktree is gone is a note, not a reason.
     /// </summary>
-    // Residual of the ordering here: background processes the worker left behind are NOT killed
-    // before this decision — once the worker exits they are reparented to init and out of a tree
-    // kill's reach — so any of them can race the check before a delete. The re-check right before
-    // each delete narrows that window but does not close it, and the deletes are plain File.Delete
-    // and Directory.Delete calls, not unlinkat against a re-verified handle, so the window stays
-    // open by exactly that much. The fix is tracked in the issue tracker (issue #116).
-    private async Task RemoveAsync()
+    // The processes the worker left behind cannot race the decision here: the worker's own process
+    // group is signalled when the worker exits, before this decision (issue #116). A process that
+    // leaves the group on its own is out of the launcher's reach either way.
+    private async Task RemoveAsync(Git.Pin worktree, Git.Pin repo)
     {
         // The same refusal once more, at the moment of deletion: a path turned dirty after the
         // first check still deletes nothing.
@@ -369,15 +410,15 @@ internal sealed class WorktreeRun
 
         // The emptiness check again: what is left after the launcher's own files are gone must be
         // nothing at all.
-        if (!await EmptyAsync(new HashSet<string>(StringComparer.Ordinal)).ConfigureAwait(false))
+        if (!await EmptyAsync(worktree, repo, new HashSet<string>(StringComparer.Ordinal)).ConfigureAwait(false))
         {
             return;
         }
 
         // The ignored files (the build output of the run) go with the worktree: they are not work.
-        int ignored = await CountIgnoredAsync().ConfigureAwait(false);
+        int ignored = await CountIgnoredAsync(worktree).ConfigureAwait(false);
 
-        Git.Result? removed = await Git.RunResultAsync(_repo, "worktree", "remove", WorktreePath).ConfigureAwait(false);
+        Git.Result? removed = await Git.RunPinnedResultAsync(repo, "worktree", "remove", WorktreePath).ConfigureAwait(false);
         if (removed is null)
         {
             Kept("git failed");
@@ -393,7 +434,7 @@ internal sealed class WorktreeRun
 
         // The branch goes only while it still points at the commit it was created from: a branch
         // that moved holds work of its own and stays.
-        Git.Result? deleted = await Git.RunResultAsync(_repo, "update-ref", "-d", "refs/heads/" + Branch, BaseSha).ConfigureAwait(false);
+        Git.Result? deleted = await Git.RunPinnedResultAsync(repo, "update-ref", "-d", "refs/heads/" + Branch, BaseSha).ConfigureAwait(false);
         if (deleted?.ExitCode is not 0)
         {
             Note = $"branch kept: {EvidenceBlock.OneLine(deleted?.Stderr.Trim() ?? "git failed")}";
@@ -434,9 +475,9 @@ internal sealed class WorktreeRun
     /// home still compares equal. Empty when the common git dir cannot be read: the check then
     /// fails.
     /// </summary>
-    private async Task<string> ExpectedGitDirAsync()
+    private async Task<string> ExpectedGitDirAsync(Git.Pin repo)
     {
-        string? common = await Git.RunAsync(_repo, "rev-parse", "--git-common-dir").ConfigureAwait(false);
+        string? common = await Git.RunPinnedAsync(repo, "rev-parse", "--git-common-dir").ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(common))
         {
             return string.Empty;
@@ -449,18 +490,19 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
-    /// Whether the worktree directory is still the one git registered for this run:
-    /// <c>git -C &lt;WorktreePath&gt; rev-parse --absolute-git-dir</c> — a path with symlinks
-    /// resolved — must name the invoking repository's own <c>worktrees/&lt;name&gt;</c> directory.
-    /// A directory swapped for another checkout, another worktree of the same repository or a
-    /// foreign repository names something else, and every further git call would read a tree this
-    /// decision cannot judge. Runs before every git call of <see cref="AtBaseAsync"/> and
-    /// <see cref="EmptyAsync"/>.
+    /// Whether the git dir the decision is pinned to is the one the repository registered for this
+    /// run: <c>git rev-parse --absolute-git-dir</c> — a path with symlinks resolved — must name
+    /// the invoking repository's own <c>worktrees/&lt;name&gt;</c> directory. The call is pinned
+    /// to the git dir and the work tree the launcher resolved before the worker ran, so it reads
+    /// the repository the run owns and not one a worker pointed it at (issue #114). A worktree
+    /// whose own ".git" was rewritten is caught by the git metadata watch, which keeps the
+    /// decision from running at all.
+    /// Runs before every git call of <see cref="AtBaseAsync"/> and <see cref="EmptyAsync"/>.
     /// </summary>
-    private async Task<bool> OwnsGitDirAsync()
+    private async Task<bool> OwnsGitDirAsync(Git.Pin worktree, Git.Pin repo)
     {
-        string expected = await ExpectedGitDirAsync().ConfigureAwait(false);
-        Git.Result? actual = await Git.RunResultAsync(WorktreePath, "rev-parse", "--absolute-git-dir").ConfigureAwait(false);
+        string expected = await ExpectedGitDirAsync(repo).ConfigureAwait(false);
+        Git.Result? actual = await Git.RunPinnedResultAsync(worktree, "rev-parse", "--absolute-git-dir").ConfigureAwait(false);
         string actualDir = actual is { ExitCode: 0 } ? actual.Stdout.Trim() : string.Empty;
         if (expected.Length > 0
             && actualDir.Length > 0
@@ -579,6 +621,63 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
+    /// The pins of the decision and the reason the worktree cannot be judged when they do not
+    /// resolve: no git call of the decision may run unpinned.
+    /// </summary>
+    private static async Task<(Git.Pin? Worktree, Git.Pin? Repo, string Unverifiable)> DecisionPinsAsync(string repoRoot, string worktreePath)
+    {
+        (Git.Pin? worktree, Git.Pin? repo) = await PinsAsync(repoRoot, worktreePath).ConfigureAwait(false);
+        string unverifiable = worktree is null || repo is null
+            ? "the git dir of the worktree cannot be resolved"
+            : string.Empty;
+        return (worktree, repo, unverifiable);
+    }
+
+    /// <summary>
+    /// The pins of the git calls of the decision: the worktree's own git dir with the worktree as
+    /// its work tree, and the repository's own git dir with the repository as its work tree. They
+    /// are resolved here — before the worker runs — so the calls of the decision read the
+    /// repository the launcher started in, whatever the worker writes since (issue #114). Null for
+    /// a directory git does not resolve a git dir for.
+    /// </summary>
+    private static async Task<(Git.Pin? Worktree, Git.Pin? Repo)> PinsAsync(string repoRoot, string worktreePath)
+    {
+        Git.Pin? worktree = await PinAsync(worktreePath).ConfigureAwait(false);
+        Git.Pin? repo = await PinAsync(repoRoot).ConfigureAwait(false);
+        return (worktree, repo);
+    }
+
+    /// <summary>
+    /// The pin of one directory: the git dir git resolves for it, the directory itself as the
+    /// work tree and the common git dir git resolves for it. The common dir is part of the pin
+    /// because git reads "$GIT_DIR/commondir" in every git dir, a main ".git" included: a worker
+    /// that wrote one there would move the call to a copy of the git dir of its own, whose config
+    /// carries a clean filter (issue #114). Null when git does not resolve a git dir for it — and
+    /// null when it does not resolve a common dir either: a pin without a common dir would run
+    /// the call with the common dir git resolves for itself, so there is no pin at all and the
+    /// caller keeps the worktree.
+    /// </summary>
+    private static async Task<Git.Pin?> PinAsync(string dir)
+    {
+        Git.Result? result = await Git.RunResultAsync(dir, "rev-parse", "--absolute-git-dir").ConfigureAwait(false);
+        string gitDir = result is { ExitCode: 0 } ? result.Stdout.Trim() : string.Empty;
+        if (gitDir.Length is 0)
+        {
+            return null;
+        }
+
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(dir).ConfigureAwait(false);
+        if (dirs is null || dirs.Common.Length is 0)
+        {
+            // No common dir: no pin. The call would run with the common dir git resolves for
+            // itself, which is the one a worker may have pointed at a copy of its own.
+            return null;
+        }
+
+        return new Git.Pin(gitDir, Path.GetFullPath(dir), dirs.Common);
+    }
+
+    /// <summary>
     /// Whether the repository already has the branch.
     /// </summary>
     private static async Task<bool> BranchExistsAsync(string repoRoot, string branch)
@@ -630,15 +729,15 @@ internal sealed class WorktreeRun
     /// paths are printed raw (no quoting), so they can be compared with the paths the launcher
     /// recorded.
     /// </summary>
-    private async Task<Git.Result?> StatusAsync() =>
-        await Git.RunResultAsync(WorktreePath, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all").ConfigureAwait(false);
+    private static async Task<Git.Result?> StatusAsync(Git.Pin worktree) =>
+        await Git.RunPinnedResultAsync(worktree, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all").ConfigureAwait(false);
 
     /// <summary>
     /// The ignored files of the worktree (the build output of the run): they are counted, not kept.
     /// </summary>
-    private async Task<int> CountIgnoredAsync()
+    private static async Task<int> CountIgnoredAsync(Git.Pin worktree)
     {
-        Git.Result? result = await Git.RunResultAsync(WorktreePath, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored", "--untracked-files=all").ConfigureAwait(false);
+        Git.Result? result = await Git.RunPinnedResultAsync(worktree, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored", "--untracked-files=all").ConfigureAwait(false);
         if (result?.ExitCode is not 0)
         {
             return 0;
@@ -756,13 +855,9 @@ internal sealed class WorktreeRun
             }
         }
 
-        string system = Path.Combine(setup, "system");
-        if (Directory.Exists(system))
+        foreach (string file in FileTree.FilesUnder(setup, "system"))
         {
-            foreach (string file in Directory.EnumerateFiles(system, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
-            {
-                files.Add(new SetupFile(Relative(setup, file), file));
-            }
+            files.Add(new SetupFile(Relative(setup, file), file));
         }
 
         foreach (string file in Directory.EnumerateFiles(setup, "code-*.md").Order(StringComparer.Ordinal))

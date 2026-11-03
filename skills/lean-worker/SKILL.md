@@ -192,6 +192,12 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   also give the `quota:` line: it is how the user sees what is left on the plan.
 - For a closer look, run `git diff --stat`, then read only the files that matter.
 
+The worker's process group is signalled when the worker exits (Linux, through `setsid`): a process it
+left behind gets a SIGTERM and, five seconds later, a SIGKILL, and the evidence block counts it
+(`- leftovers: N`). A worker that calls `setsid`/`setpgid` itself, or double-forks into a new
+session, leaves the group: the kill covers the children that stay in it (lean-worker#121 tracks a
+cgroup).
+
 ## 5. When it wraps up or fails
 
 - `status: wrapped-up` (exit 3): the worker reached the wrap-up share of its budget and left a
@@ -204,6 +210,20 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   Offer it to the user in one sentence; run it only on their go.
 - `status: budget-exceeded`: the launcher stopped the worker at the budget before it could hand off.
   Check the state with `git status`, then lower `wrapUpAt` for that profile or raise its budget.
+- `status: truncated` (exit 1): the provider's output limit cut the worker's last step off and that
+  step produced nothing, so the run is not a success even when the worker exited cleanly — the
+  result block's `reason=length` says so. Nothing new was written: check `git status`, then run
+  again with a narrower task, or with a model that has a bigger output budget.
+- `status: out-of-scope` (exit 1): the run changed the repository's own git metadata — the config or
+  the hooks of the shared `.git` — which every later git call runs. The changed files are listed in
+  the evidence block (`- git-tamper: .git/config`) and a warning goes to stderr. Show the user the
+  list and ask what to do with it; do not accept the run as it is. Such a run gets no continuation
+  invitation, and `--continue-from` on its run directory is refused (exit 1): look at the metadata
+  before running anything else.
+- A wrap-up without a `continue:` line, or a failed run without an `escalate:` line: the launcher
+  could not verify the repository's own git metadata (its `summary.json` records
+  `git_metadata_verified: false`), so it invites nothing. Look at the metadata before running
+  anything else; `--continue-from` on that run directory is refused (exit 1) too.
 - Otherwise the worker's session is not kept. Sharpen `task.md` (goal, start-here paths, scope) or
   split the task, and run again. Each run gets its own directory.
 - If the cause is general (a missing command, an unknown convention), fix `project.md` or the
@@ -219,8 +239,10 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
 - Give a task that edits code its write scope: `--write-scope "src/Foo/**"` (repeatable, relative to the git
   root; a directory covers everything under it) or the profile key `writeScope`. The launcher compares the
   working tree before and after the run: the `files:` line counts what changed, `summary.json` lists it
-  (`changed_files`, `out_of_scope`), and a `WARNING` names the files outside the scope. The status does not
-  change: check those files (revert or accept them) before you accept the run. A continuation keeps the scope.
+  (`changed_files`, `out_of_scope`), and a `WARNING` names the files outside the scope. A file the launcher
+  cannot read (no permission) is listed as `unverified: <path>`: it could not tell whether the run changed
+  it. The status does not change: check those files (revert or accept them) before you accept the run. A
+  continuation keeps the scope.
 
 ## Gate (optional): the run ends when a check passes
 

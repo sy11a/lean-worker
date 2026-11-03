@@ -1827,28 +1827,29 @@ public sealed class GateTrustLoopTests : IDisposable
         string scratch = _dirs.Create("lw-gate-between");
         string script = await GateLoopTests.WriteSequenceScriptAsync(scratch, (1, 3), (1, 2), (0, 0));
         RunAsyncGolden.WriteProfile(root, "test", GateLoopTests.GateProfile(script));
-        string tamper = target is "global.json"
-            ? "printf '{}' > global.json"
-            : "printf ' ' >> '" + Path.Combine(root, "profiles.json") + "'";
         string counter = Path.Combine(scratch, "w");
         string tampered = Path.Combine(scratch, "tampered");
+        string cwd = string.Empty;
 
-        // Round 1's worker leaves a background process that waits until round 1 is recorded, then
-        // tampers and does not restore. Round 2's worker waits for it, so the change is on disk before
-        // round 2's gate check no matter how the launcher is scheduled.
+        // The tamperer is the test itself, not a background process of the worker (since #116 the
+        // launcher kills the worker's whole process group when the worker exits): it waits until
+        // round 1 is recorded, tampers and does not restore. Round 2's worker waits for the marker,
+        // so the change is on disk before round 2's gate check no matter how the launcher is scheduled.
+        Task tamperer = Task.Run(async () => await TamperAfterRoundOneAsync(root, () => cwd, target, tampered), TestContext.Current.CancellationToken);
         string worker =
             "N=$(cat '" + counter + "' 2>/dev/null || echo 0); N=$((N+1)); echo $N > '" + counter + "'\n" +
-            "if [ $N = 1 ]; then\n" +
-            "  ( i=0; while [ $i -lt 400 ]; do\n" +
-            "      if ls '" + root + "'/runs/*/summary.json >/dev/null 2>&1; then " + tamper + "; touch '" + tampered + "'; exit 0; fi\n" +
-            "      sleep 0.05; i=$((i+1)); done ) >/dev/null 2>&1 </dev/null &\n" +
-            "else\n" +
+            "if [ $N != 1 ]; then\n" +
             "  i=0; while [ ! -e '" + tampered + "' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n" +
             "fi\n" + RunAsyncGolden.SuccessStream;
 
-        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker, _ => _dirs.Track(Directory.GetCurrentDirectory()));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, worker, _ =>
+        {
+            cwd = Directory.GetCurrentDirectory();
+            _dirs.Track(cwd);
+        });
+        await tamperer;
 
-        Assert.True(File.Exists(tampered), "the background process never tampered");
+        Assert.True(File.Exists(tampered), "the test never tampered");
         Assert.Equal(5, code);
         Assert.Equal("1", (await File.ReadAllTextAsync(Path.Combine(scratch, "n"), TestContext.Current.CancellationToken)).Trim());
         string[] names = GateLoopTests.RunDirNames(root);
@@ -1858,6 +1859,37 @@ public sealed class GateTrustLoopTests : IDisposable
         Assert.Equal("error", gate["decision"]!.GetValue<string>());
         Assert.Contains(target, gate["error"]!.GetValue<string>(), StringComparison.Ordinal);
         Assert.Contains("gate:     ERROR:", stdout, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Waits until round 1's summary.json is on disk, then tampers with the trusted file and leaves a marker. Done by the
+    /// test itself: a background process of the worker is killed with the worker's group (#116).
+    /// </summary>
+    private static async Task TamperAfterRoundOneAsync(string root, Func<string> cwd, string target, string marker)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string runs = Path.Combine(root, "runs");
+        // Only reads in the poll loop.
+        for (int i = 0; i < 400 && !(cwd().Length > 0 && Directory.Exists(runs) && Directory.EnumerateDirectories(runs).Any(d => File.Exists(Path.Combine(d, "summary.json")))); i++)
+        {
+            await Task.Delay(50, ct);
+        }
+
+        if (cwd().Length is 0 || !Directory.Exists(runs))
+        {
+            return;
+        }
+
+        if (target is "global.json")
+        {
+            await File.WriteAllTextAsync(Path.Combine(cwd(), "global.json"), "{}", ct);
+        }
+        else
+        {
+            await File.AppendAllTextAsync(Path.Combine(root, "profiles.json"), " ", ct);
+        }
+
+        await File.WriteAllTextAsync(marker, string.Empty, ct);
     }
 
     // ---- unreadable directories and FIFOs -------------------------------------------------------------------

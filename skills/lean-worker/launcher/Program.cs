@@ -9,7 +9,8 @@
 // budget a pre-tool hook blocks every tool call, so the worker's last message is a handoff; at the budget the
 // launcher stops the worker.
 //
-// Exit codes: 0 = worker finished without error (or a gate chain ended clean), 1 = worker reported an error,
+// Exit codes: 0 = worker finished without error (or a gate chain ended clean), 1 = worker reported an error
+// (or the provider's output limit truncated the run),
 // 2 = launcher failed, 3 = worker wrapped up near its budget and left a handoff (continue with
 // --continue-from <run-dir>), 4 = a gate chain ended stuck, 5 = a gate chain ended in an error.
 

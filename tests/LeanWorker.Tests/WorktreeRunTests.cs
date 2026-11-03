@@ -139,27 +139,76 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     // ---- branch delete ----
 
     [Fact]
-    public async Task A_branch_that_moved_before_the_removal_survives_and_the_note_says_soAsync()
+    public async Task The_launchers_own_git_calls_do_not_run_the_core_fsmonitor_hook_so_it_cannot_move_the_branchAsync()
     {
+        // Since #114 the launcher's own git calls carry -c core.fsmonitor= : a worker that planted a
+        // fsmonitor hook in the shared config can no longer move the branch (or anything else)
+        // while the launcher looks at the working tree.
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
         WorktreeRun wt = await CreateAsync("HEAD");
         string baseSha = await GitAsync(_repo, "rev-parse", "HEAD");
-        // A commit with the same tree: the worktree stays clean after the branch moved onto it.
         string moved = await GitAsync(_repo, "commit-tree", baseSha + "^{tree}", "-p", baseSha, "-m", "moved");
 
-        // The branch moves while the launcher looks at the working tree (after it checked the branch
-        // and before it deletes it): git consults core.fsmonitor on every status.
+        string ran = Path.Combine(_root, "fsmonitor-ran");
         string hook = Path.Combine(_root, "fsmonitor.sh");
-        WriteScript(hook, $"#!/bin/sh\ngit update-ref refs/heads/{Branch} {moved} {baseSha} >/dev/null 2>&1\nexit 1\n");
+        WriteScript(hook, $"#!/bin/sh\ntouch '{ran}'\ngit update-ref refs/heads/{Branch} {moved} {baseSha} >/dev/null 2>&1\nexit 1\n");
         _ = await GitAsync(_repo, "config", "core.fsmonitor", hook);
+
+        // Control: a plain git call (without the launcher's options) does run the hook, so the
+        // assertions below prove the launcher's calls skip it and not that the hook never works.
+        await RunPlainGitAsync(_repo, "status");
+        Assert.True(File.Exists(ran), "control: a plain git status should run the fsmonitor hook");
+        File.Delete(ran);
+        _ = await GitAsync(_repo, "update-ref", "refs/heads/" + Branch, baseSha);
+
+        await wt.FinishAsync();
+
+        Assert.False(File.Exists(ran), "the launcher's git calls ran the fsmonitor hook");
+        Assert.Equal("removed", wt.Action);
+        Assert.Equal("empty", wt.Reason);
+        Assert.False(Directory.Exists(wt.WorktreePath));
+        Assert.Null(wt.Note);
+        Assert.False(await BranchExistsAsync(Branch));
+    }
+
+    [Fact]
+    public async Task The_launchers_own_git_calls_do_not_run_a_hook_from_core_hooksPathAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
+        WorktreeRun wt = await CreateAsync("HEAD");
+        string ran = Path.Combine(_root, "hook-ran");
+        string hooks = Path.Combine(_root, "evil-hooks");
+        _ = Directory.CreateDirectory(hooks);
+        WriteScript(Path.Combine(hooks, "reference-transaction"), $"#!/bin/sh\ntouch '{ran}'\n");
+        _ = await GitAsync(_repo, "config", "core.hooksPath", hooks);
+
+        // Control: a plain git call that updates a ref runs the hook.
+        string baseSha = await GitAsync(_repo, "rev-parse", "HEAD");
+        await RunPlainGitAsync(_repo, "update-ref", "refs/heads/control", baseSha);
+        Assert.True(File.Exists(ran), "control: a plain ref update should run the reference-transaction hook");
+        File.Delete(ran);
 
         await wt.FinishAsync();
 
         Assert.Equal("removed", wt.Action);
-        Assert.Equal("empty", wt.Reason);
-        Assert.False(Directory.Exists(wt.WorktreePath));
-        Assert.NotNull(wt.Note);
-        Assert.StartsWith("branch kept: ", wt.Note, StringComparison.Ordinal);
-        Assert.Equal(moved, await GitAsync(_repo, "rev-parse", "refs/heads/" + Branch));
+        Assert.False(File.Exists(ran), "the launcher's git calls ran a hook from core.hooksPath");
+    }
+
+    private static async Task RunPlainGitAsync(string dir, params string[] args)
+    {
+        System.Diagnostics.ProcessStartInfo psi = new("git") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        psi.ArgumentList.Add("-C");
+        psi.ArgumentList.Add(dir);
+        foreach (string a in args)
+        {
+            psi.ArgumentList.Add(a);
+        }
+
+        using System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi)!;
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        _ = await p.StandardOutput.ReadToEndAsync(ct);
+        _ = await p.StandardError.ReadToEndAsync(ct);
+        await p.WaitForExitAsync(ct);
     }
 
     // ---- exemption ----
@@ -684,7 +733,8 @@ public sealed class WorktreeRunTests : IAsyncLifetime
 
             WriteScope.Snapshot snapshot = (await WriteScope.TakeAsync(_repo))!;
 
-            Assert.Equal("?", snapshot.Dirty["locked.txt"]);
+            // The marker plus the metadata still readable (#118): size, mtime ticks, unix mode (000 -> 0).
+            Assert.Matches(@"^\?\|7\|\d+\|0$", snapshot.Dirty["locked.txt"]);
         }
         finally
         {
@@ -742,6 +792,53 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         {
             Unlock(locked);
         }
+    }
+
+    [Fact]
+    [UnsupportedOSPlatform("windows")]
+    public async Task An_unreadable_file_in_the_invoking_repository_nobody_touched_is_listed_as_unverified_not_changedAsync()
+    {
+        SkipWithoutSymlinks();
+        Assert.SkipWhen(Environment.IsPrivilegedProcess, "chmod 000 has no effect for root");
+        string locked = Path.Combine(_repo, "locked.txt");
+        await WriteLockedAsync(locked);
+        try
+        {
+            (int code, _, JsonObject s) = await LaunchWorktreeAsync("true");
+
+            Assert.Equal(0, code);
+            Assert.Contains("- unverified: <invoking>/locked.txt", Lines(s), StringComparer.Ordinal);
+            Assert.Empty(OutOfScope(s));
+        }
+        finally
+        {
+            Unlock(locked);
+        }
+    }
+
+    [Fact]
+    public async Task A_worker_that_writes_the_worktrees_config_worktree_is_listed_as_git_tamper_and_the_run_is_not_a_successAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
+        string script = "printf '[core]\\n\\thooksPath = /dev/null\\n' > \"$(git -C '" + WorktreePath + "' rev-parse --absolute-git-dir)/config.worktree\"";
+
+        (int code, _, JsonObject s) = await LaunchWorktreeAsync(script);
+
+        Assert.Contains(Lines(s), l => l.StartsWith("- git-tamper: ", StringComparison.Ordinal) && l.EndsWith("/config.worktree", StringComparison.Ordinal));
+        Assert.NotEqual("success", s["status"]!.GetValue<string>(), StringComparer.Ordinal);
+        Assert.NotEqual(0, code);
+    }
+
+    [Fact]
+    public async Task A_worker_that_writes_the_shared_git_config_of_the_invoking_repository_is_listed_as_git_tamperAsync()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
+
+        (int code, _, JsonObject s) = await LaunchWorktreeAsync("printf '[core]\\n\\thooksPath = /dev/null\\n' >> '" + Path.Combine(_repo, ".git", "config") + "'");
+
+        Assert.Contains("- git-tamper: .git/config", Lines(s), StringComparer.Ordinal);
+        Assert.NotEqual("success", s["status"]!.GetValue<string>(), StringComparer.Ordinal);
+        Assert.NotEqual(0, code);
     }
 
     [Fact]

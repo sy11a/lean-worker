@@ -26,10 +26,14 @@ internal static class EvidenceBlock
     /// The evidence lines of one run, in the order they appear in the block: the run's status, exit
     /// code, terminal reason and duration; one line per gate command (its outcome, exit code and
     /// duration) with its report path on a line of its own when it has one, or a single "not run"
-    /// line when no gate ran; then one line per changed file and one line per file outside the write
-    /// scope. Every value is put on one line, so nothing in it can start a line of its own.
+    /// line when no gate ran; then one line per changed file, one line per file outside the write
+    /// scope and one line per file the launcher could not read; then the files of the repository's
+    /// own git metadata the run changed; then the worktree's line; then the number of processes
+    /// the worker left behind. Every value is put on one line, so nothing in it can start a line
+    /// of its own.
     /// </summary>
-    public static List<string> Build(JsonObject summary)
+    public static List<string> Build(JsonObject summary, IReadOnlyList<string>? unverified = null,
+        IReadOnlyList<string>? gitTamper = null, int leftovers = -1)
     {
         string status = OneLine(Json.Str(summary, "status") ?? "(none)");
         string terminalReason = OneLine(Json.Str(summary, "terminal_reason") ?? "(none)");
@@ -45,8 +49,48 @@ internal static class EvidenceBlock
         ];
         lines.AddRange(GateLines(summary["gate"] as JsonObject));
         lines.AddRange(ChangedLines(summary));
+        lines.AddRange(UnverifiedLines(unverified));
+        lines.AddRange(GitTamperLines(gitTamper));
         lines.AddRange(WorktreeLines(summary["worktree"] as JsonObject));
+        lines.AddRange(LeftoverLines(leftovers));
         return lines;
+    }
+
+    /// <summary>
+    /// The git-tamper lines: one per file of the repository's own git metadata (the config, the
+    /// hooks, the worktree's own config) the run changed. The run had no business there.
+    /// </summary>
+    private static List<string> GitTamperLines(IReadOnlyList<string>? gitTamper) =>
+        PathLines(gitTamper, "git-tamper");
+
+    /// <summary>
+    /// The leftovers line: how many processes of the worker's own group were still alive when the
+    /// worker exited. The launcher signalled the group right after, so they are gone. The line is
+    /// left out when the count is not known (-1).
+    /// </summary>
+    private static List<string> LeftoverLines(int leftovers) =>
+        leftovers < 0 ? [] : [$"- leftovers: {leftovers.ToString(CultureInfo.InvariantCulture)}"];
+
+    /// <summary>
+    /// The unverified lines: one per path the launcher could not read in either snapshot, so it
+    /// could not tell whether the run changed it. The run says so instead of counting the path as
+    /// unchanged.
+    /// </summary>
+    private static List<string> UnverifiedLines(IReadOnlyList<string>? unverified) =>
+        PathLines(unverified, "unverified");
+
+    /// <summary>
+    /// The lines of one kind of path: one line per path, each of them named by its kind, and none
+    /// when there is no path to name.
+    /// </summary>
+    private static List<string> PathLines(IReadOnlyList<string>? paths, string kind)
+    {
+        if (paths is null || paths.Count is 0)
+        {
+            return [];
+        }
+
+        return [.. paths.Select(path => $"- {kind}: {OneLine(path)}")];
     }
 
     /// <summary>

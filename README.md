@@ -549,11 +549,94 @@ to sweep.
 
 Exit codes:
 - `0`: success. With a gate, the gate is clean.
-- `1`: the worker reported an error or failed.
+- `1`: the worker reported an error or failed. A run the provider's output limit cut off
+  (`status: truncated`) exits `1` too: it is not a success, and neither is a run that changed the
+  repository's own git metadata (`status: out-of-scope`).
 - `2`: the launcher failed, including a gate configuration refused before the worker ran.
-- `3`: the worker wrapped up near its budget and left a handoff.
+- `3`: the worker wrapped up near its budget and left a handoff. A run that changed the repository's
+  own git metadata is never a wrap-up: it exits `1`, and it does not invite a continuation. A run
+  whose git metadata the launcher could not verify does not invite a continuation either.
 - `4`: the gate is stuck.
 - `5`: the gate failed, or a trusted input changed.
+
+A run the provider's output limit cut off is never a success: when the last step stopped on the
+limit and produced nothing (no final text, no output tokens), the run ends with
+`status: truncated` and `terminal_reason: length`, and it exits `1` like a failed run. The report
+of such a run is the text of an earlier step, or none at all, so treat it as a run to repeat — with
+a narrower task or a model with a bigger output budget — and not as a finished one.
+
+### The repository's own git metadata is watched
+
+A run shares the repository's git dir with it: a `--worktree` run shares the `.git` of the
+repository the launcher was called in, and a run without one works in the repository itself. A
+worker can therefore set `core.fsmonitor` or `core.hooksPath` in `.git/config`, or write a hook of
+its own into `.git/hooks` — and every git call after that runs it: the launcher's own and your next
+session's. The write-scope snapshot is `git status` based and never sees any of it, so the launcher
+watches the metadata itself: the config and every file under the hooks (by name, so an added or a
+removed hook counts) of the common git dir, the `info/attributes` file, the per-worktree
+`config.worktree` and the two files that redirect a worktree to the git dir it belongs to
+(`commondir`, `gitdir`) are hashed before the worker and after it. The common git dir's own
+`commondir` and `gitdir` files are watched as well: git reads `$GIT_DIR/commondir` in every git
+dir, a main `.git` included, so a worker that wrote one there pointed every call that reads the
+repository at a copy of the git dir of its own. A hook is hashed with its mode,
+so an exec bit added to an existing hook counts, and a hooks directory that is a link is hashed as
+the link it is — never followed.
+
+The directories are the ones git itself resolves, and they are resolved once: before the worker.
+The after pass hashes exactly those paths and runs no git at all, so a worker that redirected the
+worktree to a copy of the git dir it made cannot make the copy hash clean: the redirect is a
+watched file itself, and the copy is never looked at.
+
+A difference is an out-of-scope finding: the changed files are listed in the evidence block
+(`- git-tamper: .git/config`), a warning goes to the error stream, and the run ends with
+`status: out-of-scope` and exit `1` — whatever the worker said about itself. A wrap-up is no
+exception: it ends with `status: out-of-scope` and exit `1` too, not `3`, and it does not invite a
+continuation. A tampered run gets no invitation at all — no `escalate:` line either — and
+`--continue-from` refuses a run directory whose summary records the tamper (exit `1`), so a fresh
+worker cannot run on the repository the first one changed. Metadata the launcher cannot read after
+the run is a finding as well
+(`- git-tamper: git-metadata: unreadable after the run`), never silence.
+
+The same rule holds when the launcher cannot tell at all: the invitations (the `continue:` line of
+a wrap-up, the `escalate:` line of a failed run) need a known verdict and no findings — the rule
+the worktree decision uses. A run whose metadata watch never started has no verdict, so it gets no
+invitation either, and its summary records `git_metadata_verified: false`. `--continue-from`
+refuses such a run directory as well (exit `1`, the same message style as the refusal of a
+tampered one): a fresh worker must not run on a repository whose config may carry what the first
+one planted. A summary written before the field existed says nothing about the verdict and is
+continued as before. A workspace that is not a git working tree has no metadata to watch at all: the
+field is left out there, `--continue-from` continues such a run as before — and no invitation is
+offered either, since the launcher cannot tell that there is no repository there.
+
+The launcher's own git calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the
+subcommand: that stops the fsmonitor and the hooks, nothing else. A clean filter the worker
+planted (`filter.<x>.clean` in the config, named by a `.gitattributes`) still runs under
+`git status` — so a run whose git metadata changed skips the git-status pass altogether: its
+changed files stay unknown, and the run says why
+(`note: changed-files: skipped, the run changed the repository's git metadata`). A run whose
+metadata the launcher could not verify at all skips it as well
+(`note: changed-files: skipped, the git metadata could not be verified`).
+
+The calls the launcher makes after the worker ran are pinned to the repository it started in: the
+git dir, the work tree and the common git dir it resolved before the worker are all named
+(`--git-dir`, `--work-tree` and `GIT_COMMON_DIR`), so a worker that wrote a `.git` file, a
+`commondir` file or a config of its own cannot move them to a repository of its own. The refs are
+the exception: git's ref store ignores `GIT_COMMON_DIR` and still follows a planted `commondir` for
+them. The refs are covered by the metadata hash instead (both `commondir` files are watched, so a
+planted one is a finding) and by the tamper gate: a run whose git metadata changed is out of scope,
+and no decision over the repository is made for it.
+
+### The worker runs in a process group of its own
+
+The worker leads a process group of its own (Linux, through `setsid`), and the group is signalled
+when the worker exits: the processes it leaves behind are reparented to init the moment it is gone
+and out of a tree kill's reach, so they could race the `--worktree` cleanup. The group gets a
+SIGTERM, the members that survive five seconds a SIGKILL, and the evidence block counts the members
+that were still alive (`- leftovers: N`). Without `setsid` the worker runs as before, whatever it
+leaves behind stays behind, and the run says so (`note: process-group: unavailable`). A worker
+that calls `setsid`/`setpgid` itself, or double-forks into a new session, leaves the group: the
+kill covers the children that stay in it (lean-worker#121 tracks a cgroup). Members that are still
+there after the SIGKILL are reported too (`note: process-group: N processes survived SIGKILL`).
 
 ## Cost notes from real runs
 
@@ -589,7 +672,7 @@ Exit codes:
 - `settings.json` (claude runtime, lean mode) or `opencode-config.json` (opencode runtime)
 - `wrapup.json` when the wrap-up fired, and `hook.log`, one line per hook check
 - `summary.json`
-- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results and the files the run changed). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
+- `report.md`, the worker's own report with the launcher's evidence block appended (a `## Evidence (written by the launcher)` section: the run's status, exit code, terminal reason and duration, the gate's results, the files the run changed, the files the launcher could not read, the files of the repository's own git metadata the run changed and the processes the worker left behind). The last Evidence block in report.md is the launcher's; anything above it is the worker's text.
 
 `.lean-worker/runs.jsonl` gets one JSON line per run, recording:
 
@@ -602,6 +685,7 @@ Exit codes:
 - quota before and after the run, and the percentage it used, on a subscription with a quota adapter;
 - the next model the run offered (`escalate_to`), if any;
 - the write scope, the files the run changed in the git working tree, and those outside the scope;
+- the verdict over the repository's own git metadata (`git_metadata_verified`: true when the launcher knows the run left the config and the hooks alone, false when it knows it changed them or could not tell), in a git working tree; a workspace that is not one has no metadata to watch, and the field is left out there;
 - the worktree the run owned (`worktree`: its path, its branch, whether it was removed or kept and why), when it had one;
 - the evidence lines (`evidence_lines`): the same facts the report's evidence block carries, one string per line.
 
