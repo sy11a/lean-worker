@@ -11,11 +11,12 @@ internal static class Git
     internal sealed record Result(int ExitCode, string Stdout, string Stderr);
 
     /// <summary>
-    /// A git call bound to one repository: the git dir it reads and the work tree it compares it
-    /// with. Both are named, so a worker that rewrote a ".git" file (the "gitdir:" pointer of a
-    /// linked worktree) or a config cannot move the call to a repository of its own.
+    /// A git call bound to one repository: the git dir it reads, the work tree it compares it
+    /// with and the common git dir it takes the shared files from. All are named, so a worker
+    /// that rewrote a ".git" file (the "gitdir:" pointer of a linked worktree), a "commondir"
+    /// file or a config cannot move the call to a repository of its own.
     /// </summary>
-    internal sealed record Pin(string GitDir, string WorkTree);
+    internal sealed record Pin(string GitDir, string WorkTree, string? Common);
 
     /// <summary>
     /// The options every git call of the launcher carries, before the subcommand (where git reads
@@ -74,8 +75,8 @@ internal static class Git
     }
 
     /// <summary>
-    /// A git call pinned to the git dir and the work tree that were resolved before the worker ran,
-    /// for the calls the launcher makes after the worker exited.
+    /// A git call pinned to the git dir, the work tree and the common git dir that were resolved
+    /// before the worker ran, for the calls the launcher makes after the worker exited.
     ///
     /// Why the pin: the worker is untrusted, and every file it could write may point git somewhere
     /// else. A worker that rewrites the ".git" of the working tree (the "gitdir:" file of a linked
@@ -84,8 +85,11 @@ internal static class Git
     /// the worker is gone. Naming the git dir and the work tree (--git-dir, --work-tree) makes the
     /// call read the repository the launcher started in, whatever the worker wrote since; the
     /// global and the system config are switched off as well, so no config outside that repository
-    /// can add a filter either. The calls made before the worker ran stay as they are: there the
-    /// repository is still the one the operator handed over.
+    /// can add a filter either. The common git dir is pinned in the environment (GIT_COMMON_DIR)
+    /// for the same reason: git reads "$GIT_DIR/commondir" in every git dir, a main ".git"
+    /// included, so a worker that wrote one there pointed the call at a copy of the git dir of its
+    /// own — and the common dir in the environment wins over that file. The calls made before the
+    /// worker ran stay as they are: there the repository is still the one the operator handed over.
     /// </summary>
     internal static async Task<string?> RunPinnedAsync(Pin pin, params string[] args) =>
         Out(await RunPinnedResultAsync(pin, args).ConfigureAwait(false));
@@ -110,6 +114,17 @@ internal static class Git
 
         psi.Environment["GIT_CONFIG_GLOBAL"] = _globalConfig;
         psi.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
+        // The common git dir of the pin: it is the directory git takes the shared files (the
+        // config, the hooks, the attributes) from, and git reads "$GIT_DIR/commondir" in every git
+        // dir — a main ".git" included. A worker that wrote one there moved the call to a copy of
+        // the git dir of its own, whose config carries the clean filter the call then runs. The
+        // common dir named in the environment wins over that file, so the call reads the
+        // repository the launcher started in (issue #114).
+        if (pin.Common is { Length: > 0 } common)
+        {
+            psi.Environment["GIT_COMMON_DIR"] = common;
+        }
+
         return await StartAsync(psi).ConfigureAwait(false);
     }
 

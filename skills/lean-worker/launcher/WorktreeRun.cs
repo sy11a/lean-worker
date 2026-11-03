@@ -67,8 +67,9 @@ internal sealed class WorktreeRun
     /// The git calls of the decision, pinned to the repository they read: the worktree's own git
     /// dir (with the worktree as its work tree) and the repository's own git dir (with the
     /// repository as its work tree). Both are resolved before the worker runs, so a worker that
-    /// rewrote a ".git" file or a config cannot move the decision to a repository of its own — one
-    /// whose config would run its clean filter under the decision (issue #114).
+    /// rewrote a ".git" file, a "commondir" file or a config cannot move the decision to a
+    /// repository of its own — one whose config would run its clean filter under the decision
+    /// (issue #114).
     /// </summary>
     private readonly Git.Pin? _worktreePin;
 
@@ -647,14 +648,23 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
-    /// The pin of one directory: the git dir git resolves for it and the directory itself as the
-    /// work tree. Null when git does not resolve a git dir for it.
+    /// The pin of one directory: the git dir git resolves for it, the directory itself as the
+    /// work tree and the common git dir git resolves for it. The common dir is part of the pin
+    /// because git reads "$GIT_DIR/commondir" in every git dir, a main ".git" included: a worker
+    /// that wrote one there would move the call to a copy of the git dir of its own, whose config
+    /// carries a clean filter (issue #114). Null when git does not resolve a git dir for it.
     /// </summary>
     private static async Task<Git.Pin?> PinAsync(string dir)
     {
         Git.Result? result = await Git.RunResultAsync(dir, "rev-parse", "--absolute-git-dir").ConfigureAwait(false);
         string gitDir = result is { ExitCode: 0 } ? result.Stdout.Trim() : string.Empty;
-        return gitDir.Length > 0 ? new Git.Pin(gitDir, Path.GetFullPath(dir)) : null;
+        if (gitDir.Length is 0)
+        {
+            return null;
+        }
+
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(dir).ConfigureAwait(false);
+        return new Git.Pin(gitDir, Path.GetFullPath(dir), dirs?.Common);
     }
 
     /// <summary>

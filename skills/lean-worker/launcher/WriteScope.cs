@@ -20,11 +20,11 @@ internal static class WriteScope
     internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty, GitMetadata.Dirs? GitDirs = null)
     {
         /// <summary>
-        /// The pin of the git calls that read this tree: its own git dir and the tree itself, both
-        /// as they were when the snapshot was taken. Null when the snapshot carries no git dir
-        /// (the tree was not a git tree, or git could not resolve one).
+        /// The pin of the git calls that read this tree: its own git dir, the tree itself and the
+        /// common git dir, all as they were when the snapshot was taken. Null when the snapshot
+        /// carries no git dir (the tree was not a git tree, or git could not resolve one).
         /// </summary>
-        public Git.Pin? Pin() => GitDirs?.Own is { } own ? new Git.Pin(own, Root) : null;
+        public Git.Pin? Pin() => GitDirs is { } dirs && dirs.Own is { } own ? new Git.Pin(own, Root, dirs.Common) : null;
     }
 
     /// <summary>

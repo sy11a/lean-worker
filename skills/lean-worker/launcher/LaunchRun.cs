@@ -266,8 +266,10 @@ internal sealed class LaunchRun
         }
         catch
         {
-            // A launch that dies leaves no worktree behind either: the same decision as after a
+            // A launch that dies leaves the worktree behind as well: the same decision as after a
             // finished run, reported on the error stream (the run's own report is never written).
+            // A launch that died before the after-worker pass could say whether the run touched
+            // the repository's own git metadata keeps it as "unverified" (issue #114).
             await FinishWorktreeOnFailureAsync().ConfigureAwait(false);
             throw;
         }
@@ -372,10 +374,10 @@ internal sealed class LaunchRun
 
     /// <summary>
     /// The worktree after a failed launch: the same decision as after a finished run, so a launch
-    /// that dies before the worker leaves nothing behind either. A launch that died before the
-    /// after-worker pass could say whether the run touched the repository's own git metadata keeps
-    /// the worktree as well: nothing may be decided over a repository the launcher cannot vouch
-    /// for (issue #114).
+    /// that dies before the worker leaves the worktree behind as well. A launch that died before
+    /// the after-worker pass could say whether the run touched the repository's own git metadata
+    /// keeps it as "unverified": nothing may be decided over a repository the launcher cannot
+    /// vouch for (issue #114).
     /// </summary>
     private async Task FinishWorktreeOnFailureAsync()
     {
@@ -1107,29 +1109,43 @@ internal sealed class LaunchRun
     private const string ChangedFilesSkipped = "changed-files: skipped, the run changed the repository's git metadata";
 
     /// <summary>
+    /// The note when the changed-files pass is skipped because the launcher has no verdict over
+    /// the repository's own git metadata: the watch never started, so it cannot tell whether the
+    /// run changed it.
+    /// </summary>
+    private const string ChangedFilesUnverified = "changed-files: skipped, the git metadata could not be verified";
+
+    /// <summary>
     /// The changed-files bookkeeping after the worker: the workspace's after-worker snapshot, the
     /// changed list and the out-of-scope list it yields, then the invoking repository's comparison
     /// (--worktree) on top.
     /// </summary>
     private async Task SnapshotChangedAsync()
     {
-        if (_gitTamper.Count > 0)
+        if (!TamperAllowsDecision())
         {
-            // The run changed the repository's own git metadata, so the working tree is not
-            // trusted any more: `git status` would run the clean filter the worker planted (the
-            // launcher's own -c options stop the fsmonitor and the hooks, not the filters). The
-            // changed files stay unknown — the "could not tell" path — and the note says why.
+            // The run changed the repository's own git metadata, or the launcher never got a verdict
+            // over it: the working tree is not trusted any more. `git status` would run the clean
+            // filter the worker planted (the launcher's own -c options stop the fsmonitor and the
+            // hooks, not the filters). The changed files stay unknown — the "could not tell" path —
+            // and the note says why. A workspace that is not a git tree has no changed-files pass
+            // to skip: nothing was lost there, so nothing is reported.
             _changed = null;
             _outOfScope = null;
-            _notes.Add(ChangedFilesSkipped);
+            if (_treeBefore is not null || _invokingBefore is not null)
+            {
+                _notes.Add(_gitTamper.Count > 0 ? ChangedFilesSkipped : ChangedFilesUnverified);
+            }
+
             return;
         }
 
         WriteScope.Snapshot? treeBefore = _treeBefore;
         WriteScope.Snapshot? invokingBefore = _invokingBefore;
-        // The after snapshot is pinned to the git dir and the work tree the before pass resolved:
-        // a worker that rewrote the ".git" of the working tree cannot move the call to a
-        // repository of its own, whose config would run its clean filter (issue #114).
+        // The after snapshot is pinned to the git dir, the work tree and the common git dir the
+        // before pass resolved: a worker that rewrote the ".git" of the working tree or planted a
+        // "commondir" file cannot move the call to a repository of its own, whose config would run
+        // its clean filter (issue #114).
         WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore, _runsRoot).ConfigureAwait(false);
         _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
         _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
@@ -1307,8 +1323,9 @@ internal sealed class LaunchRun
         try
         {
             (string runsDir, string ledger) = InvokingExcludes();
-            // Pinned to the git dir and the work tree of the before snapshot, like the workspace's
-            // own after snapshot: the worker must not be able to move the call (issue #114).
+            // Pinned to the git dir, the work tree and the common git dir of the before snapshot,
+            // like the workspace's own after snapshot: the worker must not be able to move the call
+            // (issue #114).
             invokingAfter = await WriteScope.TakeAsync(invokingBefore, runsDir, ledger).ConfigureAwait(false)
                 ?? NoteInvokingUnchecked(InvokingUncheckedReason);
         }

@@ -574,7 +574,10 @@ session's. The write-scope snapshot is `git status` based and never sees any of 
 watches the metadata itself: the config and every file under the hooks (by name, so an added or a
 removed hook counts) of the common git dir, the `info/attributes` file, the per-worktree
 `config.worktree` and the two files that redirect a worktree to the git dir it belongs to
-(`commondir`, `gitdir`) are hashed before the worker and after it. A hook is hashed with its mode,
+(`commondir`, `gitdir`) are hashed before the worker and after it. The common git dir's own
+`commondir` and `gitdir` files are watched as well: git reads `$GIT_DIR/commondir` in every git
+dir, a main `.git` included, so a worker that wrote one there pointed every call that reads the
+repository at a copy of the git dir of its own. A hook is hashed with its mode,
 so an exec bit added to an existing hook counts, and a hooks directory that is a link is hashed as
 the link it is — never followed.
 
@@ -595,7 +598,14 @@ subcommand: that stops the fsmonitor and the hooks, nothing else. A clean filter
 planted (`filter.<x>.clean` in the config, named by a `.gitattributes`) still runs under
 `git status` — so a run whose git metadata changed skips the git-status pass altogether: its
 changed files stay unknown, and the run says why
-(`note: changed-files: skipped, the run changed the repository's git metadata`).
+(`note: changed-files: skipped, the run changed the repository's git metadata`). A run whose
+metadata the launcher could not verify at all skips it as well
+(`note: changed-files: skipped, the git metadata could not be verified`).
+
+The calls the launcher makes after the worker ran are pinned to the repository it started in: the
+git dir, the work tree and the common git dir it resolved before the worker are all named
+(`--git-dir`, `--work-tree` and `GIT_COMMON_DIR`), so a worker that wrote a `.git` file, a
+`commondir` file or a config of its own cannot move them to a repository of its own.
 
 ### The worker runs in a process group of its own
 

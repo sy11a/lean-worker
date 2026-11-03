@@ -8,7 +8,9 @@
 // worker runs (git itself resolves them), and the after pass hashes exactly those paths and runs
 // no git at all: a worker that redirected the worktree to a copy of the git dir it made (the
 // commondir, the gitdir file) cannot make the after pass hash the copy — the redirect is a watched
-// file itself, and the copy is never looked at.
+// file itself, and the copy is never looked at. The redirect files of the common git dir are
+// watched as well: git reads "$GIT_DIR/commondir" in every git dir, a main ".git" included, so a
+// worker that wrote one there pointed the calls that read the repository at a copy of it.
 //
 // The ".git" of the working tree itself is watched as well: the file that points a linked worktree
 // at the git dir it belongs to, or the directory of the main worktree. A worker that rewrote it
@@ -20,8 +22,9 @@ namespace LeanWorker;
 /// <summary>
 /// The hashes of the git metadata of a working tree: the common git dir's config, every file under
 /// its hooks (by name, so an added or a removed hook counts), the attributes file, the per-worktree
-/// config and the files that redirect a worktree to the git dir it belongs to. The directories are
-/// the ones git itself resolved before the worker ran, never a string-built ".git".
+/// config and the files that redirect a worktree (or a whole repository) to the git dir it belongs
+/// to. The directories are the ones git itself resolved before the worker ran, never a
+/// string-built ".git".
 /// </summary>
 internal static class GitMetadata
 {
@@ -86,6 +89,12 @@ internal static class GitMetadata
         await AddFileAsync(files, Path.Combine(common, "info", "attributes"), labelBase).ConfigureAwait(false);
         // The per-worktree config of the common git dir (the main worktree's own config).
         await AddFileAsync(files, Path.Combine(common, "config.worktree"), labelBase).ConfigureAwait(false);
+        // The two files that redirect a call to the common git dir: git reads "$GIT_DIR/commondir"
+        // in every git dir, a main ".git" included, so a worker that wrote one there pointed the
+        // calls that read the repository at a copy of it. The redirect itself is the finding — the
+        // copy is never hashed.
+        await AddFileAsync(files, Path.Combine(common, "commondir"), labelBase).ConfigureAwait(false);
+        await AddFileAsync(files, Path.Combine(common, "gitdir"), labelBase).ConfigureAwait(false);
         // The ".git" of the working tree: the file that redirects a linked worktree to the git dir
         // it belongs to (its content is watched), or the directory of the main worktree.
         await AddDotGitAsync(files, Path.Combine(topLevel, ".git"), labelBase).ConfigureAwait(false);
