@@ -42,8 +42,10 @@ internal static class FileHash
             Buffer.BlockCopy(content, 0, both, mode.Length, content.Length);
             return Content(both);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
+            // Every error of the read is an unreadable file, not a crash: the file is watched, and a
+            // file the launcher cannot read is a finding of its own (issue #114).
             return Unreadable(path);
         }
     }
@@ -73,7 +75,7 @@ internal static class FileHash
             FileInfo info = new(path);
             return string.Create(CultureInfo.InvariantCulture, $"{Marker}|{info.Length}|{File.GetLastWriteTimeUtc(path).Ticks}|{Mode(path)}");
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
             return Marker.ToString();
         }
@@ -94,7 +96,7 @@ internal static class FileHash
         {
             return ((int)File.GetUnixFileMode(path)).ToString(CultureInfo.InvariantCulture);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
             return "-";
         }

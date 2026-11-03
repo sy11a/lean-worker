@@ -106,6 +106,11 @@ internal sealed class LaunchRun
     // so they are watched on their own (issue #114).
     private List<string> _gitTamper = [];
 
+    // Whether the after-worker pass of the git metadata watch ran: it is the verdict over the
+    // repository's own metadata. Without that verdict the launcher does not know whether the run
+    // touched the metadata, and no decision over the repository may be made (issue #114).
+    private bool _gitTamperKnown;
+
     // The processes of the worker's own group that were still alive when the worker exited: they
     // are signalled right after (issue #116). -1 when the worker had no group of its own.
     private int _leftovers = -1;
@@ -331,7 +336,9 @@ internal sealed class LaunchRun
     /// <summary>
     /// The worktree after the worker: it goes when it holds no change and its branch no commit
     /// beyond the base, and it stays otherwise. A gate chain that continues keeps it for the next
-    /// round.
+    /// round. A run that touched the repository's own git metadata keeps it as well: the decision
+    /// runs git over that repository, and a worker that planted a clean filter there would have it
+    /// run under the decision (issue #114).
     /// </summary>
     private async Task FinishWorktreeAsync()
     {
@@ -348,13 +355,27 @@ internal sealed class LaunchRun
             return;
         }
 
-        await worktree.FinishAsync().ConfigureAwait(false);
+        if (!TamperAllowsDecision())
+        {
+            // The repository is not trusted: the worktree stays, and the reason says why.
+            worktree.KeepForTamper(TamperReason());
+            return;
+        }
+
+        // The decision runs over the repository the before-worker snapshot resolved: the pins of
+        // the workspace (the calls in the worktree) and of the invoking repository (the calls in
+        // the repository). A snapshot that carries none leaves the pin to the worktree itself,
+        // which resolved one when it was created (also before the worker ran).
+        await worktree.FinishAsync(_gitBefore, _invokingBefore).ConfigureAwait(false);
         _notes.AddRange(worktree.Note is { Length: > 0 } note ? [EvidenceBlock.OneLine(note)] : []);
     }
 
     /// <summary>
     /// The worktree after a failed launch: the same decision as after a finished run, so a launch
-    /// that dies before the worker leaves nothing behind either.
+    /// that dies before the worker leaves nothing behind either. A launch that died before the
+    /// after-worker pass could say whether the run touched the repository's own git metadata keeps
+    /// the worktree as well: nothing may be decided over a repository the launcher cannot vouch
+    /// for (issue #114).
     /// </summary>
     private async Task FinishWorktreeOnFailureAsync()
     {
@@ -368,7 +389,16 @@ internal sealed class LaunchRun
         {
             if (worktree.Action.Length is 0)
             {
-                await worktree.FinishAsync().ConfigureAwait(false);
+                if (TamperAllowsDecision())
+                {
+                    // Pinned to the repository the before-worker snapshot resolved, like the
+                    // decision after a finished run.
+                    await worktree.FinishAsync(_gitBefore, _invokingBefore).ConfigureAwait(false);
+                }
+                else
+                {
+                    worktree.KeepForTamper(TamperReason());
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or FormatException)
@@ -379,6 +409,32 @@ internal sealed class LaunchRun
 
         await Console.Error.WriteLineAsync($"worktree: {worktree.Action} {EvidenceBlock.OneLine(worktree.Reason)} {EvidenceBlock.OneLine(worktree.WorktreePath)}").ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Whether the launcher may decide over the worktree: only when it knows that the run did not
+    /// touch the repository's own git metadata. A finding means the repository is not trusted any
+    /// more (the worker planted a filter or a hook there); no verdict means the launcher never got
+    /// to look (the after pass did not run).
+    /// </summary>
+    private bool TamperAllowsDecision() => _gitTamperKnown && _gitTamper.Count is 0;
+
+    /// <summary>
+    /// The reason a worktree is kept because the repository's own git metadata cannot be trusted:
+    /// the finding itself when there is one, the missing verdict otherwise.
+    /// </summary>
+    private string TamperReason() => _gitTamper.Count > 0 ? WorktreeKeptGitMetadata : WorktreeKeptUnverified;
+
+    /// <summary>
+    /// The reason a worktree is kept because the run changed the repository's own git metadata:
+    /// the decision would run git over a repository the worker tampered with.
+    /// </summary>
+    private const string WorktreeKeptGitMetadata = "git-metadata";
+
+    /// <summary>
+    /// The reason a worktree is kept because the launcher does not know whether the run changed
+    /// the repository's own git metadata: the after pass did not run.
+    /// </summary>
+    private const string WorktreeKeptUnverified = "unverified";
 
     private async Task LoadProfileAsync()
     {
@@ -1023,7 +1079,25 @@ internal sealed class LaunchRun
         _invokingBefore = await SnapshotInvokingAsync().ConfigureAwait(false);
         // The git metadata (the config, the hooks) is watched on its own: the write scope is
         // git-status based and never sees it (issue #114).
-        _gitBefore = await WriteScope.TakeGitMetadataAsync(_workspaceRoot, GitLabelBase()).ConfigureAwait(false);
+        _gitBefore = await SnapshotGitMetadataBeforeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The git metadata snapshot taken before the worker: the git dirs git resolves and the hashes
+    /// of the watched files. Null when the tree is not a git tree (or git is missing), and null
+    /// when the metadata cannot be read at all: the watch did not start, so the launcher has no
+    /// verdict over the metadata later on.
+    /// </summary>
+    private async Task<WriteScope.Snapshot?> SnapshotGitMetadataBeforeAsync()
+    {
+        try
+        {
+            return await WriteScope.TakeGitMetadataAsync(_workspaceRoot, GitLabelBase()).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -1053,7 +1127,10 @@ internal sealed class LaunchRun
 
         WriteScope.Snapshot? treeBefore = _treeBefore;
         WriteScope.Snapshot? invokingBefore = _invokingBefore;
-        WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore.Root, _runsRoot).ConfigureAwait(false);
+        // The after snapshot is pinned to the git dir and the work tree the before pass resolved:
+        // a worker that rewrote the ".git" of the working tree cannot move the call to a
+        // repository of its own, whose config would run its clean filter (issue #114).
+        WriteScope.Snapshot? treeAfter = treeBefore is null ? null : await WriteScope.TakeAsync(treeBefore, _runsRoot).ConfigureAwait(false);
         _changed = treeBefore is null || treeAfter is null ? null : WriteScope.Changed(treeBefore, treeAfter);
         _outOfScope = _changed is null || _writeScope is null ? null : [.. _changed.Where(f => !WriteScope.InScope(f, _writeScope))];
         // The paths both snapshots could not read (issue #118): the launcher could not tell whether
@@ -1082,17 +1159,34 @@ internal sealed class LaunchRun
     /// (the config, the hooks), which every later git call runs: the launcher's own and the
     /// operator's next session (issue #114). The after pass hashes the very directories the
     /// before pass resolved and runs no git at all, so a worker that redirected the worktree to a
-    /// copy of the git dir it made cannot hide behind the copy.
+    /// copy of the git dir it made cannot hide behind the copy. Every error of the pass is a
+    /// finding of its own: the launcher cannot tell whether the run changed the metadata, and that
+    /// is never silence.
     /// </summary>
     private async Task SnapshotGitMetadataAsync()
     {
         WriteScope.Snapshot? before = _gitBefore;
         if (before is null)
         {
+            // The watch never started: the launcher has no verdict over the metadata.
             return;
         }
 
-        WriteScope.Snapshot? after = await WriteScope.TakeGitMetadataAsync(before, GitLabelBase()).ConfigureAwait(false);
+        WriteScope.Snapshot? after;
+        try
+        {
+            after = await WriteScope.TakeGitMetadataAsync(before, GitLabelBase()).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            // The pass failed: the metadata cannot be read after the run, and that is a finding.
+            _gitTamperKnown = true;
+            AddGitTamper(GitMetadataUnreadable);
+            return;
+        }
+
+        // The pass ran: the launcher knows now whether the run touched the metadata.
+        _gitTamperKnown = true;
         if (after is null)
         {
             // The metadata could not be read after the run: the launcher cannot tell whether the
@@ -1170,7 +1264,7 @@ internal sealed class LaunchRun
 
     /// <summary>
     /// The invoking repository's before-worker snapshot (--worktree): the same snapshot mechanism
-    /// the workspace gets (<see cref="WriteScope.TakeAsync"/>), over the repository the launcher was
+    /// the workspace gets (<see cref="WriteScope.Snapshot"/>), over the repository the launcher was
     /// called in. Null without --worktree — the workspace's own snapshot covers the repository then.
     /// A snapshot that comes back null, or one that fails, is noted (never skipped silently).
     /// </summary>
@@ -1213,7 +1307,9 @@ internal sealed class LaunchRun
         try
         {
             (string runsDir, string ledger) = InvokingExcludes();
-            invokingAfter = await WriteScope.TakeAsync(invokingBefore.Root, runsDir, ledger).ConfigureAwait(false)
+            // Pinned to the git dir and the work tree of the before snapshot, like the workspace's
+            // own after snapshot: the worker must not be able to move the call (issue #114).
+            invokingAfter = await WriteScope.TakeAsync(invokingBefore, runsDir, ledger).ConfigureAwait(false)
                 ?? NoteInvokingUnchecked(InvokingUncheckedReason);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

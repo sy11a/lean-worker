@@ -17,12 +17,22 @@ internal static class WriteScope
     /// snapshot of the repository's own git metadata carries the git dirs it was taken over as well
     /// (<see cref="GitDirs"/>): the after pass hashes exactly those dirs and runs no git at all.
     /// </summary>
-    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty, GitMetadata.Dirs? GitDirs = null);
+    internal sealed record Snapshot(string Root, Dictionary<string, string> Dirty, GitMetadata.Dirs? GitDirs = null)
+    {
+        /// <summary>
+        /// The pin of the git calls that read this tree: its own git dir and the tree itself, both
+        /// as they were when the snapshot was taken. Null when the snapshot carries no git dir
+        /// (the tree was not a git tree, or git could not resolve one).
+        /// </summary>
+        public Git.Pin? Pin() => GitDirs?.Own is { } own ? new Git.Pin(own, Root) : null;
+    }
 
     /// <summary>
     /// Null when <paramref name="cwd"/> is not inside a git working tree (or git is missing). The
     /// excluded paths (the launcher's own bookkeeping) leave both snapshots of a comparison when
-    /// they lie in the tree; an exclude outside it is ignored.
+    /// they lie in the tree; an exclude outside it is ignored. The snapshot carries the git dirs
+    /// of the tree as well (<see cref="Snapshot.GitDirs"/>): they are resolved now, before the
+    /// worker runs, and the after pass is pinned to them.
     /// </summary>
     public static async Task<Snapshot?> TakeAsync(string cwd, params string?[] excludes)
     {
@@ -32,12 +42,48 @@ internal static class WriteScope
             return null;
         }
 
+        GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(root).ConfigureAwait(false);
         string? status = await Git.RunAsync(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
         if (status is null)
         {
             return null;
         }
 
+        return new Snapshot(root, await DirtyAsync(root, status, excludes).ConfigureAwait(false), dirs);
+    }
+
+    /// <summary>
+    /// The same snapshot, taken again after the worker ran: the call is pinned to the git dir and
+    /// the work tree the before pass resolved, so it reads the repository the launcher started in
+    /// and not the one a worker pointed it at (a ".git" file it rewrote, a git dir of its own with
+    /// a clean filter in its config). The root is the one the before pass found: it is not looked
+    /// up again, because a lookup would follow what the worker wrote.
+    /// Null when the before snapshot carries no git dir to pin the call to.
+    /// </summary>
+    public static async Task<Snapshot?> TakeAsync(Snapshot before, params string?[] excludes)
+    {
+        Git.Pin? pin = before.Pin();
+        if (pin is null)
+        {
+            return null;
+        }
+
+        string? status = await Git.RunPinnedAsync(pin,
+            "status", "--porcelain=v1", "-z", "--untracked-files=all").ConfigureAwait(false);
+        if (status is null)
+        {
+            return null;
+        }
+
+        return new Snapshot(before.Root, await DirtyAsync(before.Root, status, excludes).ConfigureAwait(false), before.GitDirs);
+    }
+
+    /// <summary>
+    /// The dirty files of a status: path relative to the repository root → content hash. A file
+    /// that is not there any more is recorded as deleted.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> DirtyAsync(string root, string status, string?[] excludes)
+    {
         string[] skips = [.. excludes.Where(e => e is not null)
             .Select(e => Relative(root, e!))
             .OfType<string>()
@@ -65,7 +111,8 @@ internal static class WriteScope
                 dirty[path] = File.Exists(full) ? await FileHash.OfAsync(full).ConfigureAwait(false) : "-";
             }
         }
-        return new Snapshot(root, dirty);
+
+        return dirty;
     }
 
     /// <summary>
@@ -93,11 +140,12 @@ internal static class WriteScope
     }
 
     /// <summary>
-    /// The hashes of the watched files of the two git dirs.
+    /// The hashes of the watched files of the two git dirs. The root is the top level of the
+    /// working tree: its ".git" is watched as well.
     /// </summary>
     private static async Task<Snapshot?> TakeGitMetadataAsync(GitMetadata.Dirs dirs, string root, string labelBase)
     {
-        Dictionary<string, string>? files = await GitMetadata.HashAsync(dirs, labelBase).ConfigureAwait(false);
+        Dictionary<string, string>? files = await GitMetadata.HashAsync(dirs, labelBase, root).ConfigureAwait(false);
         return files is null ? null : new Snapshot(root, files, dirs);
     }
 

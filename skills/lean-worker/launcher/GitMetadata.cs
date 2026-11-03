@@ -9,6 +9,11 @@
 // no git at all: a worker that redirected the worktree to a copy of the git dir it made (the
 // commondir, the gitdir file) cannot make the after pass hash the copy — the redirect is a watched
 // file itself, and the copy is never looked at.
+//
+// The ".git" of the working tree itself is watched as well: the file that points a linked worktree
+// at the git dir it belongs to, or the directory of the main worktree. A worker that rewrote it
+// (a "gitdir:" pointer to a git dir of its own) is caught by the file's own content, and the git
+// dir it named is never looked at.
 
 namespace LeanWorker;
 
@@ -49,16 +54,18 @@ internal static class GitMetadata
     /// <summary>
     /// The hashes of the watched files: the label of every file → its hash. No git call at all:
     /// the directories are the ones git resolved before the worker ran. Null when the pass could
-    /// not be made at all (an I/O error reading the tree).
+    /// not be made at all (an I/O error reading the tree, or any other error while hashing it).
     /// </summary>
-    public static async Task<Dictionary<string, string>?> HashAsync(Dirs dirs, string labelBase)
+    public static async Task<Dictionary<string, string>?> HashAsync(Dirs dirs, string labelBase, string topLevel)
     {
         try
         {
-            return await HashFilesAsync(dirs, labelBase).ConfigureAwait(false);
+            return await HashFilesAsync(dirs, labelBase, topLevel).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
+            // Every error of the hash is a finding, not a crash: the launcher cannot tell whether
+            // the run changed the metadata, and that is what it has to report (issue #114).
             return null;
         }
     }
@@ -67,9 +74,10 @@ internal static class GitMetadata
     /// The watched files of the two git dirs: the config, the attributes file and the per-worktree
     /// config of the common git dir; the per-worktree config and the two files that redirect a
     /// worktree to the git dir it belongs to in the working tree's own git dir; every file under
-    /// the hooks of the common git dir.
+    /// the hooks of the common git dir. The ".git" of the working tree itself is watched too: the
+    /// file (or the directory) that says which git dir the working tree belongs to.
     /// </summary>
-    private static async Task<Dictionary<string, string>> HashFilesAsync(Dirs dirs, string labelBase)
+    private static async Task<Dictionary<string, string>> HashFilesAsync(Dirs dirs, string labelBase, string topLevel)
     {
         Dictionary<string, string> files = new(StringComparer.Ordinal);
         string common = dirs.Common;
@@ -78,6 +86,9 @@ internal static class GitMetadata
         await AddFileAsync(files, Path.Combine(common, "info", "attributes"), labelBase).ConfigureAwait(false);
         // The per-worktree config of the common git dir (the main worktree's own config).
         await AddFileAsync(files, Path.Combine(common, "config.worktree"), labelBase).ConfigureAwait(false);
+        // The ".git" of the working tree: the file that redirects a linked worktree to the git dir
+        // it belongs to (its content is watched), or the directory of the main worktree.
+        await AddDotGitAsync(files, Path.Combine(topLevel, ".git"), labelBase).ConfigureAwait(false);
         if (dirs.Own is { } own)
         {
             // The per-worktree config of the working tree's own git dir.
@@ -92,6 +103,42 @@ internal static class GitMetadata
         await AddHooksAsync(files, Path.Combine(common, "hooks"), labelBase).ConfigureAwait(false);
         return files;
     }
+
+    /// <summary>
+    /// The state of the ".git" of the working tree, added to the map under its label: the content
+    /// of the file when it is a file (the "gitdir:" pointer of a linked worktree), the marker of a
+    /// directory when it is one (the main worktree), the marker of a link when it is one. A ".git"
+    /// that is not there at all is not watched: it was not there before the worker either, and a
+    /// file that appears where there was none is a change the two passes see.
+    /// </summary>
+    private static async Task AddDotGitAsync(Dictionary<string, string> files, string path, string labelBase)
+    {
+        string? link = LinkTarget(path);
+        if (link is not null)
+        {
+            files[Label(path, labelBase)] = FileHash.OfLink(link);
+            return;
+        }
+
+        if (Directory.Exists(path))
+        {
+            files[Label(path, labelBase)] = DirectoryMarker;
+            return;
+        }
+
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        files[Label(path, labelBase)] = await FileHash.OfAsync(path, withMode: true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The marker of a ".git" that is a directory: it differs from every hash, so a ".git" that
+    /// became a file (or the other way round) counts as a change.
+    /// </summary>
+    private const string DirectoryMarker = "dir";
 
     /// <summary>
     /// The hash of a watched file, added to the map under its label. A file that is not there is
@@ -173,8 +220,10 @@ internal static class GitMetadata
         {
             entries = Directory.GetFileSystemEntries(dir);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
+            // The folder cannot be listed: it is listed as itself, so its hash says that it could
+            // not be read. Any error counts, not only the I/O ones.
             files.Add(dir);
             return;
         }
@@ -198,7 +247,8 @@ internal static class GitMetadata
     }
 
     /// <summary>
-    /// The target of a link, or null when the path is not a link.
+    /// The target of a link, or null when the path is not a link. A path that cannot be examined
+    /// is not a link: it is hashed as the file it is, and the hash says that it could not be read.
     /// </summary>
     private static string? LinkTarget(string path)
     {
@@ -206,7 +256,7 @@ internal static class GitMetadata
         {
             return new FileInfo(path).LinkTarget;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
             return null;
         }
@@ -223,7 +273,7 @@ internal static class GitMetadata
         {
             return Path.GetFullPath(Path.Combine(dir, path));
         }
-        catch (ArgumentException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
             return path;
         }
@@ -246,7 +296,7 @@ internal static class GitMetadata
             string relative = Path.GetRelativePath(Path.GetFullPath(labelBase), Path.GetFullPath(path)).Replace('\\', '/');
             return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? path : relative;
         }
-        catch (ArgumentException)
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
             return path;
         }
