@@ -356,6 +356,81 @@ public sealed class GitMetadataHardeningTests : IDisposable
         Assert.False(File.Exists(marker), "the worker ran although the continuation was refused");
     }
 
+    // ---- the verdict over the git metadata in the summary, and the continuation that needs it ----
+
+    // 7179bfa: the summary records whether the launcher could vouch for the repository's git metadata.
+    [Fact]
+    public async Task A_clean_verified_run_records_git_metadata_verified_trueAsync()
+    {
+        (_, _, string root) = await NewRepoAsync();
+
+        (_, _, JsonObject s) = await RunAsync(root, "true");
+
+        Assert.True(s["git_metadata_verified"]!.GetValue<bool>());
+    }
+
+    // 7179bfa: outside a git working tree there is no metadata to watch, so the field is left out.
+    [Fact]
+    public async Task A_non_git_workspace_has_no_git_metadata_verified_fieldAsync()
+    {
+        string root = Path.Combine(_dirs.Create("lw-nogit"), ".lean-worker");
+        _ = Directory.CreateDirectory(root);
+        await File.WriteAllTextAsync(Path.Combine(root, "task.md"), "do nothing", TestContext.Current.CancellationToken);
+
+        (_, _, JsonObject s) = await RunAsync(root, "true");
+
+        Assert.False(s.ContainsKey("git_metadata_verified"));
+    }
+
+    private static async Task<(int Code, string Stdout)> ContinueAsync(string root, string runDir, string marker)
+    {
+        return await RunAsyncGolden.RunAsync(root, "touch '" + marker + "'\n" + RunAsyncGolden.SuccessStream, o =>
+        {
+            o.TaskFile = null;
+            o.ContinueFrom = runDir;
+        });
+    }
+
+    // 7179bfa: a run that could not verify the metadata is not continued; the operator looks first.
+    [Fact]
+    public async Task Continuing_a_run_whose_summary_says_git_metadata_was_not_verified_is_refusedAsync()
+    {
+        (_, _, string root) = await NewRepoAsync();
+        (_, _, JsonObject first) = await RunAsync(root, "true");
+        string runDir = first["run_dir"]!.GetValue<string>();
+        string summaryPath = Path.Combine(runDir, "summary.json");
+        JsonObject edited = RunAsyncGolden.Summary(runDir);
+        edited["git_metadata_verified"] = false;
+        await File.WriteAllTextAsync(summaryPath, edited.ToJsonString(), TestContext.Current.CancellationToken);
+        string marker = Path.Combine(_dirs.Create("lw-marker"), "worker-ran");
+
+        (int code, string stdout) = await ContinueAsync(root, runDir, marker);
+
+        Assert.Equal(1, code);
+        Assert.Contains("continue: refused:", stdout, StringComparison.Ordinal);
+        Assert.Contains("git metadata not verified", stdout, StringComparison.Ordinal);
+        Assert.False(File.Exists(marker), "the worker ran although the continuation was refused");
+    }
+
+    // 7179bfa: a summary written before the field existed says nothing about the verdict and is accepted.
+    [Fact]
+    public async Task Continuing_a_run_whose_summary_has_no_git_metadata_verified_field_is_acceptedAsync()
+    {
+        (_, _, string root) = await NewRepoAsync();
+        (_, _, JsonObject first) = await RunAsync(root, "true");
+        string runDir = first["run_dir"]!.GetValue<string>();
+        JsonObject edited = RunAsyncGolden.Summary(runDir);
+        Assert.True(edited.Remove("git_metadata_verified"));
+        await File.WriteAllTextAsync(Path.Combine(runDir, "summary.json"), edited.ToJsonString(), TestContext.Current.CancellationToken);
+        string marker = Path.Combine(_dirs.Create("lw-marker"), "worker-ran");
+
+        (int code, string stdout) = await ContinueAsync(root, runDir, marker);
+
+        Assert.DoesNotContain("continue: refused:", stdout, StringComparison.Ordinal);
+        Assert.Equal(0, code);
+        Assert.True(File.Exists(marker), "the worker did not run");
+    }
+
     // ---- a launch that dies before the worker ----
 
     // edaf46a: a launch that died before the after pass decided over the worktree as a finished run did: a clean worktree
