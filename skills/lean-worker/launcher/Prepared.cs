@@ -26,7 +26,7 @@ internal sealed record Prepared(
 
     /// <summary>
     /// The note of a run whose worker had no process group of its own (or whose group could not
-    /// be read): null when the group worked.
+    /// be read), or whose group still had members after the SIGKILL: null when the group worked.
     /// </summary>
     public string? GroupNote()
     {
@@ -35,7 +35,12 @@ internal sealed record Prepared(
             return ProcessGroup.UnavailableNote;
         }
 
-        return Group.Leftovers < 0 ? ProcessGroup.UnknownNote : null;
+        if (Group.Leftovers < 0)
+        {
+            return ProcessGroup.UnknownNote;
+        }
+
+        return Group.Survivors > 0 ? ProcessGroup.SurvivedNote(Group.Survivors) : null;
     }
 
     /// <summary>

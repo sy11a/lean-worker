@@ -111,6 +111,11 @@ internal sealed class LaunchRun
     // touched the metadata, and no decision over the repository may be made (issue #114).
     private bool _gitTamperKnown;
 
+    // Why the run the caller wanted to continue was refused: its summary records git tamper, so a
+    // fresh worker would run on a repository whose config carries what that run planted. Null when
+    // there is no refusal (issue #114).
+    private string? _continueRefusal;
+
     // The processes of the worker's own group that were still alive when the worker exited: they
     // are signalled right after (issue #116). -1 when the worker had no group of its own.
     private int _leftovers = -1;
@@ -241,6 +246,15 @@ internal sealed class LaunchRun
         {
             await ResolveWorkspaceAsync().ConfigureAwait(false);
             await LoadProfileAsync().ConfigureAwait(false);
+            if (_continueRefusal is { } refusal)
+            {
+                // The run the caller wanted to continue changed the repository's own git metadata:
+                // the operator has to look at that first (issue #114). The refusal is a failed run
+                // (exit 1), not a launcher error: nothing was started and nothing is left behind.
+                await Console.Out.WriteLineAsync($"continue: refused: {refusal}").ConfigureAwait(false);
+                return 1;
+            }
+
             await PrepareWorktreeAsync().ConfigureAwait(false);
             ResolveSettings();
             await ValidateInputsAsync().ConfigureAwait(false);
@@ -451,6 +465,16 @@ internal sealed class LaunchRun
             }
 
             prevSummary = Json.ParseLenient(await File.ReadAllTextAsync(prevSummaryPath, CancellationToken.None).ConfigureAwait(false)).AsObject();
+            if (SummaryHasGitTamper(prevSummary))
+            {
+                // The run changed the repository's own git metadata: a fresh worker would run on a
+                // repository whose config carries what that run planted (issue #114). The operator
+                // has to look at the metadata first.
+                _continueRefusal =
+                    $"the run at {_o.ContinueFrom} changed the repository's own git metadata (git tamper). " +
+                    "Look at the metadata (the changed files are in the run's summary.json) before continuing it.";
+                return;
+            }
         }
         _prevSummary = prevSummary;
         JsonObject? profile = null;
@@ -473,6 +497,47 @@ internal sealed class LaunchRun
             throw new LaunchException($"--profile given but {profilesPath} does not exist");
         }
         _profile = profile;
+    }
+
+    /// <summary>
+    /// Whether a run's summary records git tamper: the files of the repository's own git metadata
+    /// (the config, the hooks) the run changed. A run that changed them is not continued: every
+    /// later git call runs what the run planted (issue #114).
+    ///
+    /// The summary records the findings twice — as a note of the run ("git-tamper: ...") and as an
+    /// evidence line ("- git-tamper: ...") — and both are read. A summary that lists the findings
+    /// in a "git_tamper" array of its own is refused as well.
+    /// </summary>
+    private static bool SummaryHasGitTamper(JsonObject summary)
+    {
+        if (summary["git_tamper"] is JsonArray tamper && tamper.Count > 0)
+        {
+            return true;
+        }
+
+        return HasGitTamperLine(Json.StrList(summary, "notes"), "git-tamper: ")
+            || HasGitTamperLine(Json.StrList(summary, "evidence_lines"), "- git-tamper:");
+    }
+
+    /// <summary>
+    /// Whether a list of the summary holds a line that names a git-tamper finding.
+    /// </summary>
+    private static bool HasGitTamperLine(List<string>? lines, string prefix)
+    {
+        if (lines is null)
+        {
+            return false;
+        }
+
+        foreach (string line in lines)
+        {
+            if (line.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -2262,7 +2327,12 @@ internal sealed class LaunchRun
         _firstCallCacheReadShare = firstCallCacheReadShare;
 
         _hookChecks = File.Exists(Path.Combine(RunDir, "hook.log")) ? await Launcher.CountLinesAsync(Path.Combine(RunDir, "hook.log")).ConfigureAwait(false) : 0;
-        _next = _status is "wrapped-up" or "success" ? null : Launcher.NextInChain(_chain, _provider, _model);
+        // A run that changed the repository's own git metadata gets no invitation of its own: the
+        // operator has to look at the metadata first, and a fresh worker would run on a repository
+        // whose config carries what this one planted (issue #114).
+        _next = _gitTamper.Count > 0 || _status is "wrapped-up" or "success"
+            ? null
+            : Launcher.NextInChain(_chain, _provider, _model);
     }
 
     private void BuildSummary()
@@ -2540,7 +2610,7 @@ internal sealed class LaunchRun
         }
 
         Meter meter = NonNull(_meter);
-        if (meter.WrappedUp && _status is not "out-of-scope")
+        if (meter.WrappedUp && _status is not "out-of-scope" && _gitTamper.Count is 0)
         {
             // A run that changed the repository's own git metadata is out of scope, wrap-up or
             // not: it must not invite a continuation, the operator has to look at the metadata

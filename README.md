@@ -590,7 +590,10 @@ A difference is an out-of-scope finding: the changed files are listed in the evi
 (`- git-tamper: .git/config`), a warning goes to the error stream, and the run ends with
 `status: out-of-scope` and exit `1` — whatever the worker said about itself. A wrap-up is no
 exception: it ends with `status: out-of-scope` and exit `1` too, not `3`, and it does not invite a
-continuation. Metadata the launcher cannot read after the run is a finding as well
+continuation. A tampered run gets no invitation at all — no `escalate:` line either — and
+`--continue-from` refuses a run directory whose summary records the tamper (exit `1`), so a fresh
+worker cannot run on the repository the first one changed. Metadata the launcher cannot read after
+the run is a finding as well
 (`- git-tamper: git-metadata: unreadable after the run`), never silence.
 
 The launcher's own git calls carry `-c core.fsmonitor= -c core.hooksPath=/dev/null` before the
@@ -605,7 +608,11 @@ metadata the launcher could not verify at all skips it as well
 The calls the launcher makes after the worker ran are pinned to the repository it started in: the
 git dir, the work tree and the common git dir it resolved before the worker are all named
 (`--git-dir`, `--work-tree` and `GIT_COMMON_DIR`), so a worker that wrote a `.git` file, a
-`commondir` file or a config of its own cannot move them to a repository of its own.
+`commondir` file or a config of its own cannot move them to a repository of its own. The refs are
+the exception: git's ref store ignores `GIT_COMMON_DIR` and still follows a planted `commondir` for
+them. The refs are covered by the metadata hash instead (both `commondir` files are watched, so a
+planted one is a finding) and by the tamper gate: a run whose git metadata changed is out of scope,
+and no decision over the repository is made for it.
 
 ### The worker runs in a process group of its own
 
@@ -614,7 +621,10 @@ when the worker exits: the processes it leaves behind are reparented to init the
 and out of a tree kill's reach, so they could race the `--worktree` cleanup. The group gets a
 SIGTERM, the members that survive five seconds a SIGKILL, and the evidence block counts the members
 that were still alive (`- leftovers: N`). Without `setsid` the worker runs as before, whatever it
-leaves behind stays behind, and the run says so (`note: process-group: unavailable`).
+leaves behind stays behind, and the run says so (`note: process-group: unavailable`). A worker
+that calls `setsid`/`setpgid` itself, or double-forks into a new session, leaves the group: the
+kill covers the children that stay in it (lean-worker#121 tracks a cgroup). Members that are still
+there after the SIGKILL are reported too (`note: process-group: N processes survived SIGKILL`).
 
 ## Cost notes from real runs
 

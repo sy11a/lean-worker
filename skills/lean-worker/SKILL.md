@@ -192,6 +192,12 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
   also give the `quota:` line: it is how the user sees what is left on the plan.
 - For a closer look, run `git diff --stat`, then read only the files that matter.
 
+The worker's process group is signalled when the worker exits (Linux, through `setsid`): a process it
+left behind gets a SIGTERM and, five seconds later, a SIGKILL, and the evidence block counts it
+(`- leftovers: N`). A worker that calls `setsid`/`setpgid` itself, or double-forks into a new
+session, leaves the group: the kill covers the children that stay in it (lean-worker#121 tracks a
+cgroup).
+
 ## 5. When it wraps up or fails
 
 - `status: wrapped-up` (exit 3): the worker reached the wrap-up share of its budget and left a
@@ -211,7 +217,9 @@ quota:    5h 10% -> 12%, weekly 41% -> 42%
 - `status: out-of-scope` (exit 1): the run changed the repository's own git metadata — the config or
   the hooks of the shared `.git` — which every later git call runs. The changed files are listed in
   the evidence block (`- git-tamper: .git/config`) and a warning goes to stderr. Show the user the
-  list and ask what to do with it; do not accept the run as it is.
+  list and ask what to do with it; do not accept the run as it is. Such a run gets no continuation
+  invitation, and `--continue-from` on its run directory is refused (exit 1): look at the metadata
+  before running anything else.
 - Otherwise the worker's session is not kept. Sharpen `task.md` (goal, start-here paths, scope) or
   split the task, and run again. Each run gets its own directory.
 - If the cause is general (a missing command, an unknown convention), fix `project.md` or the

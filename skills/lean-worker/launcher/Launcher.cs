@@ -151,13 +151,23 @@ internal static class Launcher
             }
         };
         p.BeginErrorReadLine();
-        await p.StandardInput.WriteAsync(stdin).ConfigureAwait(false);
-        p.StandardInput.Close();
-        bool timedOut = await WaitForExitAsync(p, timeoutMinutes).ConfigureAwait(false);
-        // The worker has exited: whatever it left behind is reparented to init and out of a tree
-        // kill's reach, so the group it shared with the worker is signalled here — before the run
-        // decides what becomes of the worktree (issue #116).
-        await prep.FinishGroupAsync().ConfigureAwait(false);
+        bool timedOut;
+        try
+        {
+            await p.StandardInput.WriteAsync(stdin).ConfigureAwait(false);
+            p.StandardInput.Close();
+            timedOut = await WaitForExitAsync(p, timeoutMinutes).ConfigureAwait(false);
+        }
+        finally
+        {
+            // The worker has exited — or the launch failed before it could: whatever it left
+            // behind is reparented to init and out of a tree kill's reach, so the group it shared
+            // with the worker is signalled here — before the run decides what becomes of the
+            // worktree (issue #116). The finally: an exception from the stdin write or from the
+            // wait must not leave the group behind.
+            await prep.FinishGroupAsync().ConfigureAwait(false);
+        }
+
         _ = await Task.WhenAny(Task.WhenAll(pumpTask, errDone.Task), Task.Delay(TimeSpan.FromSeconds(30), TimeProvider.System, CancellationToken.None)).ConfigureAwait(false);
         lock (state.Gate) { state.Closed = true; }
         await cts.CancelAsync().ConfigureAwait(false);

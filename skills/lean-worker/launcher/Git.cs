@@ -16,7 +16,7 @@ internal static class Git
     /// that rewrote a ".git" file (the "gitdir:" pointer of a linked worktree), a "commondir"
     /// file or a config cannot move the call to a repository of its own.
     /// </summary>
-    internal sealed record Pin(string GitDir, string WorkTree, string? Common);
+    internal sealed record Pin(string GitDir, string WorkTree, string Common);
 
     /// <summary>
     /// The options every git call of the launcher carries, before the subcommand (where git reads
@@ -82,14 +82,21 @@ internal static class Git
     /// else. A worker that rewrites the ".git" of the working tree (the "gitdir:" file of a linked
     /// worktree) moves the working tree to a git dir of its own — one whose config carries a clean
     /// filter, which then runs under the launcher's own `git status`, with the worker's code, after
-    /// the worker is gone. Naming the git dir and the work tree (--git-dir, --work-tree) makes the
-    /// call read the repository the launcher started in, whatever the worker wrote since; the
-    /// global and the system config are switched off as well, so no config outside that repository
-    /// can add a filter either. The common git dir is pinned in the environment (GIT_COMMON_DIR)
-    /// for the same reason: git reads "$GIT_DIR/commondir" in every git dir, a main ".git"
-    /// included, so a worker that wrote one there pointed the call at a copy of the git dir of its
-    /// own — and the common dir in the environment wins over that file. The calls made before the
-    /// worker ran stay as they are: there the repository is still the one the operator handed over.
+    /// the worker is gone. Naming the git dir and the work tree (--git-dir, --work-tree) keeps the
+    /// call on the repository the launcher started in, whatever the worker wrote since; the global
+    /// and the system config are switched off as well, so no config outside that repository can add
+    /// a filter either. The common git dir is pinned in the environment (GIT_COMMON_DIR) for the
+    /// same reason: git reads "$GIT_DIR/commondir" in every git dir, a main ".git" included, so a
+    /// worker that wrote one there pointed the call at a copy of the git dir of its own — and the
+    /// common dir in the environment wins over that file for the files git takes from it (the
+    /// config, the hooks, the attributes).
+    ///
+    /// The refs are not covered by the environment: git's ref store ignores GIT_COMMON_DIR and
+    /// still follows a planted "commondir" for them. The refs are covered by the metadata hash
+    /// instead (both commondir files are watched, so a planted one is a finding) and by the tamper
+    /// gate: a run whose git metadata changed is out of scope and no decision over the repository
+    /// is made for it (issue #114). The calls made before the worker ran stay as they are: there
+    /// the repository is still the one the operator handed over.
     /// </summary>
     internal static async Task<string?> RunPinnedAsync(Pin pin, params string[] args) =>
         Out(await RunPinnedResultAsync(pin, args).ConfigureAwait(false));
@@ -118,12 +125,15 @@ internal static class Git
         // config, the hooks, the attributes) from, and git reads "$GIT_DIR/commondir" in every git
         // dir — a main ".git" included. A worker that wrote one there moved the call to a copy of
         // the git dir of its own, whose config carries the clean filter the call then runs. The
-        // common dir named in the environment wins over that file, so the call reads the
-        // repository the launcher started in (issue #114).
-        if (pin.Common is { Length: > 0 } common)
-        {
-            psi.Environment["GIT_COMMON_DIR"] = common;
-        }
+        // common dir named in the environment wins over that file for those files (issue #114).
+        // The refs are not covered by it: git's ref store ignores GIT_COMMON_DIR and still follows
+        // a planted "commondir" for them. The refs are covered by the metadata hash instead (both
+        // commondir files are watched, so a planted one is a finding) and by the tamper gate: a
+        // run whose git metadata changed is out of scope and no decision over the repository is
+        // made for it. A pin always names a common dir (there is no pin without one), so the
+        // variable is never left out: a call without it would read the common dir git resolves
+        // for itself, which is the one the worker may have redirected.
+        psi.Environment["GIT_COMMON_DIR"] = pin.Common;
 
         return await StartAsync(psi).ConfigureAwait(false);
     }

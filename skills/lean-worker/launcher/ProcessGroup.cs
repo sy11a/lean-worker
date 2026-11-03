@@ -35,6 +35,13 @@ internal static class ProcessGroup
     internal const string UnknownNote = "process-group: unknown";
 
     /// <summary>
+    /// The note of a run whose group still had members after the SIGKILL: the kill cannot be
+    /// taken back, so what survived it stays behind.
+    /// </summary>
+    public static string SurvivedNote(int survivors) =>
+        "process-group: " + survivors.ToString(CultureInfo.InvariantCulture) + " processes survived SIGKILL";
+
+    /// <summary>
     /// The signals the group gets: first the one that asks its members to stop, then the one that
     /// leaves nothing behind.
     /// </summary>
@@ -53,6 +60,13 @@ internal static class ProcessGroup
     /// second are five seconds.
     /// </summary>
     private const int WaitSteps = 50;
+
+    /// <summary>
+    /// The number of checks of a group whose members did not die on the SIGKILL: ten steps of a
+    /// tenth of a second are one second. A killed process is a zombie at once, so the wait is
+    /// short: a process that cannot die must not hold the launcher.
+    /// </summary>
+    private const int SurvivorSteps = 10;
 
     /// <summary>
     /// The wait between the two checks of a group that did not go on SIGTERM.
@@ -83,18 +97,12 @@ internal static class ProcessGroup
             ProcStat? stat = Stat(pid);
             if (stat is not null)
             {
-                // The worker leads its own group: the group is the worker's own id.
+                // The worker leads its own group: the group is the worker's own id. Nothing else
+                // is looked at: a group the worker made for itself is not the launcher's to
+                // signal, and a guess would kill a process the worker chose.
                 if (stat.Value.Pgrp == pid)
                 {
                     return pid;
-                }
-
-                // setsid forked (it waits for the program in a child of its own): the group is the
-                // one the child leads.
-                int child = ChildGroup(pid);
-                if (child > 0)
-                {
-                    return child;
                 }
             }
 
@@ -109,6 +117,10 @@ internal static class ProcessGroup
     /// a SIGTERM, and the members that are still there after five seconds get a SIGKILL. The count
     /// is what the run records: the processes the worker left behind. -1 when the group is not
     /// known (or is the launcher's own group, which is never signalled).
+    ///
+    /// A SIGKILL is final, but a killed process is still there until the kernel has taken it: the
+    /// launcher waits for the killed members to die before it returns, so the members that are
+    /// still there afterwards (read with <see cref="Alive"/>) are the ones the kill could not end.
     /// </summary>
     public static async Task<int> FinishAsync(int pgid)
     {
@@ -134,6 +146,12 @@ internal static class ProcessGroup
         if (Alive(pgid) > 0)
         {
             await SignalAsync(pgid, Sigkill).ConfigureAwait(false);
+            // The killed members need a moment to die. The wait is short (a second): a process
+            // that cannot die must not hold the launcher.
+            for (int step = 0; step < SurvivorSteps && Alive(pgid) > 0; step++)
+            {
+                await Task.Delay(_waitStep, TimeProvider.System, CancellationToken.None).ConfigureAwait(false);
+            }
         }
 
         return alive;
@@ -198,8 +216,15 @@ internal static class ProcessGroup
             // read to their end, so the launcher waits for the program and not for a pipe.
             Task<string> output = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
             Task<string> error = p.StandardError.ReadToEndAsync(CancellationToken.None);
-            if (!p.WaitForExit(KillTimeoutMs))
+            using CancellationTokenSource cts = new(KillTimeoutMs);
+            try
             {
+                await p.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The kill program did not finish in time: it is killed and the launcher stops
+                // waiting for it.
                 try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
                 return;
             }
@@ -247,41 +272,15 @@ internal static class ProcessGroup
     }
 
     /// <summary>
-    /// The group of the child of a process: the case where setsid forked. Zero when there is no
-    /// such child (yet).
+    /// The fields of a process's stat line that matter here: its state and its process group.
     /// </summary>
-    private static int ChildGroup(int pid)
-    {
-        foreach (string dir in ProcDirs())
-        {
-            if (!TryPid(dir, out int child))
-            {
-                continue;
-            }
-
-            ProcStat? stat = Stat(child);
-            if (stat is null || stat.Value.Ppid != pid)
-            {
-                continue;
-            }
-
-            return stat.Value.Pgrp;
-        }
-
-        return 0;
-    }
+    private readonly record struct ProcStat(char State, int Pgrp);
 
     /// <summary>
-    /// The fields of a process's stat line that matter here: its state, its parent, its process
-    /// group and its session.
-    /// </summary>
-    private readonly record struct ProcStat(char State, int Ppid, int Pgrp, int Sid);
-
-    /// <summary>
-    /// The stat line of a process, read from /proc: its state (the third field of the line), its
-    /// parent (the fourth), its process group (the fifth) and its session (the sixth) — counted
-    /// after the command name, which sits in parentheses and may hold spaces and parentheses of
-    /// its own. Null when the process is gone or its line cannot be read.
+    /// The stat line of a process, read from /proc: its state (the third field of the line) and its
+    /// process group (the fifth) — counted after the command name, which sits in parentheses and
+    /// may hold spaces and parentheses of its own. Null when the process is gone or its line
+    /// cannot be read.
     /// </summary>
     private static ProcStat? Stat(int pid)
     {
@@ -297,16 +296,14 @@ internal static class ProcessGroup
             }
 
             string[] fields = line[(close + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (fields.Length < 4 || fields[0].Length is 0)
+            if (fields.Length < 3 || fields[0].Length is 0)
             {
                 return null;
             }
 
             return new ProcStat(
                 fields[0][0],
-                int.Parse(fields[1], CultureInfo.InvariantCulture),
-                int.Parse(fields[2], CultureInfo.InvariantCulture),
-                int.Parse(fields[3], CultureInfo.InvariantCulture));
+                int.Parse(fields[2], CultureInfo.InvariantCulture));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or OverflowException or ArgumentException)
         {

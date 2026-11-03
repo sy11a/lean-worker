@@ -652,7 +652,10 @@ internal sealed class WorktreeRun
     /// work tree and the common git dir git resolves for it. The common dir is part of the pin
     /// because git reads "$GIT_DIR/commondir" in every git dir, a main ".git" included: a worker
     /// that wrote one there would move the call to a copy of the git dir of its own, whose config
-    /// carries a clean filter (issue #114). Null when git does not resolve a git dir for it.
+    /// carries a clean filter (issue #114). Null when git does not resolve a git dir for it — and
+    /// null when it does not resolve a common dir either: a pin without a common dir would run
+    /// the call with the common dir git resolves for itself, so there is no pin at all and the
+    /// caller keeps the worktree.
     /// </summary>
     private static async Task<Git.Pin?> PinAsync(string dir)
     {
@@ -664,7 +667,14 @@ internal sealed class WorktreeRun
         }
 
         GitMetadata.Dirs? dirs = await GitMetadata.ResolveAsync(dir).ConfigureAwait(false);
-        return new Git.Pin(gitDir, Path.GetFullPath(dir), dirs?.Common);
+        if (dirs is null || dirs.Common.Length is 0)
+        {
+            // No common dir: no pin. The call would run with the common dir git resolves for
+            // itself, which is the one a worker may have pointed at a copy of its own.
+            return null;
+        }
+
+        return new Git.Pin(gitDir, Path.GetFullPath(dir), dirs.Common);
     }
 
     /// <summary>
