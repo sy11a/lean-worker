@@ -632,7 +632,8 @@ internal sealed class LaunchRun
         // The notes list is append-only: the price book's warnings join the notes collected so
         // far (the workspace note is the first of them) instead of replacing them.
         _notes.AddRange(_prices.Warnings);
-        // An explicit runtime holds for every model in the chain; otherwise each model gets the runtime its provider allows.
+        // The runtime is resolved per model (RuntimePolicy): --runtime, then runtimeByProvider[provider],
+        // then the profile's runtime, then the provider's default.
         _runtimePolicy = RuntimePolicy.Load(_o.Runtime, _profile);
         _runtimeName = _runtimePolicy.Initial;
         if (_o.Model is not null)
