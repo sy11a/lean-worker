@@ -36,7 +36,8 @@ internal sealed class LaunchRun
     // ResolveSettings (price book + runtime + chain)
     private PriceBook? _prices;
     private readonly List<string> _notes = [];
-    private string? _explicitRuntime;
+    private RuntimePolicy? _runtimePolicy;
+    private bool _runtimeDefaulted;
     private string _runtimeName = string.Empty;
     private List<string> _chain = [];
 
@@ -632,13 +633,8 @@ internal sealed class LaunchRun
         // far (the workspace note is the first of them) instead of replacing them.
         _notes.AddRange(_prices.Warnings);
         // An explicit runtime holds for every model in the chain; otherwise each model gets the runtime its provider allows.
-        _explicitRuntime = _o.Runtime ?? Json.Str(_profile, "runtime");
-        if (_explicitRuntime is not null)
-        {
-            _ = Runtimes.Get(_explicitRuntime); // validates the name before any quota read
-        }
-
-        _runtimeName = _explicitRuntime ?? "claude";
+        _runtimePolicy = RuntimePolicy.Load(_o.Runtime, _profile);
+        _runtimeName = _runtimePolicy.Initial;
         if (_o.Model is not null)
         {
             _chain = [_o.Model];
@@ -859,7 +855,7 @@ internal sealed class LaunchRun
                 _ => "next in chain",
             };
             quotaBefore = null;
-            _runtimeName = _explicitRuntime ?? Launcher.DefaultRuntime(info);
+            (_runtimeName, _runtime, _runtimeDefaulted) = NonNull(_runtimePolicy).For(info);
             if (Launcher.Billing(info, _runtimeName, _hasKey) is not "subscription" || info.Quota is null)
             {
                 break;
@@ -900,8 +896,7 @@ internal sealed class LaunchRun
     {
         PriceBook prices = NonNull(_prices);
         _providerInfo = prices.Provider(_provider);
-        _runtime = Runtimes.Get(_runtimeName);
-        if (_explicitRuntime is null && _runtimeName is not "claude")
+        if (_runtimeDefaulted && _runtimeName is not "claude")
         {
             _notes.Add($"runtime {_runtimeName}: provider {_provider} has no Anthropic-compatible endpoint in the price book");
         }
