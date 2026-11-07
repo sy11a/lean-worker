@@ -130,6 +130,12 @@ A profile's `model` may be a **chain**, e.g. `["zai-coding-plan/glm-5.3", "deeps
 its quota windows are under the thresholds in `prices.json`, a metered model always. The result block
 says which model ran and why; do not pick the model yourself unless the user asks.
 
+Each model runs in the runtime its provider allows. To mix plans in one chain, add `runtimeByProvider`
+(provider name -> runtime name), e.g. `"runtimeByProvider": {"minimax-coding-plan": "opencode",
+"zai-coding-plan": "opencode"}`: those models run under opencode and `sonnet` still runs under claude.
+Per model the runtime is `--runtime`, then `runtimeByProvider[provider]`, then the profile's `runtime`, then
+the provider's default. Every runtime name is checked when the profile loads.
+
 ## 3. Run it
 
 A worker can outlast the shell tool's timeout, so:
