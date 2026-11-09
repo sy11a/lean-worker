@@ -23,6 +23,10 @@ Never commit to `master` directly and never force-push it.
 - `dotnet tool run sy11a-lint check --full tests/LeanWorker.Tests/LeanWorker.Tests.csproj`
   (`--full`: no solution here, so no `--affected`; the test project as target covers the launcher)
 - `dotnet tool run sy11a-arch check --affected skills/lean-worker/launcher/LeanWorker.csproj`
+- before a head goes to the full CI run (operator, 2026-11-09): the touched test classes and the ones that reference the changed
+  production types (build the test project and run them in the same step, report the counts), and the affected fast tier inside
+  the test sandbox, `dotnet tool run sy11a-test check --affected --base origin/master --tiers small,medium --no-build tests/LeanWorker.Tests/LeanWorker.Tests.csproj`,
+  exit code in the report, run from a detached unit, not a session shell
 - `dotnet tool run sy11a-test check --affected --base origin/master tests/LeanWorker.Tests/LeanWorker.Tests.csproj`
 - The build restores the private `Sy11a.Analyzers` policy package from
   `https://nuget.pkg.github.com/sy11a/index.json`: a classic PAT with `read:packages`, stored in the
