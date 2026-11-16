@@ -47,3 +47,14 @@ Never commit to `master` directly and never force-push it.
 - Never remove `../lean-worker-pinned`: it is sy11a_ctxops's pinned launcher. It moves only
   deliberately (`git -C ../lean-worker-pinned checkout --detach <commit>`, then a rebuild), while no
   worker runs from it, and the move is recorded in a ctxops `docs/history/` entry.
+
+## Decision gate
+
+The operator's rule of 2026-11-16 (every repository in ~/Repository_v2): anything found along the way that is
+not part of the approved task (a review finding outside the PR's own change, a residual route, a flaky test, an
+idea, a new rule) is filed as a GitHub issue in this repository with the label `needs-decision`: what was found,
+where (file:line), the evidence and the proposed fix. It is not worked on, and not put on an epic or backlog
+checklist, until the operator labels it `decision:do`; a no-do is closed as not planned. Only `decision:do` issues
+and work the operator approved in words are taken. A finding on the PR's own change that blocks it (a MAJOR, a red
+test) is part of the approved task and is fixed in that PR. This overrides any rule above that puts findings on an
+epic checklist or files work without the operator's decision.
