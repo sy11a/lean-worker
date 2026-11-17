@@ -8,8 +8,9 @@ operator's word with `gh issue create`. A pull request that finishes one says `C
 ## Changes reach `master` through a pull request
 
 1. Start from an up-to-date `master` (`git switch master && git pull --ff-only`), then branch before
-   the first edit (`fix/<slug>`, `feature/<slug>`, `docs/<slug>`). For parallel work use a worktree:
-   `git worktree add ../lean-worker-<slug> -b <branch> origin/master`.
+   the first edit (`fix/<slug>`, `feature/<slug>`, `docs/<slug>`). For parallel work use a worktree under
+   `~/Repository_v2/.worktrees/lean-worker/` (never next to the projects):
+   `wt-add ~/Repository_v2/lean-worker <slug> -b <branch> origin/master`.
 2. Verify, commit (no AI co-author trailers), `git push -u origin <branch>`, then
    `gh pr create --base master` (what, how verified; no AI attribution footer).
 3. Merge it on GitHub yourself: `gh pr merge --merge --delete-branch`, then
@@ -44,8 +45,9 @@ Never commit to `master` directly and never force-push it.
 - A handoff holds the position and the next step only; the history lives in git.
 - Remove your worktree when its branch is merged (`git worktree remove`, then `git worktree prune`);
   never remove one with uncommitted work.
-- Never remove `../lean-worker-pinned`: it is sy11a_ctxops's pinned launcher. It moves only
-  deliberately (`git -C ../lean-worker-pinned checkout --detach <commit>`, then a rebuild), while no
+- Never remove `~/Repository_v2/.worktrees/lean-worker/pinned` (until 2026-11-17 `../lean-worker-pinned`): it is
+  sy11a_ctxops's pinned launcher. It moves only deliberately
+  (`git -C ~/Repository_v2/.worktrees/lean-worker/pinned checkout --detach <commit>`, then a rebuild), while no
   worker runs from it, and the move is recorded in a ctxops `docs/history/` entry.
 
 ## Decision gate
