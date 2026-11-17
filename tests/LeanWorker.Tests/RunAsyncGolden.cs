@@ -80,6 +80,25 @@ internal static partial class RunAsyncGolden
     }
 
     /// <summary>
+    /// The stub's script: <paramref name="shell"/> first (in the launcher's working directory), then <paramref name="stream"/>.
+    /// </summary>
+    public static string Worker(string shell, string stream = SuccessStream) => shell + "\n" + stream;
+
+    /// <summary>
+    /// The options hook that tracks the run's working directory for cleanup, then runs <paramref name="prepare"/> inside it
+    /// (so it can create the files the worker will tamper with) and <paramref name="configure"/> on the options.
+    /// </summary>
+    public static Action<Options> Tracking(TempDirs dirs, Action? prepare = null, Action<Options>? configure = null)
+    {
+        return o =>
+        {
+            dirs.Track(Directory.GetCurrentDirectory());
+            prepare?.Invoke();
+            configure?.Invoke(o);
+        };
+    }
+
+    /// <summary>
     /// Runs RunAsync with the stub on PATH; returns the exit code and stdout, or rethrows what RunAsync throws.
     /// </summary>
     public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key",

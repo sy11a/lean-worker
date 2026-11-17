@@ -382,13 +382,13 @@ public sealed class GitMetadataHardeningTests : IDisposable
         Assert.False(s.ContainsKey("git_metadata_verified"));
     }
 
-    private static async Task<(int Code, string Stdout)> ContinueAsync(string root, string runDir, string marker)
+    private static Action<Options> ContinuingFrom(string runDir)
     {
-        return await RunAsyncGolden.RunAsync(root, "touch '" + marker + "'\n" + RunAsyncGolden.SuccessStream, o =>
+        return o =>
         {
             o.TaskFile = null;
             o.ContinueFrom = runDir;
-        });
+        };
     }
 
     // 7179bfa: a run that could not verify the metadata is not continued; the operator looks first.
@@ -404,7 +404,7 @@ public sealed class GitMetadataHardeningTests : IDisposable
         await File.WriteAllTextAsync(summaryPath, edited.ToJsonString(), TestContext.Current.CancellationToken);
         string marker = Path.Combine(_dirs.Create("lw-marker"), "worker-ran");
 
-        (int code, string stdout) = await ContinueAsync(root, runDir, marker);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("touch '" + marker + "'"), ContinuingFrom(runDir));
 
         Assert.Equal(1, code);
         Assert.Contains("continue: refused:", stdout, StringComparison.Ordinal);
@@ -424,7 +424,7 @@ public sealed class GitMetadataHardeningTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(runDir, "summary.json"), edited.ToJsonString(), TestContext.Current.CancellationToken);
         string marker = Path.Combine(_dirs.Create("lw-marker"), "worker-ran");
 
-        (int code, string stdout) = await ContinueAsync(root, runDir, marker);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("touch '" + marker + "'"), ContinuingFrom(runDir));
 
         Assert.DoesNotContain("continue: refused:", stdout, StringComparison.Ordinal);
         Assert.Equal(0, code);

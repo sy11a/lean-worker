@@ -40,21 +40,6 @@ public sealed class GateTrustLoopTests : IDisposable
         return new Setup(root, marker, script);
     }
 
-    /// <summary>
-    /// Runs the launcher with a worker that first executes <paramref name="workerShell"/> (in the launcher's
-    /// working directory) and then reports success. <paramref name="prepare"/> runs inside the run's working
-    /// directory before the launch, so it can create the files the worker will tamper with.
-    /// </summary>
-    private async Task<(int Code, string Stdout)> RunAsync(Setup setup, string workerShell, Action? prepare = null, Action<Options>? configure = null)
-    {
-        return await RunAsyncGolden.RunAsync(setup.Root, workerShell + "\n" + RunAsyncGolden.SuccessStream, o =>
-        {
-            _dirs.Track(Directory.GetCurrentDirectory());
-            prepare?.Invoke();
-            configure?.Invoke(o);
-        });
-    }
-
     private static void AssertViolation(Setup setup, int code, string stdout, string expectedPath)
     {
         Assert.Equal(5, code);
@@ -92,7 +77,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "mkdir -p \"$(dirname '" + relative + "')\"\nprintf '{}' > '" + relative + "'");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkdir -p \"$(dirname '" + relative + "')\"\nprintf '{}' > '" + relative + "'"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, "dotnet-tools.json");
     }
@@ -109,10 +94,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync();
         string expected = string.Empty;
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "mkdir -p \"$(dirname '../" + relative + "')\"\nprintf '{}' > '../" + relative + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkdir -p \"$(dirname '../" + relative + "')\"\nprintf '{}' > '../" + relative + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string repo = Directory.GetCurrentDirectory();
                 GitInit(repo);
@@ -120,7 +102,7 @@ public sealed class GateTrustLoopTests : IDisposable
                 _ = Directory.CreateDirectory(work);
                 Directory.SetCurrentDirectory(work);
                 expected = Path.Combine(repo, "a", relative);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, expected);
     }
@@ -147,7 +129,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         (Setup setup, string exe) = await NewPathToolSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "true", () => PutOnPath(exe));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => PutOnPath(exe)));
 
         AssertClean(setup, code, stdout);
     }
@@ -157,7 +139,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         (Setup setup, string exe) = await NewPathToolSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "printf '#!/bin/sh\\nexit 0\\n' > '" + exe + "'", () => PutOnPath(exe));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n' > '" + exe + "'"), RunAsyncGolden.Tracking(_dirs, () => PutOnPath(exe)));
 
         AssertViolation(setup, code, stdout, exe);
     }
@@ -183,7 +165,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "true", () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertClean(setup, code, stdout);
     }
@@ -194,10 +176,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string planted = Path.Combine(dirA, ToolName);
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'",
-            () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertViolation(setup, code, stdout, planted);
     }
@@ -208,7 +187,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string removed = Path.Combine(dirB, ToolName);
 
-        (int code, string stdout) = await RunAsync(setup, "rm -f '" + removed + "'", () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("rm -f '" + removed + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertViolation(setup, code, stdout, removed);
     }
@@ -222,17 +201,14 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string relativeMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "relative-ran");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "true",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string bin = Path.Combine(Directory.GetCurrentDirectory(), "relbin");
                 _ = Directory.CreateDirectory(bin);
                 File.WriteAllText(Path.Combine(bin, ToolName), "#!/bin/sh\ntouch '" + relativeMarker + "'\nexit 0\n");
                 File.SetUnixFileMode(Path.Combine(bin, ToolName), UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
                 SetPath("relbin", dirA, dirB);
-            });
+            }));
 
         AssertClean(setup, code, stdout);
         Assert.False(File.Exists(relativeMarker), "a tool found through a relative PATH entry must not run");
@@ -263,11 +239,8 @@ public sealed class GateTrustLoopTests : IDisposable
             "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nR=\"$(dirname \"$0\")/rep.json\"\n" +
             "printf '{\"runs\":[{\"results\":[1,2]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 1\n");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '#!/bin/sh\\ntouch \"" + plantedMarker + "\"\\necho 0 findings\\nexit 0\\n' > '" + exeA + "'\nchmod +x '" + exeA + "'",
-            () => Environment.SetEnvironmentVariable(
-                "PATH", dirA + Path.PathSeparator + dirB + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\ntouch \"" + plantedMarker + "\"\\necho 0 findings\\nexit 0\\n' > '" + exeA + "'\nchmod +x '" + exeA + "'"), RunAsyncGolden.Tracking(_dirs, () => Environment.SetEnvironmentVariable(
+                "PATH", dirA + Path.PathSeparator + dirB + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"))));
 
         AssertViolation(setup, code, stdout, exeA);
         Assert.False(File.Exists(plantedMarker), "the planted gate must not run");
@@ -279,7 +252,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["lw-gate-t53m-does-not-exist"]));
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("lw-gate-t53m-does-not-exist", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -305,8 +278,7 @@ public sealed class GateTrustLoopTests : IDisposable
             _ = Directory.CreateDirectory(Path.GetDirectoryName(decoy)!);
             await GateLoopTests.WriteExecutableAsync(decoy, "#!/bin/sh\ntouch '" + decoyMarker + "'\nexit 0\n");
 
-            (int code, string stdout) = await RunAsync(
-                setup, "true", () =>
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     string cwd = Directory.GetCurrentDirectory();
                     string script = Path.Combine(cwd, "tools", "gate.sh");
@@ -314,7 +286,7 @@ public sealed class GateTrustLoopTests : IDisposable
                     File.WriteAllText(script, "#!/bin/sh\ntouch '" + setup.Marker + "'\necho \"argv0=$0\"\nexit 0\n");
                     File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
                     expected = script;
-                });
+                }));
 
             AssertClean(setup, code, stdout);
             Assert.False(File.Exists(decoyMarker), "the script under the launcher's folder must not run");
@@ -368,7 +340,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["command"] = new JsonArray(["./tools/missing.sh"]));
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("gate executable './tools/missing.sh' not found", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("on PATH", ex.Message, StringComparison.Ordinal);
@@ -403,10 +375,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string planted = Path.Combine(missing, ToolName);
         try
         {
-            (int code, string stdout) = await RunAsync(
-                setup,
-                "mkdir '" + missing + "'\nprintf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'\nchmod 0311 '" + missing + "'",
-                () => SetPath(missing, dirB));
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkdir '" + missing + "'\nprintf '#!/bin/sh\\nexit 0\\n' > '" + planted + "'\nchmod +x '" + planted + "'\nchmod 0311 '" + missing + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(missing, dirB)));
 
             AssertViolation(setup, code, stdout, missing);
         }
@@ -425,7 +394,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         try
         {
-            (int code, string stdout) = await RunAsync(setup, "chmod 0311 '" + dirA + "'", () => SetPath(dirA, dirB));
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("chmod 0311 '" + dirA + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
             AssertViolation(setup, code, stdout, dirA);
             Assert.Contains("is now unreadable", stdout, StringComparison.Ordinal);
@@ -442,7 +411,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string missing = Path.Combine(dirA, "bin");
 
-        (int code, string stdout) = await RunAsync(setup, "mkdir '" + missing + "'", () => SetPath(missing, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkdir '" + missing + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(missing, dirB)));
 
         AssertViolation(setup, code, stdout, missing);
         Assert.Contains("is now readable", stdout, StringComparison.Ordinal);
@@ -460,7 +429,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(setup, "touch '" + workerMarker + "'", () => Environment.SetEnvironmentVariable("PATH", "relbin" + Path.PathSeparator + ".")));
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () => Environment.SetEnvironmentVariable("PATH", "relbin" + Path.PathSeparator + "."))));
 
         Assert.Contains("gate PATH has no absolute entries", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -494,8 +463,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string tool = Path.Combine(dirB, ToolName);
 
-        (int code, string stdout) = await RunAsync(
-            setup, "printf '#!/bin/sh\\nexit 0\\n# a different and longer body\\n' > '" + tool + "'", () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n# a different and longer body\\n' > '" + tool + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertViolation(setup, code, stdout, tool);
         Assert.Contains("changed length", stdout, StringComparison.Ordinal);
@@ -511,10 +479,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string tool = Path.Combine(dirB, ToolName);
         string staged = Path.Combine(dirA, "staged");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '#!/bin/sh\\nexit 0\\n# renamed over, with another body\\n' > '" + staged + "'\nchmod +x '" + staged + "'\nmv '" + staged + "' '" + tool + "'",
-            () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n# renamed over, with another body\\n' > '" + staged + "'\nchmod +x '" + staged + "'\nmv '" + staged + "' '" + tool + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertViolation(setup, code, stdout, tool);
     }
@@ -528,14 +493,11 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string link = Path.Combine(dirA, "lw-link");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "ln -sfn '" + Path.Combine(dirB, ToolName) + "' '" + link + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("ln -sfn '" + Path.Combine(dirB, ToolName) + "' '" + link + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 _ = File.CreateSymbolicLink(link, Path.Combine(dirB, "elsewhere"));
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, link);
         Assert.Contains("changed its link target", stdout, StringComparison.Ordinal);
@@ -549,15 +511,12 @@ public sealed class GateTrustLoopTests : IDisposable
 
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "true",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 File.WriteAllText(Path.Combine(dirA, "other-tool"), "x");
                 _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), Path.Combine(dirB, ToolName));
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertClean(setup, code, stdout);
     }
@@ -568,7 +527,7 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string planted = Path.Combine(dirA, ToolName);
 
-        (int code, string stdout) = await RunAsync(setup, "touch '" + planted + "'", () => SetPath(dirA, dirB));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + planted + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirB)));
 
         AssertViolation(setup, code, stdout, planted);
         Assert.Contains(PathHint, stdout, StringComparison.Ordinal);
@@ -582,15 +541,12 @@ public sealed class GateTrustLoopTests : IDisposable
         string inside = string.Empty;
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () =>
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     inside = Path.Combine(Directory.GetCurrentDirectory(), "inbin");
                     _ = Directory.CreateDirectory(inside);
                     SetPath(inside, dirA, dirB);
-                }));
+                })));
 
         Assert.Equal("gate PATH directory '" + inside + "' is inside the working tree", ex.Message);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -608,16 +564,13 @@ public sealed class GateTrustLoopTests : IDisposable
         string link = Path.Combine(dirA, "lw-link");
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () =>
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     string target = Path.Combine(Directory.GetCurrentDirectory(), "inside-target");
                     File.WriteAllText(target, "x");
                     _ = File.CreateSymbolicLink(link, target);
                     SetPath(dirA, dirB);
-                }));
+                })));
 
         Assert.StartsWith("gate PATH entry '" + link + "' links into the working tree: ", ex.Message, StringComparison.Ordinal);
         Assert.Contains("inside-target", ex.Message, StringComparison.Ordinal);
@@ -635,15 +588,12 @@ public sealed class GateTrustLoopTests : IDisposable
         string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "data");
         string link = Path.Combine(dirA, "lw-link");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf 'a much longer replacement body' > '" + target + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'a much longer replacement body' > '" + target + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 File.WriteAllText(target, "short");
                 _ = File.CreateSymbolicLink(link, target);
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, link);
         Assert.Contains("changed its target's length", stdout, StringComparison.Ordinal);
@@ -662,17 +612,14 @@ public sealed class GateTrustLoopTests : IDisposable
         string realTarget = Path.Combine(baseDir, "real", "x");
         string viaLink = Path.Combine(baseDir, "a");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf 'a much longer replacement body' > '" + realTarget + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'a much longer replacement body' > '" + realTarget + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 File.WriteAllText(realTarget, "short");
                 File.WriteAllText(Path.Combine(baseDir, "x"), "decoy");
                 _ = Directory.CreateSymbolicLink(viaLink, realB);
                 _ = File.CreateSymbolicLink(Path.Combine(realB, "lw-link"), "../x");
                 SetPath(viaLink, dirB);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, Path.Combine(viaLink, "lw-link"));
         Assert.Contains("changed its target's length", stdout, StringComparison.Ordinal);
@@ -689,14 +636,11 @@ public sealed class GateTrustLoopTests : IDisposable
         try
         {
             LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-                async () => await RunAsync(
-                    setup,
-                    "touch '" + workerMarker + "'",
-                    () =>
+                async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                     {
                         File.SetUnixFileMode(dirA, UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
                         SetPath(dirA, dirB);
-                    }));
+                    })));
 
             Assert.StartsWith("gate PATH directory '" + dirA + "' cannot be listed: unreadable", ex.Message, StringComparison.Ordinal);
             Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -719,15 +663,12 @@ public sealed class GateTrustLoopTests : IDisposable
         string a = Path.Combine(dirA, "a");
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () =>
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     _ = File.CreateSymbolicLink(a, Path.Combine(dirA, "b"));
                     _ = File.CreateSymbolicLink(Path.Combine(dirA, "b"), a);
                     SetPath(dirA, dirB);
-                }));
+                })));
 
         // both halves of the loop are unresolvable; the listing order decides which one is named first
         Assert.True(
@@ -747,14 +688,11 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string missing = Path.Combine(_dirs.Create("lw-gate-linktarget"), "missing");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "true",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), missing);
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertClean(setup, code, stdout);
     }
@@ -769,14 +707,11 @@ public sealed class GateTrustLoopTests : IDisposable
         string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "missing");
         string link = Path.Combine(dirA, "lw-link");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf 'planted' > '" + target + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'planted' > '" + target + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 _ = File.CreateSymbolicLink(link, target);
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, link);
     }
@@ -793,16 +728,13 @@ public sealed class GateTrustLoopTests : IDisposable
         string second = Path.Combine(targetDir, "second");
         string link = Path.Combine(dirA, "lw-link");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "ln -sfn '" + second + "' '" + link + "'",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("ln -sfn '" + second + "' '" + link + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 File.WriteAllText(first, "same");
                 File.WriteAllText(second, "same");
                 _ = File.CreateSymbolicLink(link, first);
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertViolation(setup, code, stdout, link);
         Assert.Contains("changed its final target", stdout, StringComparison.Ordinal);
@@ -817,15 +749,12 @@ public sealed class GateTrustLoopTests : IDisposable
         (Setup setup, string dirA, string dirB) = await NewNamedToolSetupAsync();
         string target = Path.Combine(_dirs.Create("lw-gate-linktarget"), "data");
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "true",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 File.WriteAllText(target, "short");
                 _ = File.CreateSymbolicLink(Path.Combine(dirA, "lw-link"), target);
                 SetPath(dirA, dirB);
-            });
+            }));
 
         AssertClean(setup, code, stdout);
     }
@@ -843,16 +772,13 @@ public sealed class GateTrustLoopTests : IDisposable
         string viaLink = Path.Combine(_dirs.Create("lw-gate-links"), "link-to-repo");
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () =>
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     string cwd = Directory.GetCurrentDirectory();
                     _ = Directory.CreateDirectory(Path.Combine(cwd, "bin"));
                     _ = Directory.CreateSymbolicLink(viaLink, cwd);
                     SetPath(Path.Combine(viaLink, "bin"), dirA, dirB);
-                }));
+                })));
 
         Assert.Equal("gate PATH directory '" + Path.Combine(viaLink, "bin") + "' is inside the working tree", ex.Message);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -873,11 +799,7 @@ public sealed class GateTrustLoopTests : IDisposable
         _ = Directory.CreateDirectory(inside);
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () => SetPath(inside, dirA, dirB),
-                o => o.RunsRoot = rootLink));
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () => SetPath(inside, dirA, dirB), configure: o => o.RunsRoot = rootLink)));
 
         Assert.Equal("gate PATH directory '" + inside + "' is inside the working tree", ex.Message);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -897,17 +819,14 @@ public sealed class GateTrustLoopTests : IDisposable
         string hop = string.Empty;
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(
-            async () => await RunAsync(
-                setup,
-                "touch '" + workerMarker + "'",
-                () =>
+            async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
                 {
                     File.WriteAllText(target, "x");
                     hop = Path.Combine(Directory.GetCurrentDirectory(), "hop");
                     _ = File.CreateSymbolicLink(hop, target);
                     _ = File.CreateSymbolicLink(entry, hop);
                     SetPath(dirA, dirB);
-                }));
+                })));
 
         Assert.Equal("gate PATH entry '" + entry + "' resolves into the working tree via '" + hop + "'", ex.Message);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -928,8 +847,7 @@ public sealed class GateTrustLoopTests : IDisposable
         RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
-            setup, "touch '" + workerMarker + "'"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
         Assert.Contains("is at or under the runs root outside runs/", ex.Message, StringComparison.Ordinal);
@@ -947,7 +865,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string dirBLink = Path.Combine(_dirs.Create("lw-gate-links"), "pathb-link");
         _ = Directory.CreateSymbolicLink(dirBLink, dirB);
 
-        (int code, string stdout) = await RunAsync(setup, "true", () => SetPath(dirA, dirBLink));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => SetPath(dirA, dirBLink)));
 
         AssertClean(setup, code, stdout);
     }
@@ -959,10 +877,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["Directory.Build.props"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '<Project><PropertyGroup><NoWarn>all</NoWarn></PropertyGroup></Project>' > Directory.Build.props",
-            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '<Project><PropertyGroup><NoWarn>all</NoWarn></PropertyGroup></Project>' > Directory.Build.props"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>")));
 
         AssertViolation(setup, code, stdout, "Directory.Build.props");
     }
@@ -972,10 +887,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["Directory.Build.targets"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '<Project><PropertyGroup/></Project>' > Directory.Build.props",
-            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '<Project><PropertyGroup/></Project>' > Directory.Build.props"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>")));
 
         AssertClean(setup, code, stdout);
     }
@@ -985,7 +897,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray([".editorconfig"]));
 
-        (int code, string stdout) = await RunAsync(setup, "printf 'root = true' > .editorconfig");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'root = true' > .editorconfig"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, ".editorconfig");
     }
@@ -995,15 +907,12 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["src/**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '<Project><PropertyGroup/></Project>' > src/deep/x.props",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '<Project><PropertyGroup/></Project>' > src/deep/x.props"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string dir = Path.Combine(Directory.GetCurrentDirectory(), "src", "deep");
                 _ = Directory.CreateDirectory(dir);
                 File.WriteAllText(Path.Combine(dir, "x.props"), "<Project/>");
-            });
+            }));
 
         AssertViolation(setup, code, stdout, "x.props");
     }
@@ -1013,15 +922,12 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["src/**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf 'changed' > src/deep/x.txt",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'changed' > src/deep/x.txt"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string dir = Path.Combine(Directory.GetCurrentDirectory(), "src", "deep");
                 _ = Directory.CreateDirectory(dir);
                 File.WriteAllText(Path.Combine(dir, "x.txt"), "text");
-            });
+            }));
 
         AssertClean(setup, code, stdout);
     }
@@ -1031,7 +937,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["../outside.props"]));
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "true"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("gate.trust[0]", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(setup.Marker));
@@ -1046,7 +952,7 @@ public sealed class GateTrustLoopTests : IDisposable
             "#!/bin/sh\nprintf '{}' > global.json\nR=\"$(dirname \"$0\")/report.json\"\n" +
             "printf '{\"runs\":[{\"results\":[1,2]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 1\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.Equal(5, code);
         Assert.Contains("gate:     ERROR: trusted files changed while the gate ran: ", stdout, StringComparison.Ordinal);
@@ -1086,8 +992,7 @@ public sealed class GateTrustLoopTests : IDisposable
             },
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 if (!existedBefore)
                 {
@@ -1095,7 +1000,7 @@ public sealed class GateTrustLoopTests : IDisposable
                 }
 
                 File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old");
-            });
+            }));
 
         AssertClean(setup, code, stdout);
     }
@@ -1105,8 +1010,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("report.out"));
 
-        (int code, string stdout) = await RunAsync(
-            setup, "printf 'tampered' > report.out", () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'tampered' > report.out"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old")));
 
         AssertViolation(setup, code, stdout, "report.out");
     }
@@ -1146,14 +1050,13 @@ public sealed class GateTrustLoopTests : IDisposable
             ReportScript(relative));
         string expected = string.Empty;
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string cwd = Directory.GetCurrentDirectory();
                 expected = Path.Combine(cwd, relative);
                 _ = Directory.CreateDirectory(Path.GetDirectoryName(expected)!);
                 File.WriteAllText(expected, "{}");
-            });
+            }));
 
         await AssertReportPathViolationAsync(code, stdout, expected);
     }
@@ -1165,7 +1068,7 @@ public sealed class GateTrustLoopTests : IDisposable
         await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
         Setup setup = await NewSetupAsync(scriptBody: ReportScript(prices));
 
-        (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices));
 
         await AssertReportPathViolationAsync(code, stdout, prices);
     }
@@ -1174,8 +1077,8 @@ public sealed class GateTrustLoopTests : IDisposable
     // These tests keep the script in the working directory; the scratch-directory script is covered by the
     // "outside the git root" tests below.
 
-    private async Task<Setup> NewRepoScriptSetupAsync(bool wrapped) =>
-        await NewSetupAsync(gate => gate["command"] = wrapped ? new JsonArray(["env", "X=1", "sh", "gate.sh"]) : new JsonArray(["sh", "gate.sh"]));
+    private static Action<JsonObject> RepoScriptGate(bool wrapped) =>
+        gate => gate["command"] = wrapped ? new JsonArray(["env", "X=1", "sh", "gate.sh"]) : new JsonArray(["sh", "gate.sh"]);
 
     // Writes the gate script into the working directory; returns its full path.
     private static string PlantRepoScript(string body)
@@ -1190,10 +1093,10 @@ public sealed class GateTrustLoopTests : IDisposable
     [InlineData(true)]
     public async Task A_report_path_that_is_the_gate_script_ends_in_errorAsync(bool wrapped)
     {
-        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        Setup setup = await NewSetupAsync(RepoScriptGate(wrapped));
         string expected = string.Empty;
 
-        (int code, string stdout) = await RunAsync(setup, "true", () => expected = PlantRepoScript(ReportScript("$0")));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => expected = PlantRepoScript(ReportScript("$0"))));
 
         await AssertReportPathViolationAsync(code, stdout, expected);
     }
@@ -1203,12 +1106,11 @@ public sealed class GateTrustLoopTests : IDisposable
     [InlineData(true)]
     public async Task A_worker_that_changes_the_script_trips_the_trust_checkAsync(bool wrapped)
     {
-        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        Setup setup = await NewSetupAsync(RepoScriptGate(wrapped));
         string expected = string.Empty;
         string body = "#!/bin/sh\ntouch '" + setup.Marker + "'\nexit 0\n";
 
-        (int code, string stdout) = await RunAsync(
-            setup, "printf '#!/bin/sh\\nexit 0\\n' > gate.sh", () => expected = PlantRepoScript(body));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n' > gate.sh"), RunAsyncGolden.Tracking(_dirs, () => expected = PlantRepoScript(body)));
 
         AssertViolation(setup, code, stdout, expected);
     }
@@ -1218,10 +1120,10 @@ public sealed class GateTrustLoopTests : IDisposable
     [InlineData(true)]
     public async Task A_gate_script_the_worker_leaves_alone_is_cleanAsync(bool wrapped)
     {
-        Setup setup = await NewRepoScriptSetupAsync(wrapped);
+        Setup setup = await NewSetupAsync(RepoScriptGate(wrapped));
         string body = "#!/bin/sh\ntouch '" + setup.Marker + "'\nexit 0\n";
 
-        (int code, string stdout) = await RunAsync(setup, "true", () => PlantRepoScript(body));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => PlantRepoScript(body)));
 
         AssertClean(setup, code, stdout);
     }
@@ -1260,8 +1162,7 @@ public sealed class GateTrustLoopTests : IDisposable
             },
             OutputScript);
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 if (!existedBefore)
                 {
@@ -1269,7 +1170,7 @@ public sealed class GateTrustLoopTests : IDisposable
                 }
 
                 WriteOldReport();
-            });
+            }));
 
         AssertClean(setup, code, stdout);
 
@@ -1290,7 +1191,7 @@ public sealed class GateTrustLoopTests : IDisposable
             },
             OutputScript);
 
-        (int code, string stdout) = await RunAsync(setup, "printf 'tampered' > out/report.sarif", () => WriteOldReport());
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'tampered' > out/report.sarif"), RunAsyncGolden.Tracking(_dirs, () => WriteOldReport()));
 
         AssertViolation(setup, code, stdout, "report.sarif");
     }
@@ -1300,7 +1201,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
         JsonObject gateJson = JsonNode.Parse(await File.ReadAllTextAsync(
@@ -1317,8 +1218,7 @@ public sealed class GateTrustLoopTests : IDisposable
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf 'new' > \"$1\"\nR=\"$(dirname \"$0\")/rep.json\"\n" +
             "printf '{\"runs\":[{\"results\":[]}]}' > \"$R\"\necho \"sarif: $R\"\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "report.out"), "old")));
 
         Assert.Equal(5, code);
         Assert.Contains("gate:     ERROR: trusted files changed while the gate ran: ", stdout, StringComparison.Ordinal);
@@ -1334,7 +1234,7 @@ public sealed class GateTrustLoopTests : IDisposable
             "#!/bin/sh\ntouch '" + setup.Marker + "'\nfor d in '" + setup.Root + "'/runs/*/; do D=\"${d%/}\"; done\n" +
             "printf '{\"runs\":[{\"results\":[]}]}' > \"$D/gate-report.json\"\necho \"sarif: $D/gate-report.json\"\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1358,7 +1258,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string counter = Path.Combine(Path.GetDirectoryName(setup.Script)!, "w");
         string worker = "N=$(cat '" + counter + "' 2>/dev/null || echo 0); N=$((N+1)); echo $N > '" + counter + "'\n" + workerShell;
 
-        (int code, string stdout) = await RunAsync(setup, worker, () => WriteOldReport());
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker(worker), RunAsyncGolden.Tracking(_dirs, () => WriteOldReport()));
         return (setup, code, stdout);
     }
 
@@ -1394,7 +1294,7 @@ public sealed class GateTrustLoopTests : IDisposable
     public async Task A_worker_that_edits_a_gate_script_outside_the_git_root_trips_the_trust_checkAsync()
     {
         Setup setup = await NewSetupAsync();
-        (int code, string stdout) = await RunAsync(setup, "printf '#!/bin/sh\\nexit 0\\n' > '" + setup.Script + "'");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '#!/bin/sh\\nexit 0\\n' > '" + setup.Script + "'"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, setup.Script);
     }
@@ -1404,10 +1304,9 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", () => Assert.False(
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => Assert.False(
                 Path.GetFullPath(setup.Script).StartsWith(Directory.GetCurrentDirectory() + Path.DirectorySeparatorChar, StringComparison.Ordinal),
-                "the gate script must live outside the working directory"));
+                "the gate script must live outside the working directory")));
 
         AssertClean(setup, code, stdout);
     }
@@ -1427,7 +1326,7 @@ public sealed class GateTrustLoopTests : IDisposable
             },
             RewritingGateScript);
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.True(code is 0, stdout);
         Assert.Contains("gate:     clean after 2 round(s), findings 3→0", stdout, StringComparison.Ordinal);
@@ -1442,8 +1341,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray([prices]));
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
-            setup, "touch '" + workerMarker + "'", configure: o => o.PricesFile = prices));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices)));
 
         Assert.Contains("gate.outputs[0] '" + prices + "' is a trusted gate input", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -1459,7 +1357,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("/dev/null"));
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("/dev/null", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -1480,8 +1378,7 @@ public sealed class GateTrustLoopTests : IDisposable
         RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
-            setup, "touch '" + workerMarker + "'"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs)));
 
         string expected = kind is "runsroot" ? "is at or under the runs root outside runs/" : "is a trusted gate input";
         Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
@@ -1495,7 +1392,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray(["artifacts/global.json"]));
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1511,7 +1408,7 @@ public sealed class GateTrustLoopTests : IDisposable
         profile["gate"]!["outputs"] = new JsonArray([output]);
         RunAsyncGolden.WriteProfile(setup.Root, "test", profile);
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1530,7 +1427,7 @@ public sealed class GateTrustLoopTests : IDisposable
             },
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nprintf '{\"runs\":[{\"results\":[]}]}' > \"$1\"\necho \"sarif: $1\"\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1542,8 +1439,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string profiles = Path.GetFullPath(Path.Combine(setup.Root, "profiles.json"));
         await GateLoopTests.WriteExecutableAsync(setup.Script, ReportScript(profiles));
 
-        (int code, string stdout) = await RunAsync(
-            setup, "true", configure: o => o.RunsRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), setup.Root));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, configure: o => o.RunsRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), setup.Root)));
 
         Assert.Equal(5, code);
         Assert.Contains("the gate's report path is a trusted input", stdout, StringComparison.Ordinal);
@@ -1556,7 +1452,7 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Setup setup = await NewSetupAsync(gate => gate["command"]!.AsArray().Add("/dev/null"));
 
-        _ = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "true"));
+        _ = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs)));
 
         string runs = Path.Combine(setup.Root, "runs");
         Assert.False(Directory.Exists(runs) && Directory.GetFileSystemEntries(runs).Length > 0, "no run directory may be left");
@@ -1569,8 +1465,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(
-            setup, "for d in '" + setup.Root + "'/runs/*/; do mkdir \"${d%/}/gate.log\"; done");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("for d in '" + setup.Root + "'/runs/*/; do mkdir \"${d%/}/gate.log\"; done"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.Equal(5, code);
         Assert.Contains("gate:     ERROR: the gate could not be run", stdout, StringComparison.Ordinal);
@@ -1590,7 +1485,7 @@ public sealed class GateTrustLoopTests : IDisposable
             "#!/bin/sh\ntouch '" + setup.Marker + "'\nfor d in '" + setup.Root + "'/runs/*/; do D=\"${d%/}\"; done\n" +
             "echo \"sarif: $D/../../profiles.json\"\nexit 3\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         await AssertReportPathViolationAsync(code, stdout, Path.GetFullPath(Path.Combine(setup.Root, "profiles.json")));
     }
@@ -1603,8 +1498,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["other.props", "tools"]));
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
-            setup, "touch '" + workerMarker + "'", () => Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), "tools"))));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () => Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), "tools")))));
 
         Assert.Contains("gate.trust[1]", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -1679,15 +1573,11 @@ public sealed class GateTrustLoopTests : IDisposable
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
         string expected = string.Empty;
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(
-            setup,
-            "touch '" + workerMarker + "'",
-            () =>
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 expected = Path.Combine(Directory.GetCurrentDirectory(), output);
                 PlantTrustedFile(kind, expected, setup.Root);
-            },
-            o => PointOptionsAtTrustedFile(kind, o, output)));
+            }, configure: o => PointOptionsAtTrustedFile(kind, o, output))));
 
         Assert.Contains("gate.outputs[1] '" + expected + "' is a trusted gate input", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -1699,7 +1589,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["outputs"] = new JsonArray(["../outside.sarif"]));
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "true"));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs)));
 
         Assert.Contains("gate.outputs[0]", ex.Message, StringComparison.Ordinal);
         Assert.False(File.Exists(setup.Marker));
@@ -1712,7 +1602,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(setup, "mkdir -p obj\nprintf '<Project/>' > obj/x.nuget.g.props");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkdir -p obj\nprintf '<Project/>' > obj/x.nuget.g.props"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1724,7 +1614,7 @@ public sealed class GateTrustLoopTests : IDisposable
             gate => gate["trust"] = new JsonArray(["**/*.props"]),
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/gate-ran\"\nmkdir -p obj\nprintf '<Project/>' > obj/x.nuget.g.props\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1734,10 +1624,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '<Project><PropertyGroup/></Project>' > Directory.Build.props",
-            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '<Project><PropertyGroup/></Project>' > Directory.Build.props"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "Directory.Build.props"), "<Project/>")));
 
         AssertViolation(setup, code, stdout, "Directory.Build.props");
     }
@@ -1757,7 +1644,7 @@ public sealed class GateTrustLoopTests : IDisposable
         _ = File.CreateSymbolicLink(link2, link1);
         RunAsyncGolden.WriteProfile(setup.Root, "test", new JsonObject { ["gate"] = new JsonObject { ["command"] = new JsonArray([link2]) } });
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -1776,11 +1663,11 @@ public sealed class GateTrustLoopTests : IDisposable
         }
 
         Setup clean = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["tools.cfg"]));
-        (int cleanCode, string cleanStdout) = await RunAsync(clean, "true", () => Prepare());
+        (int cleanCode, string cleanStdout) = await RunAsyncGolden.RunAsync(clean.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () => Prepare()));
         AssertClean(clean, cleanCode, cleanStdout);
 
         Setup edited = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["tools.cfg"]));
-        (int editedCode, string editedStdout) = await RunAsync(edited, "printf 'two' > real.cfg", () => Prepare());
+        (int editedCode, string editedStdout) = await RunAsyncGolden.RunAsync(edited.Root, RunAsyncGolden.Worker("printf 'two' > real.cfg"), RunAsyncGolden.Tracking(_dirs, () => Prepare()));
         AssertViolation(edited, editedCode, editedStdout, "tools.cfg");
     }
 
@@ -1795,7 +1682,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string workerMarker = Path.Combine(Path.GetDirectoryName(setup.Marker)!, "worker-ran");
         string expected = string.Empty;
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + workerMarker + "'", () =>
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + workerMarker + "'"), RunAsyncGolden.Tracking(_dirs, () =>
         {
             expected = Path.Combine(Directory.GetCurrentDirectory(), "global.json");
             if (kind is "directory")
@@ -1806,7 +1693,7 @@ public sealed class GateTrustLoopTests : IDisposable
             {
                 _ = File.CreateSymbolicLink(expected, Path.Combine(Directory.GetCurrentDirectory(), "lw-missing-target"));
             }
-        }));
+        })));
 
         Assert.Contains("trusted path '" + expected + "' (", ex.Message, StringComparison.Ordinal);
         Assert.Contains("is not a regular file", ex.Message, StringComparison.Ordinal);
@@ -1906,7 +1793,7 @@ public sealed class GateTrustLoopTests : IDisposable
         File.SetUnixFileMode(locked, UnixFileMode.None);
         try
         {
-            (int code, string stdout) = await RunAsync(setup, "true");
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
             Assert.True(code is 0, stdout);
             Assert.True(File.Exists(setup.Marker), "the gate should have run");
@@ -1928,14 +1815,14 @@ public sealed class GateTrustLoopTests : IDisposable
         string locked = string.Empty;
         try
         {
-            (int code, string stdout) = await RunAsync(setup, "true", () =>
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string repo = Directory.GetCurrentDirectory();
                 GitInit(repo);
                 locked = Path.Combine(repo, "locked");
                 _ = Directory.CreateDirectory(locked);
                 File.SetUnixFileMode(locked, UnixFileMode.None);
-            });
+            }));
 
             Assert.True(code is 0, stdout);
             Assert.True(File.Exists(setup.Marker), "the gate should have run");
@@ -1958,8 +1845,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string r = setup.Root;
         Stopwatch watch = Stopwatch.StartNew();
 
-        Task<(int Code, string Stdout)> run = RunAsync(
-            setup, "mkfifo '" + r + "/f1' '" + r + "/f2' '" + r + "/f3' '" + r + "/f4' '" + r + "/f5'");
+        Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("mkfifo '" + r + "/f1' '" + r + "/f2' '" + r + "/f3' '" + r + "/f4' '" + r + "/f5'"), RunAsyncGolden.Tracking(_dirs));
         (int code, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(120), TimeProvider.System, TestContext.Current.CancellationToken);
         watch.Stop();
 
@@ -1972,7 +1858,7 @@ public sealed class GateTrustLoopTests : IDisposable
     {
         Setup setup = await NewSetupAsync(scriptBody: "#!/bin/sh\nprintf 'scratch' > not-trusted.txt\nexit 0\n");
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.Equal(0, code);
         Assert.Contains("gate:     clean after 1 round(s), findings 0", stdout, StringComparison.Ordinal);
@@ -1987,7 +1873,7 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(setup, "ln -s \"$PWD/lw-missing-target\" global.json");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("ln -s \"$PWD/lw-missing-target\" global.json"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, "global.json");
         Assert.DoesNotContain("lw-missing-target", stdout, StringComparison.Ordinal);
@@ -2000,15 +1886,12 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Setup setup = await NewSetupAsync();
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "rm global.json\nln -s other.json global.json",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("rm global.json\nln -s other.json global.json"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string cwd = Directory.GetCurrentDirectory();
                 File.WriteAllText(Path.Combine(cwd, "global.json"), "{}");
                 File.WriteAllText(Path.Combine(cwd, "other.json"), "{}");
-            });
+            }));
 
         AssertViolation(setup, code, stdout, "global.json");
     }
@@ -2021,13 +1904,11 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync();
         string r = setup.Root;
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "echo '{}' >> '" + r + "/runs.jsonl'\n" +
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("echo '{}' >> '" + r + "/runs.jsonl'\n" +
             "mkdir -p '" + r + "/system' '" + r + "/inbox/t' '" + r + "/runs/other'\n" +
             "echo x > '" + r + "/system/zz.md'\n" +
             "echo y > '" + r + "/inbox/t/f'\n" +
-            "echo z > '" + r + "/runs/other/summary.json'");
+            "echo z > '" + r + "/runs/other/summary.json'"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
     }
@@ -2040,7 +1921,7 @@ public sealed class GateTrustLoopTests : IDisposable
         _ = Directory.CreateDirectory(nested);
         await File.WriteAllTextAsync(Path.Combine(nested, "notes.txt"), "before", TestContext.Current.CancellationToken);
 
-        (int code, string stdout) = await RunAsync(setup, "printf 'after' > '" + Path.Combine(nested, "notes.txt") + "'");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf 'after' > '" + Path.Combine(nested, "notes.txt") + "'"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, "notes.txt");
     }
@@ -2052,7 +1933,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string prices = Path.Combine(_dirs.Create("lw-gate-prices"), "my-prices.json");
         await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
 
-        (int code, string stdout) = await RunAsync(setup, "printf '{ }' > '" + prices + "'", configure: o => o.PricesFile = prices);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '{ }' > '" + prices + "'"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices));
 
         AssertViolation(setup, code, stdout, prices);
     }
@@ -2064,7 +1945,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string prices = Path.Combine(_dirs.Create("lw-gate-prices"), "my-prices.json");
         await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
 
-        (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices));
 
         AssertClean(setup, code, stdout);
     }
@@ -2078,7 +1959,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string prices = Path.Combine(inbox, "my-prices.json");
         await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
 
-        (int code, string stdout) = await RunAsync(setup, "printf '{ }' > '" + prices + "'", configure: o => o.PricesFile = prices);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '{ }' > '" + prices + "'"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices));
 
         AssertViolation(setup, code, stdout, prices);
     }
@@ -2092,7 +1973,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string prices = Path.Combine(inbox, "my-prices.json");
         await File.WriteAllTextAsync(prices, "{}", TestContext.Current.CancellationToken);
 
-        (int code, string stdout) = await RunAsync(setup, "true", configure: o => o.PricesFile = prices);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, configure: o => o.PricesFile = prices));
 
         AssertClean(setup, code, stdout);
     }
@@ -2109,10 +1990,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["*.cfg"]));
         string content = target is "same" ? "one" : "two";
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '" + content + "' > target.txt\nrm tools.cfg\nln -s target.txt tools.cfg",
-            () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "tools.cfg"), "one"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '" + content + "' > target.txt\nrm tools.cfg\nln -s target.txt tools.cfg"), RunAsyncGolden.Tracking(_dirs, () => File.WriteAllText(Path.Combine(Directory.GetCurrentDirectory(), "tools.cfg"), "one")));
 
         AssertViolation(setup, code, stdout, "tools.cfg");
     }
@@ -2130,8 +2008,7 @@ public sealed class GateTrustLoopTests : IDisposable
         string content = target is "same" ? "one" : "two";
         string elsewhere = Path.Combine(_dirs.Create("lw-gate-link-target"), "target.md");
 
-        (int code, string stdout) = await RunAsync(
-            setup, "printf '" + content + "' > '" + elsewhere + "'\nrm '" + project + "'\nln -s '" + elsewhere + "' '" + project + "'");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '" + content + "' > '" + elsewhere + "'\nrm '" + project + "'\nln -s '" + elsewhere + "' '" + project + "'"), RunAsyncGolden.Tracking(_dirs));
 
         AssertViolation(setup, code, stdout, "project.md");
     }
@@ -2144,13 +2021,13 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(setup, "true", () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
         {
             string repo = Directory.GetCurrentDirectory();
             GitInit(repo);
             File.WriteAllText(Path.Combine(repo, "a.props"), "<Project/>");
             _ = File.CreateSymbolicLink(Path.Combine(repo, "loop"), "..");
-        });
+        }));
 
         AssertClean(setup, code, stdout);
     }
@@ -2162,16 +2039,13 @@ public sealed class GateTrustLoopTests : IDisposable
 
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.props"]));
 
-        (int code, string stdout) = await RunAsync(
-            setup,
-            "printf '<Project><PropertyGroup/></Project>' > vendor/.git/inner.props",
-            () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("printf '<Project><PropertyGroup/></Project>' > vendor/.git/inner.props"), RunAsyncGolden.Tracking(_dirs, () =>
             {
                 string repo = Directory.GetCurrentDirectory();
                 GitInit(repo);
                 _ = Directory.CreateDirectory(Path.Combine(repo, "vendor", ".git"));
                 File.WriteAllText(Path.Combine(repo, "vendor", ".git", "inner.props"), "<Project/>");
-            });
+            }));
 
         AssertViolation(setup, code, stdout, "inner.props");
     }
@@ -2182,7 +2056,7 @@ public sealed class GateTrustLoopTests : IDisposable
         Setup setup = await NewSetupAsync(gate => gate["trust"] = new JsonArray(["**/*.lw-no-such-extension"]));
         const string Message = "gate.trust[0] '**/*.lw-no-such-extension' matched no files";
 
-        (int code, string stdout) = await RunAsync(setup, "true");
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         AssertClean(setup, code, stdout);
         Assert.Contains("note:", stdout, StringComparison.Ordinal);

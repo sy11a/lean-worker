@@ -14,11 +14,11 @@ public class GateLoopTests
 {
     private static string NewScratch() => Directory.CreateTempSubdirectory("lw-gate-loop").FullName;
 
-    private static async Task WriteReportFileAsync(string path, int count)
+    private static string ReportJson(int count)
     {
         JsonArray results = new([.. Enumerable.Range(0, count).Select(i => (JsonNode)i)]);
         JsonObject doc = new() { ["runs"] = new JsonArray { new JsonObject { ["results"] = results } } };
-        await File.WriteAllTextAsync(path, doc.ToJsonString(), TestContext.Current.CancellationToken);
+        return doc.ToJsonString();
     }
 
     internal static async Task WriteExecutableAsync(string path, string body)
@@ -52,7 +52,7 @@ public class GateLoopTests
             if (exitCode is 1 && count > 0)
             {
                 string report = Path.Combine(scratch, "report" + label + ".json");
-                await WriteReportFileAsync(report, count);
+                await File.WriteAllTextAsync(report, ReportJson(count), TestContext.Current.CancellationToken);
                 _ = sb.Append("echo 'sarif: ").Append(report).Append("'; ");
             }
             _ = sb.Append("exit ").Append(exitCode.ToString(CultureInfo.InvariantCulture)).Append(" ;;\n");

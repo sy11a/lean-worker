@@ -38,7 +38,7 @@ public sealed class GateCommandsLoopTests : IDisposable
         }
 
         RunAsyncGolden.WriteProfile(root, "test", profile);
-        (int code, string stdout) = await GateCommandScripts.RunAsync(_dirs, root, configure: configure, stream: stream);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("true", stream), RunAsyncGolden.Tracking(_dirs, configure: configure));
         Assert.True(code == expectedCode, stdout);
         Assert.Equal(expectedLines, GateLegacyGoldenTests.GateLines(stdout));
         return new Chain(root, scratch, code, stdout);
@@ -162,7 +162,7 @@ public sealed class GateCommandsLoopTests : IDisposable
         string root = _dirs.NewRoot();
         RunAsyncGolden.WriteProfile(root, "test", await GateCommandScripts.ProfileOfAsync(scratch, "x=0:0"));
 
-        (int code, string stdout) = await GateCommandScripts.RunAsync(_dirs, root, gateContext: GateCommandScripts.RoundTwoContext(specs, "feedback"));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs), gateContext: GateCommandScripts.RoundTwoContext(specs, "feedback"));
 
         Assert.True(code is 0, stdout);
         Assert.False(File.Exists(GateCommandScripts.Marker(scratch, "decoy")), "the decoy must not run");
@@ -179,7 +179,7 @@ public sealed class GateCommandsLoopTests : IDisposable
         RunAsyncGolden.WriteProfile(root, "test", await GateCommandScripts.ProfileOfAsync(scratch, "x=0:0 y=0:0"));
         const string Feedback = "round 1 feedback for the commands form";
 
-        (int code, string stdout) = await GateCommandScripts.RunAsync(_dirs, root, gateContext: GateCommandScripts.RoundTwoContext(round1Specs, Feedback));
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs), gateContext: GateCommandScripts.RoundTwoContext(round1Specs, Feedback));
 
         Assert.Equal(0, code);
         Assert.False(File.Exists(GateCommandScripts.Marker(scratch, "x")), "x must not run");

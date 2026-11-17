@@ -33,33 +33,20 @@ internal sealed class WorkerGroup
     public int Survivors { get; private set; }
 
     /// <summary>
-    /// Reads the group the worker leads from the process it was started as.
+    /// Records the group the worker leads, as read from the process it was started as.
     /// </summary>
-    public async Task ResolveAsync(int pid)
-    {
-        if (!Available)
-        {
-            return;
-        }
-
-        GroupId = await ProcessGroup.ResolveAsync(pid).ConfigureAwait(false);
-    }
+    public void Resolved(int groupId) => GroupId = groupId;
 
     /// <summary>
-    /// The end of the group: the members that are still alive are counted, the group is signalled,
-    /// and the ones that survive five seconds are killed.
+    /// Records the end of the group: the members that were still alive when it was signalled.
     /// </summary>
-    public async Task FinishAsync()
+    public void Finished(int leftovers)
     {
-        if (!Available)
-        {
-            return;
-        }
-
-        Leftovers = await ProcessGroup.FinishAsync(GroupId).ConfigureAwait(false);
-        // The members that are still there after the kill: FinishAsync waits for the killed ones to
-        // die, so what is left is what the SIGKILL could not end. A group that was never signalled
-        // (the launcher's own, or one whose id could not be read) has no survivors to report.
-        Survivors = Leftovers > 0 ? ProcessGroup.Alive(GroupId) : 0;
+        Leftovers = leftovers;
+        // The members that are still there after the kill: ProcessGroup.FinishAsync waits for the
+        // killed ones to die, so what is left is what the SIGKILL could not end. A group that was
+        // never signalled (the launcher's own, or one whose id could not be read) has no survivors
+        // to report.
+        Survivors = leftovers > 0 ? ProcessGroup.Alive(GroupId) : 0;
     }
 }

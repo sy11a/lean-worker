@@ -160,7 +160,7 @@ internal static class GitMetadata
             return;
         }
 
-        files[Label(path, labelBase)] = await HashFileAsync(path).ConfigureAwait(false);
+        files[Label(path, labelBase)] = LinkHash(path) ?? await FileHash.OfAsync(path, withMode: true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -179,25 +179,21 @@ internal static class GitMetadata
 
         foreach (string file in FilesUnder(hooksDir))
         {
-            files[Label(file, labelBase)] = await HashFileAsync(file).ConfigureAwait(false);
+            files[Label(file, labelBase)] = LinkHash(file) ?? await FileHash.OfAsync(file, withMode: true).ConfigureAwait(false);
         }
     }
 
     /// <summary>
-    /// The hash of a watched file: its content with its mode (an exec bit added to a hook counts),
-    /// or the target of the link it is (a hook that is a link runs what it points at). A file that
-    /// cannot be read is recorded by the marker of <see cref="FileHash"/>, so it differs from
-    /// every hash and from a file that is not there at all.
+    /// The hash of a watched file that is a link: the target of the link it is (a hook that is a
+    /// link runs what it points at). Null for a file that is not a link: its callers hash its
+    /// content with its mode instead (an exec bit added to a hook counts); a file that cannot be
+    /// read is recorded by the marker of <see cref="FileHash"/>, so it differs from every hash and
+    /// from a file that is not there at all.
     /// </summary>
-    private static async Task<string> HashFileAsync(string path)
+    private static string? LinkHash(string path)
     {
         string? link = LinkTarget(path);
-        if (link is not null)
-        {
-            return FileHash.OfLink(link);
-        }
-
-        return await FileHash.OfAsync(path, withMode: true).ConfigureAwait(false);
+        return link is null ? null : FileHash.OfLink(link);
     }
 
     /// <summary>
@@ -303,7 +299,7 @@ internal static class GitMetadata
         try
         {
             string relative = Path.GetRelativePath(Path.GetFullPath(labelBase), Path.GetFullPath(path)).Replace('\\', '/');
-            return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? path : relative;
+            return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathFullyQualified(relative) ? path : relative;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {

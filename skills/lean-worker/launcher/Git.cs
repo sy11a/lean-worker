@@ -59,6 +59,15 @@ internal static class Git
     /// </summary>
     internal static async Task<Result?> RunResultAsync(string dir, params string[] args)
     {
+        using Process? p = Start(Unpinned(dir, args));
+        return p is null ? null : await FinishAsync(p).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The start info of a call in <paramref name="dir"/>, with the safe options before the arguments.
+    /// </summary>
+    private static ProcessStartInfo Unpinned(string dir, string[] args)
+    {
         ProcessStartInfo psi = new("git") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         psi.ArgumentList.Add("-C");
         psi.ArgumentList.Add(dir);
@@ -71,7 +80,7 @@ internal static class Git
             psi.ArgumentList.Add(a);
         }
 
-        return await StartAsync(psi).ConfigureAwait(false);
+        return psi;
     }
 
     /// <summary>
@@ -107,6 +116,17 @@ internal static class Git
     /// </summary>
     internal static async Task<Result?> RunPinnedResultAsync(Pin pin, params string[] args)
     {
+        using Process? p = Start(Pinned(pin, args));
+        return p is null ? null : await FinishAsync(p).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The start info of a call pinned to <paramref name="pin"/>: the git dir and the work tree named,
+    /// the safe options before the arguments, the global and the system config off and the common git
+    /// dir in the environment.
+    /// </summary>
+    private static ProcessStartInfo Pinned(Pin pin, string[] args)
+    {
         ProcessStartInfo psi = new("git") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         psi.ArgumentList.Add("--git-dir=" + pin.GitDir);
         psi.ArgumentList.Add("--work-tree=" + pin.WorkTree);
@@ -134,29 +154,43 @@ internal static class Git
         // variable is never left out: a call without it would read the common dir git resolves
         // for itself, which is the one the worker may have redirected.
         psi.Environment["GIT_COMMON_DIR"] = pin.Common;
-
-        return await StartAsync(psi).ConfigureAwait(false);
+        return psi;
     }
 
     /// <summary>
-    /// Runs git and reports how it ended: its exit code, its standard output and its standard
-    /// error. Null when git could not be run at all (not installed) or did not finish in time.
+    /// Starts git. Null when git could not be run at all (not installed).
     /// </summary>
-    private static async Task<Result?> StartAsync(ProcessStartInfo psi)
+    private static Process? Start(ProcessStartInfo psi)
     {
         try
         {
-            using Process? p = Process.Start(psi);
-            if (p is null)
-            {
-                return null;
-            }
-
-            Task<string> output = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
-            Task<string> error = p.StandardError.ReadToEndAsync(CancellationToken.None);
-            if (!p.WaitForExit(60_000)) { try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } return null; }
-            return new Result(p.ExitCode, await output.ConfigureAwait(false), await error.ConfigureAwait(false));
+            return Process.Start(psi);
         }
         catch (System.ComponentModel.Win32Exception) { return null; } // git is not installed
+    }
+
+    /// <summary>
+    /// How a started git call ended: its exit code, its standard output and its standard error. Null
+    /// when it did not finish in time (it is then killed with its process tree).
+    /// </summary>
+    private static async Task<Result?> FinishAsync(Process p)
+    {
+        Task<string> output = p.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        Task<string> error = p.StandardError.ReadToEndAsync(CancellationToken.None);
+        if (!p.WaitForExit(60_000))
+        {
+            try
+            {
+                p.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                // Already gone, or it could not be killed: either way the call did not finish in time.
+            }
+
+            return null;
+        }
+
+        return new Result(p.ExitCode, await output.ConfigureAwait(false), await error.ConfigureAwait(false));
     }
 }

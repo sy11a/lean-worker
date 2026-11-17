@@ -64,7 +64,7 @@ internal static class Workspace
     /// </summary>
     public static async Task<string> ResolveRelativeAsync(string path, string cwd)
     {
-        if (Path.IsPathRooted(path) || File.Exists(path) || Directory.Exists(path))
+        if (Path.IsPathFullyQualified(path) || File.Exists(path) || Directory.Exists(path))
         {
             return path;
         }

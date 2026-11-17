@@ -528,10 +528,8 @@ internal static class WorktreeSweep
             return newest;
         }
 
-        if (!Path.IsPathRooted(dir))
-        {
-            dir = Path.Combine(worktreePath, dir);
-        }
+        // Combine keeps a rooted git dir as it is and puts a relative one under the worktree.
+        dir = Path.Combine(worktreePath, dir);
 
         foreach (string name in _gitFiles)
         {
@@ -651,22 +649,19 @@ internal static class WorktreeSweep
     private static async Task RemoveAsync(string repo, string path)
     {
         Git.Result? result = await Git.RunResultAsync(repo, "worktree", "remove", path).ConfigureAwait(false);
-        await ReportAsync(result, $"could not remove {path}").ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Reports why a git call failed, when it failed.
-    /// </summary>
-    private static async Task ReportAsync(Git.Result? result, string what)
-    {
-        string? why = Failure(result);
-        if (why is null)
+        if (FailureLine(result, $"could not remove {path}") is not { } line)
         {
             return;
         }
 
-        await Console.Error.WriteLineAsync($"{what}: {why}").ConfigureAwait(false);
+        await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// The error line that reports why a git call failed; null when it did not fail.
+    /// </summary>
+    private static string? FailureLine(Git.Result? result, string what) =>
+        Failure(result) is { } why ? $"{what}: {why}" : null;
 
     /// <summary>
     /// Why a git call failed, or null when it did not fail.
@@ -702,7 +697,10 @@ internal static class WorktreeSweep
         }
 
         Git.Result? prune = await Git.RunResultAsync(repo, "worktree", "prune").ConfigureAwait(false);
-        await ReportAsync(prune, $"could not prune {repo}").ConfigureAwait(false);
+        if (FailureLine(prune, $"could not prune {repo}") is { } line)
+        {
+            await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
+        }
 
         await UnlockAsync(repo, locked).ConfigureAwait(false);
     }

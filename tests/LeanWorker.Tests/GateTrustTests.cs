@@ -294,14 +294,13 @@ public sealed class GateTrustTests : IDisposable
         }
     }
 
-    private static async Task<GateTrust.Snapshot> HashBoundedAsync(string path) =>
-        await GateTrust.HashAsync([path]).WaitAsync(TimeSpan.FromSeconds(45), TimeProvider.System, TestContext.Current.CancellationToken);
+    private static readonly TimeSpan _hashBound = TimeSpan.FromSeconds(45);
 
     [Fact]
     public async Task A_directory_is_nonregularAsync()
     {
         string dir = NewDir();
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(dir);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([dir]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal(dir + "|nonregular", snapshot.Hashes[dir]);
     }
 
@@ -311,7 +310,7 @@ public sealed class GateTrustTests : IDisposable
         string dir = NewDir();
         string link = Path.Combine(NewDir(), "dirlink");
         _ = File.CreateSymbolicLink(link, dir);
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([link]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal(dir + "|nonregular", snapshot.Hashes[link]);
         _ = Assert.Single(snapshot.Hashes);
     }
@@ -321,7 +320,7 @@ public sealed class GateTrustTests : IDisposable
     {
         Assert.SkipUnless(File.Exists("/dev/null"), "no /dev/null on this platform");
 
-        GateTrust.Snapshot snapshot = await HashBoundedAsync("/dev/null");
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync(["/dev/null"]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal("/dev/null|nonregular", snapshot.Hashes["/dev/null"]);
     }
 
@@ -332,7 +331,7 @@ public sealed class GateTrustTests : IDisposable
 
         string link = Path.Combine(NewDir(), "nulllink");
         _ = File.CreateSymbolicLink(link, "/dev/null");
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([link]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal("/dev/null|nonregular", snapshot.Hashes[link]);
         _ = Assert.Single(snapshot.Hashes);
     }
@@ -345,7 +344,7 @@ public sealed class GateTrustTests : IDisposable
         string missing = Path.Combine(dir, "missing");
         _ = File.CreateSymbolicLink(link, missing);
 
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(link);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([link]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("unreadable: dangling link", snapshot.Hashes[link]);
         Assert.False(snapshot.Hashes.ContainsKey(missing));
@@ -359,9 +358,9 @@ public sealed class GateTrustTests : IDisposable
         string link = Path.Combine(dir, "dangling");
         string missing = Path.Combine(dir, "missing");
         _ = File.CreateSymbolicLink(link, missing);
-        GateTrust.Snapshot before = await HashBoundedAsync(link);
+        GateTrust.Snapshot before = await GateTrust.HashAsync([link]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         await File.WriteAllTextAsync(missing, "now here", TestContext.Current.CancellationToken);
-        GateTrust.Snapshot after = await HashBoundedAsync(link);
+        GateTrust.Snapshot after = await GateTrust.HashAsync([link]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal([link], await ChangedAsync(before, after), StringComparer.Ordinal);
     }
@@ -370,7 +369,7 @@ public sealed class GateTrustTests : IDisposable
     public async Task An_absent_path_is_a_dash_sentinelAsync()
     {
         string path = Path.Combine(NewDir(), "nothing-here");
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(path);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([path]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal("-", snapshot.Hashes[path]);
     }
 
@@ -379,7 +378,7 @@ public sealed class GateTrustTests : IDisposable
     {
         string path = Path.Combine(NewDir(), "a.txt");
         await File.WriteAllTextAsync(path, "hello", TestContext.Current.CancellationToken);
-        GateTrust.Snapshot snapshot = await HashBoundedAsync(path);
+        GateTrust.Snapshot snapshot = await GateTrust.HashAsync([path]).WaitAsync(_hashBound, TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal(path + "|" + Sha256OfHello, snapshot.Hashes[path]);
     }
 
