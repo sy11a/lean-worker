@@ -55,20 +55,19 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
         Setup setup = NewSetup();
         (string onePrelude, string twoPrelude, string worker) = shells(setup);
         await WriteTwoCommandsAsync(setup, onePrelude, twoPrelude);
-        (int code, string stdout) = await RunAsync(setup, worker, prepare);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker(worker), RunAsyncGolden.Tracking(_dirs, prepare));
         return new Run(setup, code, stdout);
     }
 
     /// <summary>
-    /// Runs the two clean commands with <paramref name="dir"/> first on the PATH; <paramref name="shells"/>
+    /// The shells for a run with <paramref name="dir"/> first on the PATH (<see cref="FirstOnPath"/>): <paramref name="shells"/>
     /// gets the shell line that plants a file in it and returns the two preludes and the worker shell.
     /// </summary>
-    private async Task<Run> RunWithDirectoryOnPathAsync(string dir, Func<string, (string OnePrelude, string TwoPrelude, string Worker)> shells)
-    {
-        return await RunTwoCommandsAsync(
-            _ => shells("touch '" + Path.Combine(dir, "planted") + "'"),
-            () => Environment.SetEnvironmentVariable("PATH", dir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH")));
-    }
+    private static Func<Setup, (string OnePrelude, string TwoPrelude, string Worker)> PlantingIn(string dir, Func<string, (string OnePrelude, string TwoPrelude, string Worker)> shells) =>
+        _ => shells("touch '" + Path.Combine(dir, "planted") + "'");
+
+    private static Action FirstOnPath(string dir) =>
+        () => Environment.SetEnvironmentVariable("PATH", dir + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"));
 
     /// <summary>
     /// Command "one" (rounds <paramref name="oneRounds"/>) writes its report to its declared output
@@ -84,21 +83,18 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
         oneEntry["outputs"] = new JsonArray(["out/one.sarif"]);
         RunAsyncGolden.WriteProfile(setup.Root, "test", GateCommandScripts.Profile(oneEntry, GateCommandScripts.Entry("two", two)));
 
-        (int code, string stdout) = await RunAsync(setup, prepare: () =>
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, () =>
         {
             string dir = Path.Combine(Directory.GetCurrentDirectory(), "out");
             _ = Directory.CreateDirectory(dir);
             File.WriteAllText(Path.Combine(dir, "one.sarif"), "old");
-        });
+        }));
         return new Run(setup, code, stdout);
     }
 
-    private async Task<(int Code, string Stdout)> RunAsync(Setup setup, string workerShell = "true", Action? prepare = null) =>
-        await GateCommandScripts.RunAsync(_dirs, setup.Root, workerShell, prepare);
-
     private async Task<LaunchException> RunRefusedAsync(Setup setup, Action? prepare = null)
     {
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsync(setup, "touch '" + setup.WorkerMarker + "'", prepare));
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("touch '" + setup.WorkerMarker + "'"), RunAsyncGolden.Tracking(_dirs, prepare)));
         Assert.False(File.Exists(setup.WorkerMarker), "the worker must not run");
         Assert.False(setup.Ran("one"), "no command may run");
         return ex;
@@ -212,7 +208,7 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
     {
         string dirA = _dirs.Create("lw-gate-commands-path");
 
-        Run run = await RunWithDirectoryOnPathAsync(dirA, plant => (plant + "\n", string.Empty, "true"));
+        Run run = await RunTwoCommandsAsync(PlantingIn(dirA, plant => (plant + "\n", string.Empty, "true")), FirstOnPath(dirA));
 
         AssertError(run, "one", "one: a gate PATH directory changed while the gate ran: ", dirA, /*lang=json,strict*/ """{"outcome":"error","exit_code":0}""", "one");
     }
@@ -222,7 +218,7 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
     {
         string dirA = _dirs.Create("lw-gate-commands-path");
 
-        Run run = await RunWithDirectoryOnPathAsync(dirA, plant => (string.Empty, string.Empty, plant));
+        Run run = await RunTwoCommandsAsync(PlantingIn(dirA, plant => (string.Empty, string.Empty, plant)), FirstOnPath(dirA));
 
         AssertPreRoundError(run, "the worker changed a gate PATH directory: ", dirA);
     }
@@ -258,13 +254,15 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
     [Fact]
     public async Task Every_command_gets_the_gate_env_patterns_and_none_gets_the_api_keyAsync()
     {
-        await WithEnvironmentAsync("LW_TEST_GATECMD", "x", async () =>
+        string? old = Environment.GetEnvironmentVariable("LW_TEST_GATECMD");
+        Environment.SetEnvironmentVariable("LW_TEST_GATECMD", "x");
+        try
         {
             const string Prelude = "echo \"seen=$LW_TEST_GATECMD key=$ANTHROPIC_API_KEY.\"\n";
             Setup setup = NewSetup();
             await WriteTwoCommandsAsync(setup, Prelude, Prelude, gate => gate["env"] = new JsonArray(["LW_TEST_GATECMD*"]));
 
-            (int code, string stdout) = await RunAsync(setup);
+            (int code, string stdout) = await RunAsyncGolden.RunAsync(setup.Root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
             Assert.True(code is 0, stdout);
             foreach (string command in _twoCommands)
@@ -274,20 +272,10 @@ public sealed class GateCommandsTrustLoopTests : IDisposable
                 string log = await File.ReadAllTextAsync(Path.Combine(RunAsyncGolden.RunDirFrom(stdout), "gate-" + command + ".log"), TestContext.Current.CancellationToken);
                 Assert.Contains("seen=x key=.", log, StringComparison.Ordinal);
             }
-        });
-    }
-
-    private static async Task WithEnvironmentAsync(string name, string value, Func<Task> body)
-    {
-        string? old = Environment.GetEnvironmentVariable(name);
-        Environment.SetEnvironmentVariable(name, value);
-        try
-        {
-            await body();
         }
         finally
         {
-            Environment.SetEnvironmentVariable(name, old);
+            Environment.SetEnvironmentVariable("LW_TEST_GATECMD", old);
         }
     }
 }

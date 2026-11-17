@@ -95,23 +95,6 @@ internal static class GateCommandScripts
     }
 
     /// <summary>
-    /// Runs the launcher with a worker that first executes <paramref name="workerShell"/> and then streams
-    /// <paramref name="stream"/>; the run's working directory is tracked for cleanup, and
-    /// <paramref name="prepare"/> runs inside it before the launch.
-    /// </summary>
-    public static async Task<(int Code, string Stdout)> RunAsync(
-        TempDirs dirs, string root, string workerShell = "true", Action? prepare = null, Action<Options>? configure = null,
-        string stream = RunAsyncGolden.SuccessStream, GateContext? gateContext = null)
-    {
-        return await RunAsyncGolden.RunAsync(root, workerShell + "\n" + stream, o =>
-        {
-            dirs.Track(Directory.GetCurrentDirectory());
-            prepare?.Invoke();
-            configure?.Invoke(o);
-        }, gateContext: gateContext);
-    }
-
-    /// <summary>
     /// The context the launcher's chain loop hands round 2: chain "chain1", round 1 counted 3 findings,
     /// the original task "do nothing" named "golden", <paramref name="feedback"/> as the aggregate's text.
     /// </summary>

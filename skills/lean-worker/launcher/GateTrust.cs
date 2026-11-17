@@ -313,11 +313,11 @@ internal static class GateTrust
         CancellationToken token = cts.Token;
 
         // The read runs on the thread pool, otherwise the FileStream ctor can park the caller's thread
-        // on a FIFO with no writer and the WhenAny timer never gets a chance to win. The wrapper
-        // moves the open off the call site and returns a Task<string> that can be raced with the
-        // timer; Task.Factory.StartNew takes a TaskScheduler (CA2008/VSTHRD105) and an Unwrap so the
-        // returned task represents the inner async method's completion.
-        Task<string> hashTask = HashOffPoolAsync(target, token);
+        // on a FIFO with no writer and the WhenAny timer never gets a chance to win. StartNew moves
+        // the open off the call site and takes a TaskScheduler (CA2008/VSTHRD105); it returns
+        // Task<Task<string>>, so the Unwrap gives the Task<string> of the inner async method's
+        // completion, which is raced with the timer.
+        Task<string> hashTask = Task.Factory.StartNew(async _ => await HashCoreAsync(target, token).ConfigureAwait(false), state: null, token, TaskCreationOptions.RunContinuationsAsynchronously, TaskScheduler.Default).Unwrap();
 
         // Observe (and discard) any fault on the abandoned hashTask. When the WhenAny below picks the
         // timer, the open/read thread is left running until its own read or open completes; that thread
@@ -340,16 +340,6 @@ internal static class GateTrust
     {
         await Task.Delay(timeout, timeProvider, token).ConfigureAwait(false);
         return "unreadable: timeout";
-    }
-
-    private static async Task<string> HashOffPoolAsync(string target, CancellationToken token)
-    {
-        // StartNew with Func<object, Task<...>> returns Task<Task<...>> and takes a TaskScheduler
-        // (satisfies CA2008/VSTHRD105). Unwrap exposes the inner Task<string>; awaiting it gives
-        // the inner result, the async method's signature wraps that back into Task<string> for the
-        // caller's WhenAny with a timer.
-        Task<Task<string>> wrapped = Task.Factory.StartNew(async _ => await HashCoreAsync(target, token).ConfigureAwait(false), state: null, token, TaskCreationOptions.RunContinuationsAsynchronously, TaskScheduler.Default);
-        return await wrapped.Unwrap().ConfigureAwait(false);
     }
 
     private static async Task<string> HashCoreAsync(string target, CancellationToken token)
@@ -1224,14 +1214,21 @@ internal static class GateTrust
     {
         try
         {
-            if (Path.IsPathRooted(target) && !Path.IsPathFullyQualified(target))
+            string? targetRoot = Path.GetPathRoot(target);
+            if (targetRoot is not { Length: > 0 })
+            {
+                // Relative (no path root): the target's components resolve against the walked prefix.
+                pending.InsertRange(0, ComponentsToWalk(target));
+                return null;
+            }
+
+            if (!Path.IsPathFullyQualified(target))
             {
                 // Rooted without a volume ("\foo", "C:foo"; Windows only): resolving would drop the volume.
                 return $"unreadable: {nameof(ArgumentException)}";
             }
 
-            string? targetRoot = Path.GetPathRoot(target);
-            if (targetRoot is { Length: > 0 } && target.StartsWith(targetRoot, PathComparison))
+            if (target.StartsWith(targetRoot, PathComparison))
             {
                 // The walk restarts at the target's own root ("/", "C:\", "\\s\c\"): clear the
                 // stack and queue the rest. A UNC root comes back without its trailing separator
@@ -1251,16 +1248,9 @@ internal static class GateTrust
                 return null;
             }
 
-            if (Path.IsPathRooted(target))
-            {
-                // Rooted on the walked root itself ("\foo"): restart from the root, keep the root.
-                resolved.Clear();
-                pending.InsertRange(0, ComponentsToWalk(target.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
-                return null;
-            }
-
-            // Relative: the target's components resolve against the walked prefix.
-            pending.InsertRange(0, ComponentsToWalk(target));
+            // Rooted on the walked root itself ("\foo"): restart from the root, keep the root.
+            resolved.Clear();
+            pending.InsertRange(0, ComponentsToWalk(target.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
             return null;
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
@@ -1489,9 +1479,9 @@ internal static class GateTrust
             string full;
             try
             {
-                full = Path.IsPathRooted(entry)
-                    ? Path.GetFullPath(entry)
-                    : Path.GetFullPath(Path.Combine(gateWorkingDirectory, entry));
+                // Combine keeps a rooted entry as it is and puts a relative one under the gate's
+                // working directory.
+                full = Path.GetFullPath(Path.Combine(gateWorkingDirectory, entry));
             }
             catch (ArgumentException)
             {

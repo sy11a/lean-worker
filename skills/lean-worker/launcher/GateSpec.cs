@@ -293,9 +293,9 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
                 string resolved;
                 try
                 {
-                    resolved = Path.IsPathRooted(s)
-                        ? Path.GetFullPath(s)
-                        : Path.GetFullPath(Path.Combine(gateWorkingDirectory, s));
+                    // Combine keeps a rooted argument as it is and puts a relative one under the
+                    // gate's working directory.
+                    resolved = Path.GetFullPath(Path.Combine(gateWorkingDirectory, s));
                 }
                 catch (ArgumentException ex)
                 {
@@ -490,8 +490,10 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             // Absolute entries (any flavour of root) defeat the point of repo-relative paths: they
             // cannot cross the repo boundary on their own, but a worker that follows an absolute
             // path has a free channel for changing arbitrary system files. Reject up-front so the
-            // error is at profile-load time, not during a trust check.
-            if (Path.IsPathRooted(normalized) || normalized.StartsWith('/'))
+            // error is at profile-load time, not during a trust check. "Any flavour" includes a
+            // drive-relative "C:x" and a volume-relative "/x" (Windows), which are rooted without
+            // being fully qualified: an entry with any path root is refused.
+            if (Path.GetPathRoot(normalized) is { Length: > 0 } || normalized.StartsWith('/'))
             {
                 throw new LaunchException($"profile gate.trust[{i.ToString(CultureInfo.InvariantCulture)}] must be a relative path: {s}");
             }
@@ -553,7 +555,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             // A relative entry resolves against the git root (or the working directory when not in
             // git), so it stays inside the repo; an absolute entry is used as-is (normalised by
             // LaunchRun.ResolveOutputEntry), which is how a gate report outside the repo is declared.
-            if (!Path.IsPathRooted(normalized))
+            if (!Path.IsPathFullyQualified(normalized))
             {
                 // No parent traversal in a relative entry: ".." would let a declared output reach
                 // outside the repo boundary.

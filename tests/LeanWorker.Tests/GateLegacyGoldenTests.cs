@@ -31,9 +31,6 @@ public sealed class GateLegacyGoldenTests : IDisposable
         return (root, scratch, script);
     }
 
-    private async Task<(int Code, string Stdout)> RunAsync(string root, Action<Options>? configure = null) =>
-        await GateCommandScripts.RunAsync(_dirs, root, configure: configure);
-
     internal static string[] GateFiles(string runDir) =>
         [.. Directory.GetFiles(runDir).Select(f => Path.GetFileName(f)).Where(n => n.StartsWith("gate", StringComparison.Ordinal)).Order(StringComparer.Ordinal)];
 
@@ -45,7 +42,7 @@ public sealed class GateLegacyGoldenTests : IDisposable
     {
         (string root, string scratch, string script) = await NewLegacySetupAsync((1, 3), (0, 0));
 
-        (int code, string stdout) = await RunAsync(root);
+        (int code, string stdout) = await RunAsyncGolden.RunAsync(root, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.Equal(0, code);
         Assert.Equal(
@@ -84,14 +81,14 @@ public sealed class GateLegacyGoldenTests : IDisposable
     public async Task A_single_command_error_and_stuck_keep_their_result_lines_and_errorAsync()
     {
         (string errorRoot, string _, string _) = await NewLegacySetupAsync((2, 0));
-        (int errorCode, string errorStdout) = await RunAsync(errorRoot);
+        (int errorCode, string errorStdout) = await RunAsyncGolden.RunAsync(errorRoot, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs));
 
         Assert.Equal(5, errorCode);
         Assert.Equal(["gate:     ERROR: gate exited 2"], GateLines(errorStdout));
         Assert.Equal("gate exited 2", RunAsyncGolden.Summary(RunAsyncGolden.RunDirFrom(errorStdout))["gate"]!["error"]!.GetValue<string>());
 
         (string stuckRoot, string _, string _) = await NewLegacySetupAsync((1, 3), (1, 3));
-        (int stuckCode, string stuckStdout) = await RunAsync(stuckRoot, o => o.GateMaxRounds = 2);
+        (int stuckCode, string stuckStdout) = await RunAsyncGolden.RunAsync(stuckRoot, RunAsyncGolden.Worker("true"), RunAsyncGolden.Tracking(_dirs, configure: o => o.GateMaxRounds = 2));
 
         Assert.Equal(4, stuckCode);
         Assert.Equal(

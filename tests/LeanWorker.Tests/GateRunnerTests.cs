@@ -300,9 +300,6 @@ public sealed partial class GateRunnerTests : IDisposable
     [GeneratedRegex(@"^path\[(?<p>\s+)\]$", RegexOptions.None, matchTimeoutMilliseconds: 1000)]
     private static partial Regex WhitespaceCaptureRegex();
 
-    private static async Task<Gate.GateResult> RunBoundedAsync(string cwd, GateSpec spec, string runDir) =>
-        await RunInAsync(cwd, spec, runDir).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
-
     [Fact]
     public async Task A_report_path_that_is_a_symlink_to_dev_zero_is_an_error_without_hangingAsync()
     {
@@ -314,7 +311,7 @@ public sealed partial class GateRunnerTests : IDisposable
         _ = File.CreateSymbolicLink(link, "/dev/zero");
         string script = WriteScript(dir, "echo 'sarif: rep.json'\nexit 1\n");
 
-        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+        Gate.GateResult r = await RunInAsync(dir, Spec(script), dirs.Create("lw-gate")).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("error", r.Outcome);
         Assert.Contains("not a regular file", r.Error, StringComparison.Ordinal);
@@ -330,7 +327,7 @@ public sealed partial class GateRunnerTests : IDisposable
         string dir = dirs.Create("lw-gate");
         string script = WriteScript(dir, "mkfifo rep.fifo\necho 'sarif: rep.fifo'\nexit 1\n");
 
-        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+        Gate.GateResult r = await RunInAsync(dir, Spec(script), dirs.Create("lw-gate")).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("error", r.Outcome);
         Assert.Contains("rep.fifo", r.Error, StringComparison.Ordinal);
@@ -351,7 +348,7 @@ public sealed partial class GateRunnerTests : IDisposable
 
         string script = WriteScript(dir, "echo 'sarif: big.json'\nexit 1\n");
 
-        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), dirs.Create("lw-gate"));
+        Gate.GateResult r = await RunInAsync(dir, Spec(script), dirs.Create("lw-gate")).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("error", r.Outcome);
         Assert.Contains("is too large", r.Error, StringComparison.Ordinal);
@@ -365,7 +362,7 @@ public sealed partial class GateRunnerTests : IDisposable
         string dir = dirs.Create("lw-gate");
         string script = WriteScript(dir, "echo 'path[   ]'\nexit 1\n");
 
-        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script, reportRegex: WhitespaceCaptureRegex()), dirs.Create("lw-gate"));
+        Gate.GateResult r = await RunInAsync(dir, Spec(script, reportRegex: WhitespaceCaptureRegex()), dirs.Create("lw-gate")).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("error", r.Outcome);
         Assert.Equal("gate exited 1 but report path was empty", r.Error);
@@ -401,7 +398,7 @@ public sealed partial class GateRunnerTests : IDisposable
         File.SetUnixFileMode(planted, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         GateSpec spec = new(["lw-planted-tool"], DefaultRegex(), "runs[0].results", 8000, 30, 5, 10m, []);
 
-        Gate.GateResult r = await RunBoundedAsync(dir, spec, dirs.Create("lw-gate"));
+        Gate.GateResult r = await RunInAsync(dir, spec, dirs.Create("lw-gate")).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("error", r.Outcome);
         Assert.Contains("not found on PATH", r.Error, StringComparison.Ordinal);
@@ -424,7 +421,7 @@ public sealed partial class GateRunnerTests : IDisposable
         _ = File.CreateSymbolicLink(Path.Combine(runDir, "gate.json"), victimJson);
         string script = WriteScript(dir, "echo hello-from-the-gate\nexit 0\n");
 
-        Gate.GateResult r = await RunBoundedAsync(dir, Spec(script), runDir);
+        Gate.GateResult r = await RunInAsync(dir, Spec(script), runDir).WaitAsync(_bound, TimeProvider.System, TestContext.Current.CancellationToken);
 
         Assert.Equal("clean", r.Outcome);
         Assert.Equal("untouched-log", await File.ReadAllTextAsync(victimLog, TestContext.Current.CancellationToken));

@@ -238,6 +238,6 @@ internal static class WriteScope
     private static string? Relative(string root, string path)
     {
         string rel = Path.GetRelativePath(root, Path.GetFullPath(path)).Replace('\\', '/');
-        return rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel) ? null : rel;
+        return rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathFullyQualified(rel) ? null : rel;
     }
 }

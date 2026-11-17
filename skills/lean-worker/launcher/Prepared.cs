@@ -60,14 +60,31 @@ internal sealed record Prepared(
     }
 
     /// <summary>
-    /// Reads the group the worker leads, from the process it was started as.
+    /// Reads the group the worker leads, from the process it was started as. Without a group of
+    /// its own there is nothing to read.
     /// </summary>
-    public async Task ResolveGroupAsync(int pid) =>
-        await Group.ResolveAsync(pid).ConfigureAwait(false);
+    public async Task ResolveGroupAsync(int pid)
+    {
+        if (!Group.Available)
+        {
+            return;
+        }
+
+        Group.Resolved(await ProcessGroup.ResolveAsync(pid).ConfigureAwait(false));
+    }
 
     /// <summary>
-    /// Signals the group after the worker exited.
+    /// The end of the group after the worker exited: the members that are still alive are counted,
+    /// the group is signalled, and the ones that survive five seconds are killed. Without a group of
+    /// its own nothing is signalled.
     /// </summary>
-    public async Task FinishGroupAsync() =>
-        await Group.FinishAsync().ConfigureAwait(false);
+    public async Task FinishGroupAsync()
+    {
+        if (!Group.Available)
+        {
+            return;
+        }
+
+        Group.Finished(await ProcessGroup.FinishAsync(Group.GroupId).ConfigureAwait(false));
+    }
 }

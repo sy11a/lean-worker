@@ -356,7 +356,7 @@ internal sealed class WorktreeRun
             return false;
         }
 
-        Git.Result? status = await StatusAsync(worktree).ConfigureAwait(false);
+        Git.Result? status = await Git.RunPinnedResultAsync(worktree, _statusArgs).ConfigureAwait(false);
         if (status is null)
         {
             Kept("git failed");
@@ -725,12 +725,11 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
-    /// The status of the worktree: every changed, deleted and untracked path, one per line. The
+    /// The git arguments of the status of the worktree: every changed, deleted and untracked path, one per line. The
     /// paths are printed raw (no quoting), so they can be compared with the paths the launcher
     /// recorded.
     /// </summary>
-    private static async Task<Git.Result?> StatusAsync(Git.Pin worktree) =>
-        await Git.RunPinnedResultAsync(worktree, "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all").ConfigureAwait(false);
+    private static readonly string[] _statusArgs = ["-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=all"];
 
     /// <summary>
     /// The ignored files of the worktree (the build output of the run): they are counted, not kept.

@@ -283,7 +283,7 @@ internal static class Gate
     private static async Task<GateResult> BuildStartFailureResultAsync(string message, DateTimeOffset started, string gateJsonPath, GateSpec spec, IReadOnlyList<string> envNames)
     {
         GateResult startFailure = new(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null, Feedback: string.Empty, Error: message, Duration: DateTimeOffset.Now - started);
-        await WriteGateJsonAsync(gateJsonPath, startFailure, spec, envNames).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(gateJsonPath, GateJsonText(startFailure, spec, envNames)).ConfigureAwait(false);
         return startFailure;
     }
 
@@ -377,7 +377,7 @@ internal static class Gate
             Feedback: JoinStdout(stdout, spec.FeedbackMaxChars, logPath),
             Error: string.Create(CultureInfo.InvariantCulture, $"gate timed out after {spec.TimeoutMinutes} minutes"),
             Duration: duration);
-        await WriteGateJsonAsync(gateJsonPath, timeoutResult, spec, envNames).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(gateJsonPath, GateJsonText(timeoutResult, spec, envNames)).ConfigureAwait(false);
         return timeoutResult;
     }
 
@@ -391,16 +391,19 @@ internal static class Gate
             Feedback: JoinStdout(stdout, spec.FeedbackMaxChars, logPath),
             Error: "gate cancelled",
             Duration: duration);
-        await WriteGateJsonAsync(gateJsonPath, cancelledResult, spec, envNames).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(gateJsonPath, GateJsonText(cancelledResult, spec, envNames)).ConfigureAwait(false);
         return cancelledResult;
     }
 
     private static async Task<GateResult> FinishResultAsync(string gateJsonPath, GateSpec spec, TimeSpan duration, string cwd, StdoutBuffer stdout, string logPath, IReadOnlyList<string> envNames, int exitCode)
     {
         string feedback = JoinStdout(stdout, spec.FeedbackMaxChars, logPath);
-        CountResolution resolution = await TryResolveCountAsync(stdout, cwd, spec).ConfigureAwait(false);
+        CountResolution reportPath = ResolveReportPath(stdout, cwd, spec);
+        CountResolution resolution = reportPath is { Error: null, ReportPath: { } full }
+            ? await TryReadReportFileAsync(full, spec.CountPath).ConfigureAwait(false)
+            : reportPath;
         GateResult result = BuildResult(exitCode, spec, feedback, resolution, duration);
-        await WriteGateJsonAsync(gateJsonPath, result, spec, envNames).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(gateJsonPath, GateJsonText(result, spec, envNames)).ConfigureAwait(false);
         return result;
     }
 
@@ -482,7 +485,12 @@ internal static class Gate
 
     private readonly record struct CountResolution(int? Count, string? ReportPath, string? Error);
 
-    private static async Task<CountResolution> TryResolveCountAsync(StdoutBuffer stdout, string cwd, GateSpec spec)
+    /// <summary>
+    /// The report file the gate named on its last stdout line: a resolution whose report path is the
+    /// full path still to be read (no count and no error yet), or whose error says why no usable path
+    /// was printed (the report is then not read at all).
+    /// </summary>
+    private static CountResolution ResolveReportPath(StdoutBuffer stdout, string cwd, GateSpec spec)
     {
         string? last;
         lock (stdout.Lock)
@@ -519,16 +527,17 @@ internal static class Gate
         string full;
         try
         {
-            // GetFullPath also normalizes an absolute path (a printed "../" hop or a "." segment
-            // must not blur the run-directory exemption or the source lookup).
-            full = Path.GetFullPath(Path.IsPathRooted(reportPath) ? reportPath : Path.Combine(cwd, reportPath));
+            // Combine keeps a rooted report path as it is and puts a relative one under the gate's
+            // working directory. GetFullPath also normalizes an absolute path (a printed "../" hop or
+            // a "." segment must not blur the run-directory exemption or the source lookup).
+            full = Path.GetFullPath(Path.Combine(cwd, reportPath));
         }
         catch (ArgumentException ex)
         {
             return new CountResolution(Count: null, ReportPath: null, Error: $"report path '{reportPath}' is invalid: {ex.Message}");
         }
 
-        return await TryReadReportFileAsync(full, spec.CountPath).ConfigureAwait(false);
+        return new CountResolution(Count: null, ReportPath: full, Error: null);
     }
 
     /// <summary>
@@ -646,7 +655,10 @@ internal static class Gate
         // surfaced after we have returned must not surface later as an unobserved exception.
         // StartNew hands the open off to the thread pool, otherwise the FileStream ctor can park the
         // caller's thread on a FIFO with no writer and the WhenAny timer never gets a chance to win.
-        Task<BoundedReadResult> readTask = ReadOffPoolAsync(full, token);
+        // StartNew with Func<object, Task<...>> returns Task<Task<...>> and takes a TaskScheduler
+        // (satisfies CA2008/VSTHRD105). Unwrap exposes the inner Task<BoundedReadResult> for the WhenAny
+        // with the timer below.
+        Task<BoundedReadResult> readTask = Task.Factory.StartNew(async _ => await ReadReportCoreAsync(full, token).ConfigureAwait(false), state: null, token, TaskCreationOptions.RunContinuationsAsynchronously, TaskScheduler.Default).Unwrap();
         _ = readTask.ContinueWith(static t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
 
         Task<BoundedReadResult> timer = BoundedReadTimeoutAsync(_reportReadTimeout, TimeProvider.System, token);
@@ -863,16 +875,6 @@ internal static class Gate
         return new BoundedReadResult(Text: null, Error: "timeout");
     }
 
-    private static async Task<BoundedReadResult> ReadOffPoolAsync(string full, CancellationToken token)
-    {
-        // StartNew with Func<object, Task<...>> returns Task<Task<...>> and takes a TaskScheduler
-        // (satisfies CA2008/VSTHRD105). Unwrap exposes the inner Task<BoundedReadResult>; awaiting
-        // it gives the inner result, the async method's signature wraps that back into Task<...>
-        // for the caller's WhenAny with a timer.
-        Task<Task<BoundedReadResult>> wrapped = Task.Factory.StartNew(async _ => await ReadReportCoreAsync(full, token).ConfigureAwait(false), state: null, token, TaskCreationOptions.RunContinuationsAsynchronously, TaskScheduler.Default);
-        return await wrapped.Unwrap().ConfigureAwait(false);
-    }
-
     private static GateResult BuildResult(int exitCode, GateSpec spec, string feedback, CountResolution resolution, TimeSpan duration)
     {
         if (exitCode is 0)
@@ -923,7 +925,11 @@ internal static class Gate
         return new JsonObject(fields);
     }
 
-    internal static async Task WriteGateJsonAsync(string path, GateResult result, GateSpec spec, IReadOnlyList<string> envNames)
+    /// <summary>
+    /// The text of a per-command <c>gate.json</c>: the result fields, the command, the env names and,
+    /// when the spec has them, the gate PATH, the declared outputs and the warnings.
+    /// </summary>
+    private static string GateJsonText(GateResult result, GateSpec spec, IReadOnlyList<string> envNames)
     {
         JsonObject o = ResultFields(result);
         o["command"] = new JsonArray([.. spec.Command.Select(c => (JsonNode)c)]);
@@ -947,7 +953,7 @@ internal static class Gate
             o["warnings"] = new JsonArray([.. spec.Warnings.Select(w => (JsonNode)w)]);
         }
 
-        await Launcher.WritePlainAsync(path, o.ToJsonString(Json.Indented)).ConfigureAwait(false);
+        return o.ToJsonString(Json.Indented);
     }
 
     /// <summary>
@@ -966,7 +972,7 @@ internal static class Gate
             ? new GateResult(Outcome: "error", ExitCode: -1, Count: null, ReportPath: null,
                 Feedback: string.Empty, Error: errorMessage, Duration: TimeSpan.Zero)
             : gateRan with { Outcome = "error", Error = errorMessage };
-        await WriteGateJsonAsync(Path.Combine(runDir, FileName(spec, "json")), result, spec, envNames: []).ConfigureAwait(false);
+        await Launcher.WritePlainAsync(Path.Combine(runDir, FileName(spec, "json")), GateJsonText(result, spec, envNames: [])).ConfigureAwait(false);
         return result;
     }
 

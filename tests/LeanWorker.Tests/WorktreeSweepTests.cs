@@ -103,8 +103,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
     private static string LineFor(string[] lines, string path) =>
         Assert.Single(lines, l => l.EndsWith(" " + path, StringComparison.Ordinal));
 
-    private async Task<string[]> SweepMainAsync(params string[] extra) =>
-        await SweepAsync([.. new[] { "--repo", _main, "--older-than-days", "0" }, .. extra]);
+    private string[] OnMain(params string[] extra) => [.. new[] { "--repo", _main, "--older-than-days", "0" }, .. extra];
 
     [Fact]
     public async Task A_clean_merged_worktree_is_removed_with_apply_and_its_branch_staysAsync()
@@ -112,11 +111,11 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("done");
         await LandAsync(wt);
 
-        string[] plan = await SweepMainAsync();
+        string[] plan = await SweepAsync(OnMain());
         Assert.Equal($"REMOVE merged {wt}", LineFor(plan, wt));
         Assert.True(Directory.Exists(wt));
 
-        string[] applied = await SweepMainAsync("--apply");
+        string[] applied = await SweepAsync(OnMain("--apply"));
         Assert.Equal($"REMOVE merged {wt}", LineFor(applied, wt));
         Assert.False(Directory.Exists(wt));
         Assert.DoesNotContain(wt, await GitAsync(_main, "worktree", "list", "--porcelain"), StringComparison.Ordinal);
@@ -131,7 +130,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         await CommitAsync(_main, "feature.txt", "same\n", "squashed");
         _ = await GitAsync(_main, "push", "origin", "main");
 
-        Assert.Equal($"REMOVE landed {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"REMOVE landed {wt}", LineFor(await SweepAsync(OnMain()), wt));
     }
 
     [Fact]
@@ -140,7 +139,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("work");
         await CommitAsync(wt, "wip.txt", "wip\n", "wip");
 
-        Assert.Equal($"KEEP unmerged {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"KEEP unmerged {wt}", LineFor(await SweepAsync(OnMain()), wt));
     }
 
     [Fact]
@@ -149,7 +148,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("edited");
         await File.WriteAllTextAsync(Path.Combine(wt, "README.md"), "changed\n", TestContext.Current.CancellationToken);
 
-        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepAsync(OnMain()), wt));
     }
 
     [Fact]
@@ -158,7 +157,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("untracked");
         await File.WriteAllTextAsync(Path.Combine(wt, "new.txt"), "x\n", TestContext.Current.CancellationToken);
 
-        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepAsync(OnMain()), wt));
     }
 
     [Fact]
@@ -167,7 +166,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("locked");
         _ = await GitAsync(_main, "worktree", "lock", wt);
 
-        Assert.Equal($"KEEP locked {wt}", LineFor(await SweepMainAsync("--apply"), wt));
+        Assert.Equal($"KEEP locked {wt}", LineFor(await SweepAsync(OnMain("--apply")), wt));
         Assert.True(Directory.Exists(wt));
     }
 
@@ -178,7 +177,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string custom = await AddWorktreeAsync("keepme-now");
         string open = await AddWorktreeAsync("open");
 
-        string[] lines = await SweepMainAsync("--protect", "keepme-*", "--apply");
+        string[] lines = await SweepAsync(OnMain("--protect", "keepme-*", "--apply"));
 
         Assert.Equal($"KEEP protected {pinned}", LineFor(lines, pinned));
         Assert.Equal($"KEEP protected {custom}", LineFor(lines, custom));
@@ -193,7 +192,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string outer = await AddWorktreeAsync("outer");
         string inner = await AddWorktreeAsync("inner", outer);
 
-        string[] lines = await SweepMainAsync("--apply");
+        string[] lines = await SweepAsync(OnMain("--apply"));
 
         Assert.Equal($"KEEP nested {outer}", LineFor(lines, outer));
         Assert.StartsWith("REMOVE", LineFor(lines, inner), StringComparison.Ordinal);
@@ -206,10 +205,10 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string wt = await AddWorktreeAsync("gone");
         Directory.Delete(wt, recursive: true);
 
-        Assert.Equal($"REMOVE missing {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"REMOVE missing {wt}", LineFor(await SweepAsync(OnMain()), wt));
         Assert.Contains(wt, await GitAsync(_main, "worktree", "list", "--porcelain"), StringComparison.Ordinal);
 
-        _ = await SweepMainAsync("--apply");
+        _ = await SweepAsync(OnMain("--apply"));
         Assert.DoesNotContain(wt, await GitAsync(_main, "worktree", "list", "--porcelain"), StringComparison.Ordinal);
     }
 
@@ -225,7 +224,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         string rebaseDir = (await GitAsync(wt, "rev-parse", "--git-path", "rebase-merge")).Trim();
         Assert.True(Directory.Exists(rebaseDir));
 
-        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepMainAsync(), wt));
+        Assert.Equal($"KEEP dirty {wt}", LineFor(await SweepAsync(OnMain()), wt));
     }
 
     [Fact]
@@ -263,7 +262,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         _ = await GitAsync(_main, "worktree", "lock", locked);
         await LandAsync(merged);
 
-        string[] lines = await SweepMainAsync();
+        string[] lines = await SweepAsync(OnMain());
 
         Assert.Equal(4, lines.Length);
         Assert.Equal("total: 3 worktrees, 1 removable, 2 kept", lines[^1]);
@@ -304,7 +303,7 @@ public sealed class WorktreeSweepTests : IAsyncLifetime
         using Process sleeper = Process.Start(new ProcessStartInfo("sleep", "30") { WorkingDirectory = wt, UseShellExecute = false })!;
         try
         {
-            string[] lines = await SweepMainAsync("--apply");
+            string[] lines = await SweepAsync(OnMain("--apply"));
 
             Assert.Equal($"KEEP in-use {wt}", LineFor(lines, wt));
             Assert.True(Directory.Exists(wt));

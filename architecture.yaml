@@ -27,7 +27,7 @@ metric_debt:
     cyclomatic_complexity: 16
   - project: "LeanWorker"
     symbol: "M:LeanWorker.LaunchRun.PrintHeaderAsync"
-    cyclomatic_complexity: 17
+    cyclomatic_complexity: 16
   - project: "LeanWorker"
     symbol: "M:LeanWorker.LaunchRun.ResolveOptions"
     cyclomatic_complexity: 19

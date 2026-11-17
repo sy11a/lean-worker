@@ -599,7 +599,9 @@ internal sealed class LaunchRun
     /// </summary>
     private string ResolveRunsRoot(string runsRoot)
     {
-        if (Path.IsPathRooted(runsRoot))
+        // A fully qualified root is used as given. A rooted one that is not ("\x", "C:x"; Windows
+        // only) goes on below and comes back unchanged too: Path.Combine keeps a rooted second path.
+        if (Path.IsPathFullyQualified(runsRoot))
         {
             return runsRoot;
         }
@@ -991,7 +993,7 @@ internal sealed class LaunchRun
         else if (_o.ContinueFrom is not null)
         {
             // Fresh worker, not a resumed session: the original task plus the previous worker's report.
-            string prevTask = CutSections(await ReadTextAsync(Path.Combine(_o.ContinueFrom, "task.md")).ConfigureAwait(false));
+            string prevTask = CutSections(await File.ReadAllTextAsync(Path.Combine(_o.ContinueFrom, "task.md"), Json.Utf8, CancellationToken.None).ConfigureAwait(false));
             string prevReport = await ReadPreviousReportAsync().ConfigureAwait(false);
             string nl = Environment.NewLine;
             taskText = prevTask.TrimEnd() + nl + nl + Launcher.ContinuationHeading + nl + nl +
@@ -1003,7 +1005,7 @@ internal sealed class LaunchRun
         else
         {
             string taskPath = Path.GetFullPath(_o.TaskFile!);
-            taskText = await ReadTextAsync(taskPath).ConfigureAwait(false);
+            taskText = await File.ReadAllTextAsync(taskPath, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             name = _o.Name ?? new DirectoryInfo(Path.GetDirectoryName(taskPath)!).Name;
         }
         _taskText = taskText;
@@ -1025,12 +1027,6 @@ internal sealed class LaunchRun
         _ = Directory.CreateDirectory(RunDir);
         await File.WriteAllTextAsync(Path.Combine(RunDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
-
-    /// <summary>
-    /// A file's text, read as UTF-8 (the encoding every file the launcher writes uses).
-    /// </summary>
-    private static async Task<string> ReadTextAsync(string path) =>
-        await File.ReadAllTextAsync(path, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
 
     /// <summary>
     /// A task text without its continuation and gate sections: the part that is the original task
@@ -1065,7 +1061,7 @@ internal sealed class LaunchRun
             return string.Empty;
         }
 
-        string file = await ReadTextAsync(path).ConfigureAwait(false);
+        string file = await File.ReadAllTextAsync(path, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
         return EvidenceBlock.WorkerText(file).Trim();
     }
 
@@ -1100,12 +1096,12 @@ internal sealed class LaunchRun
         string projectNotes = Path.Combine(_runsRoot, "project.md");
         if (!_o.NoProjectNotes && File.Exists(projectNotes))
         {
-            parts.Add(await ReadTextAsync(projectNotes).ConfigureAwait(false));
+            parts.Add(await File.ReadAllTextAsync(projectNotes, Json.Utf8, CancellationToken.None).ConfigureAwait(false));
         }
 
         if (_o.SystemFile is not null)
         {
-            parts.Add(await ReadTextAsync(_o.SystemFile).ConfigureAwait(false));
+            parts.Add(await File.ReadAllTextAsync(_o.SystemFile, Json.Utf8, CancellationToken.None).ConfigureAwait(false));
         }
 
         string? runSystem = null;
@@ -2536,29 +2532,31 @@ internal sealed class LaunchRun
     {
         await PrintHeaderAsync().ConfigureAwait(false);
         await PrintNoticesAsync().ConfigureAwait(false);
-        await PrintTamperWarningAsync().ConfigureAwait(false);
+        if (TamperWarning() is { } warning)
+        {
+            await Console.Error.WriteLineAsync(warning).ConfigureAwait(false);
+        }
+
         await PrintReportAsync().ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The loud warning on the error stream: the run changed the repository's own git metadata,
+    /// The loud warning for the error stream: the run changed the repository's own git metadata,
     /// which every later git call runs. It goes to the error stream, so it is seen even when the
-    /// result block is read on the other one.
+    /// result block is read on the other one. Null when the run left the git metadata alone.
     /// </summary>
-    private async Task PrintTamperWarningAsync()
+    private string? TamperWarning()
     {
         if (_gitTamper.Count is 0)
         {
-            return;
+            return null;
         }
 
         string extras = _gitTamper.Count > 5
             ? string.Create(CultureInfo.InvariantCulture, $" (+{_gitTamper.Count - 5} more, see summary.json)")
             : string.Empty;
-        await Console.Error.WriteLineAsync(
-            $"WARNING:  the run changed the repository's own git metadata: {string.Join(", ", _gitTamper.Take(5))}{extras}. " +
-            "Every later git call runs it (core.fsmonitor, core.hooksPath, a hook of its own); check it before accepting the run.")
-            .ConfigureAwait(false);
+        return $"WARNING:  the run changed the repository's own git metadata: {string.Join(", ", _gitTamper.Take(5))}{extras}. " +
+            "Every later git call runs it (core.fsmonitor, core.hooksPath, a hook of its own); check it before accepting the run.";
     }
 
     private async Task PrintHeaderAsync()
@@ -2597,7 +2595,19 @@ internal sealed class LaunchRun
             await w.WriteLineAsync($"quota:    {_quotaAfter.Line(_quotaBefore)}").ConfigureAwait(false);
         }
 
-        await PrintWorktreeAsync().ConfigureAwait(false);
+        await PrintTailAsync(w, ic).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The last lines of the header: the worktree line (a run without a worktree prints none) and
+    /// the files line (a run that recorded no changed files prints none).
+    /// </summary>
+    private async Task PrintTailAsync(TextWriter w, CultureInfo ic)
+    {
+        if (_worktree is not null)
+        {
+            await w.WriteLineAsync($"worktree: {_worktree.Action} {EvidenceBlock.OneLine(_worktree.Reason)} {EvidenceBlock.OneLine(_worktree.WorktreePath)}").ConfigureAwait(false);
+        }
 
         if (_changed is null)
         {
@@ -2626,20 +2636,6 @@ internal sealed class LaunchRun
         }
 
         return " (no write scope given)";
-    }
-
-    /// <summary>
-    /// The worktree line of the result block: what became of the worktree the run owned and where
-    /// it is. A run without a worktree prints no line.
-    /// </summary>
-    private async Task PrintWorktreeAsync()
-    {
-        if (_worktree is null)
-        {
-            return;
-        }
-
-        await Console.Out.WriteLineAsync($"worktree: {_worktree.Action} {EvidenceBlock.OneLine(_worktree.Reason)} {EvidenceBlock.OneLine(_worktree.WorktreePath)}").ConfigureAwait(false);
     }
 
     private string? FormatGateLine(CultureInfo ic)

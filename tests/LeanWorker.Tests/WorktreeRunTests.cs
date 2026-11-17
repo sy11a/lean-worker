@@ -85,9 +85,6 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
-    private async Task<WorktreeRun> CreateAsync(string baseRef = "HEAD", string branch = Branch, string name = RunName) =>
-        await WorktreeRun.CreateAsync(_repo, branch, baseRef, name, _setup);
-
     private static string[] Lines(JsonObject summary) => [.. summary["evidence_lines"]!.AsArray().Select(n => n!.GetValue<string>())];
 
     private async Task<bool> BranchExistsAsync(string branch) =>
@@ -107,7 +104,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_commit_of_the_worker_on_the_branch_keeps_the_worktree_as_commitsAsync()
     {
-        WorktreeRun wt = await CreateAsync("HEAD");
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         await CommitAsync(wt.WorktreePath, "work.txt", "work\n", "work");
 
         await AssertKeptAsync(wt, "commits");
@@ -116,7 +113,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_commit_on_a_detached_head_keeps_the_worktree_as_commitsAsync()
     {
-        WorktreeRun wt = await CreateAsync("HEAD");
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         _ = await GitAsync(wt.WorktreePath, "checkout", "--detach");
         await CommitAsync(wt.WorktreePath, "work.txt", "work\n", "work");
 
@@ -128,7 +125,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [InlineData("no-such-ref")]
     public async Task A_base_that_is_a_flag_or_does_not_exist_is_a_launch_error_and_creates_nothingAsync(string baseRef)
     {
-        _ = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync(baseRef));
+        _ = await Assert.ThrowsAsync<LaunchException>(async () => await WorktreeRun.CreateAsync(_repo, Branch, baseRef, RunName, _setup));
 
         Assert.False(Directory.Exists(WorktreePath));
         Assert.False(File.Exists(WorktreePath));
@@ -145,7 +142,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         // fsmonitor hook in the shared config can no longer move the branch (or anything else)
         // while the launcher looks at the working tree.
         Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
-        WorktreeRun wt = await CreateAsync("HEAD");
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string baseSha = await GitAsync(_repo, "rev-parse", "HEAD");
         string moved = await GitAsync(_repo, "commit-tree", baseSha + "^{tree}", "-p", baseSha, "-m", "moved");
 
@@ -175,7 +172,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task The_launchers_own_git_calls_do_not_run_a_hook_from_core_hooksPathAsync()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
-        WorktreeRun wt = await CreateAsync("HEAD");
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string ran = Path.Combine(_root, "hook-ran");
         string hooks = Path.Combine(_root, "evil-hooks");
         _ = Directory.CreateDirectory(hooks);
@@ -216,7 +213,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task An_untracked_file_of_the_worker_in_the_lean_worker_folder_keeps_the_worktreeAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         WriteFile(wt.WorktreePath, ".lean-worker/inbox/x.md", "note\n");
 
         await AssertKeptAsync(wt, "changes");
@@ -228,7 +225,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         await CommitAsync(_repo, ".lean-worker/project.md", "tracked notes\n", "track project.md");
         WriteFile(_setup, "project.md", "local notes\n");
 
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string inWorktree = Path.Combine(wt.WorktreePath, ".lean-worker", "project.md");
         Assert.Equal("tracked notes\n", await File.ReadAllTextAsync(inWorktree, TestContext.Current.CancellationToken));
 
@@ -240,7 +237,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_copied_file_the_worker_changed_keeps_the_worktreeAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         await File.WriteAllTextAsync(Path.Combine(wt.WorktreePath, ".lean-worker", "code-a.md"), "changed\n", TestContext.Current.CancellationToken);
 
         await AssertKeptAsync(wt, "changes");
@@ -249,7 +246,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_copied_file_the_worker_deleted_keeps_the_worktreeAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         File.Delete(Path.Combine(wt.WorktreePath, ".lean-worker", "code-a.md"));
 
         await AssertKeptAsync(wt, "changes");
@@ -258,7 +255,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_copied_file_the_worker_added_to_the_index_keeps_the_worktreeAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         _ = await GitAsync(wt.WorktreePath, "add", "-f", "--", ".lean-worker/code-a.md");
 
         await AssertKeptAsync(wt, "changes");
@@ -267,7 +264,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_nested_untracked_file_keeps_the_worktreeAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         WriteFile(wt.WorktreePath, "src/new/dir/f.txt", "new\n");
 
         await AssertKeptAsync(wt, "changes");
@@ -278,7 +275,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_clean_run_deletes_the_copied_files_removes_the_worktree_and_the_branch_and_leaves_the_invoking_setupAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         foreach (string file in new[] { "profiles.json", "project.md", "code-a.md", "system/s.md" })
         {
             Assert.True(File.Exists(Path.Combine(wt.WorktreePath, ".lean-worker", file)), file);
@@ -301,7 +298,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_tracked_modification_keeps_the_worktree_as_changesAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         await File.WriteAllTextAsync(Path.Combine(wt.WorktreePath, "README.md"), "edited\n", TestContext.Current.CancellationToken);
 
         await AssertKeptAsync(wt, "changes");
@@ -311,7 +308,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task An_ignored_file_is_discarded_with_the_worktree_and_counted_in_the_reasonAsync()
     {
         await CommitAsync(_repo, ".gitignore", "bin/\n", "ignore bin");
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         WriteFile(wt.WorktreePath, "bin/x", "build output\n");
 
         await wt.FinishAsync();
@@ -325,7 +322,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_worktree_git_refuses_to_remove_stays_and_its_multi_line_error_is_one_evidence_lineAsync()
     {
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         _ = await GitAsync(_repo, "worktree", "lock", "--reason", "held", wt.WorktreePath);
 
         await wt.FinishAsync();
@@ -377,7 +374,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         _ = Directory.CreateDirectory(WorktreePath);
         WriteFile(WorktreePath, "mine.txt", "mine\n");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync());
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup));
 
         Assert.Contains("taken", ex.Message, StringComparison.Ordinal);
         Assert.Equal("mine\n", await File.ReadAllTextAsync(Path.Combine(WorktreePath, "mine.txt"), TestContext.Current.CancellationToken));
@@ -392,7 +389,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         string before = await GitAsync(_repo, "rev-parse", "refs/heads/" + Branch);
         await CommitAsync(_repo, "later.txt", "later\n", "later");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync());
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup));
 
         Assert.Contains("taken", ex.Message, StringComparison.Ordinal);
         Assert.Equal(before, await GitAsync(_repo, "rev-parse", "refs/heads/" + Branch));
@@ -402,10 +399,10 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_second_run_with_the_same_name_is_refused_and_the_first_worktree_is_unchangedAsync()
     {
-        WorktreeRun first = await CreateAsync();
+        WorktreeRun first = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string before = await GitAsync(_repo, "rev-parse", "refs/heads/" + Branch);
 
-        _ = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync(branch: "other-branch"));
+        _ = await Assert.ThrowsAsync<LaunchException>(async () => await WorktreeRun.CreateAsync(_repo, "other-branch", "HEAD", RunName, _setup));
 
         Assert.True(Directory.Exists(first.WorktreePath));
         Assert.Contains(first.WorktreePath, await GitAsync(_repo, "worktree", "list", "--porcelain"), StringComparison.Ordinal);
@@ -516,7 +513,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task A_copied_folder_replaced_by_a_symlink_to_the_invoking_folder_deletes_nothing_and_keeps_the_worktreeAsync()
     {
         SkipWithoutSymlinks();
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string linked = Path.Combine(wt.WorktreePath, ".lean-worker", "system");
         Directory.Delete(linked, recursive: true);
         _ = Directory.CreateSymbolicLink(linked, Path.Combine(_setup, "system"));
@@ -532,7 +529,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task A_copied_file_replaced_by_a_symlink_to_its_source_is_not_deleted_through_and_the_worktree_is_keptAsync()
     {
         SkipWithoutSymlinks();
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string linked = Path.Combine(wt.WorktreePath, ".lean-worker", "code-a.md");
         File.Delete(linked);
         _ = File.CreateSymbolicLink(linked, Path.Combine(_setup, "code-a.md"));
@@ -548,7 +545,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task A_worktree_root_replaced_by_a_symlink_to_the_invoking_repository_deletes_nothing_and_runs_no_status_thereAsync()
     {
         SkipWithoutSymlinks();
-        WorktreeRun wt = await CreateAsync();
+        WorktreeRun wt = await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup);
         string moved = wt.WorktreePath + "-moved";
         Directory.Move(wt.WorktreePath, moved);
         _ = Directory.CreateSymbolicLink(wt.WorktreePath, _repo);
@@ -605,7 +602,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         SkipWithoutSymlinks();
         string outside = await TrackSymlinkedSystemFolderAsync();
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateAsync());
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await WorktreeRun.CreateAsync(_repo, Branch, "HEAD", RunName, _setup));
 
         Assert.Contains("tracks a symlink", ex.Message, StringComparison.Ordinal);
         Assert.Empty(Directory.GetFileSystemEntries(outside));
@@ -635,14 +632,14 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     private static string[] OutOfScope(JsonObject summary) =>
         summary["out_of_scope"] is JsonArray a ? [.. a.Select(n => n!.GetValue<string>())] : [];
 
-    private async Task<(int Code, string Stdout, JsonObject Summary)> LaunchWorktreeAsync(string workerShell, Action<Options>? more = null)
+    private static Action<Options> InWorktree(Action<Options>? more = null)
     {
-        return await LaunchAsync(Success(workerShell), o =>
+        return o =>
         {
             o.Name = RunName;
             o.Worktree = Branch;
             more?.Invoke(o);
-        });
+        };
     }
 
     [UnsupportedOSPlatform("windows")]
@@ -666,7 +663,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task A_worker_that_writes_into_the_invoking_repository_is_reported_with_the_invoking_prefix_and_the_plain_messageAsync()
     {
-        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("echo leak > '" + _repo + "/leak.txt'");
+        (int code, string stdout, JsonObject s) = await LaunchAsync(Success("echo leak > '" + _repo + "/leak.txt'"), InWorktree());
 
         Assert.Equal(0, code);
         Assert.Contains("<invoking>/leak.txt", OutOfScope(s), StringComparer.Ordinal);
@@ -678,7 +675,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task With_a_write_scope_the_invoking_repository_path_counts_as_outside_the_write_scopeAsync()
     {
-        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("echo leak > '" + _repo + "/leak.txt'", o => o.WriteScope.Add("src/**"));
+        (int code, string stdout, JsonObject s) = await LaunchAsync(Success("echo leak > '" + _repo + "/leak.txt'"), InWorktree(o => o.WriteScope.Add("src/**")));
 
         Assert.Equal(0, code);
         Assert.Equal(["<invoking>/leak.txt"], OutOfScope(s));
@@ -689,7 +686,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     [Fact]
     public async Task The_launchers_own_run_directory_and_ledger_in_the_invoking_repository_are_not_reportedAsync()
     {
-        (int code, string stdout, JsonObject s) = await LaunchWorktreeAsync("true");
+        (int code, string stdout, JsonObject s) = await LaunchAsync(Success("true"), InWorktree());
 
         Assert.Equal(0, code);
         Assert.Empty(OutOfScope(s));
@@ -710,11 +707,11 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         RunAsyncGolden.WriteProfile(_setup, "test", GateLoopTests.GateProfile(gate));
         string workerMarker = Path.Combine(_root, "worker-ran");
 
-        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await LaunchWorktreeAsync("touch '" + workerMarker + "'", o =>
+        LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await LaunchAsync(Success("touch '" + workerMarker + "'"), InWorktree(o =>
         {
             o.Profile = "test";
             Environment.SetEnvironmentVariable("PATH", bin + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH"));
-        }));
+        })));
 
         Assert.Equal("gate PATH directory '" + bin + "' is inside the working tree", ex.Message);
         Assert.False(File.Exists(workerMarker), "the worker must not run");
@@ -763,7 +760,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         string locked = Path.Combine(_repo, "locked.txt");
         try
         {
-            (int code, _, JsonObject s) = await LaunchWorktreeAsync("echo x > '" + locked + "'; chmod 000 '" + locked + "'");
+            (int code, _, JsonObject s) = await LaunchAsync(Success("echo x > '" + locked + "'; chmod 000 '" + locked + "'"), InWorktree());
 
             Assert.Equal(0, code);
             Assert.Contains("<invoking>/locked.txt", OutOfScope(s), StringComparer.Ordinal);
@@ -783,7 +780,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         await WriteLockedAsync(locked);
         try
         {
-            (int code, _, JsonObject s) = await LaunchWorktreeAsync("true");
+            (int code, _, JsonObject s) = await LaunchAsync(Success("true"), InWorktree());
 
             Assert.Equal(0, code);
             Assert.Empty(OutOfScope(s));
@@ -804,7 +801,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         await WriteLockedAsync(locked);
         try
         {
-            (int code, _, JsonObject s) = await LaunchWorktreeAsync("true");
+            (int code, _, JsonObject s) = await LaunchAsync(Success("true"), InWorktree());
 
             Assert.Equal(0, code);
             Assert.Contains("- unverified: <invoking>/locked.txt", Lines(s), StringComparer.Ordinal);
@@ -822,7 +819,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
         Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
         string script = "printf '[core]\\n\\thooksPath = /dev/null\\n' > \"$(git -C '" + WorktreePath + "' rev-parse --absolute-git-dir)/config.worktree\"";
 
-        (int code, _, JsonObject s) = await LaunchWorktreeAsync(script);
+        (int code, _, JsonObject s) = await LaunchAsync(Success(script), InWorktree());
 
         Assert.Contains(Lines(s), l => l.StartsWith("- git-tamper: ", StringComparison.Ordinal) && l.EndsWith("/config.worktree", StringComparison.Ordinal));
         Assert.NotEqual("success", s["status"]!.GetValue<string>(), StringComparer.Ordinal);
@@ -834,7 +831,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "needs a POSIX shell");
 
-        (int code, _, JsonObject s) = await LaunchWorktreeAsync("printf '[core]\\n\\thooksPath = /dev/null\\n' >> '" + Path.Combine(_repo, ".git", "config") + "'");
+        (int code, _, JsonObject s) = await LaunchAsync(Success("printf '[core]\\n\\thooksPath = /dev/null\\n' >> '" + Path.Combine(_repo, ".git", "config") + "'"), InWorktree());
 
         Assert.Contains("- git-tamper: .git/config", Lines(s), StringComparer.Ordinal);
         Assert.NotEqual("success", s["status"]!.GetValue<string>(), StringComparer.Ordinal);
@@ -845,7 +842,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     public async Task A_failed_invoking_repository_snapshot_after_the_worker_is_a_run_noteAsync()
     {
         // The worker breaks the invoking repository's HEAD: git cannot run in it any more.
-        (int code, _, JsonObject s) = await LaunchWorktreeAsync("echo garbage > '" + Path.Combine(_repo, ".git", "HEAD") + "'");
+        (int code, _, JsonObject s) = await LaunchAsync(Success("echo garbage > '" + Path.Combine(_repo, ".git", "HEAD") + "'"), InWorktree());
 
         Assert.Equal(0, code);
         Assert.Contains(RunAsyncGolden.Notes_(s), n => n.StartsWith("invoking repository not checked: ", StringComparison.Ordinal));
