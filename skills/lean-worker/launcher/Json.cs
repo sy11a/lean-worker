@@ -87,5 +87,5 @@ internal static class Json
     }
 
     public static List<string>? StrList(JsonObject? o, string key) =>
-        o?[key] is JsonArray arr ? arr.Select(x => x?.GetValue<string>()).Where(x => !string.IsNullOrEmpty(x)).Select(x => x!).ToList() : null;
+        o?[key] is JsonArray arr ? [.. arr.Select(x => x?.GetValue<string>()).Where(x => !string.IsNullOrEmpty(x)).Select(x => x!)] : null;
 }

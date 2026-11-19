@@ -1520,7 +1520,7 @@ internal sealed class LaunchRun
             await CollectCheckPathsAsync(_noExclusions).ConfigureAwait(false);
         // A declared output that is also a trusted input is a configuration mistake, not tampering:
         // refuse it here, before the worker starts, as a launch error (exit 2).
-        await ValidateDeclaredOutputsAsync(snapshotSources).ConfigureAwait(false);
+        ValidateDeclaredOutputs(snapshotSources);
         TrustSnapshot = await GateTrust.HashAsync(snapshotPaths).ConfigureAwait(false);
         RefuseBadSnapshotValues(snapshotSources);
         // The gate PATH's directories: one listing each, frozen as the baseline the pre-gate
@@ -1932,7 +1932,7 @@ internal sealed class LaunchRun
     /// the round-1 snapshot, before the run directory is created: a collision is a profile mistake,
     /// so it fails as a launch error (exit 2), not as a trust violation.
     /// </summary>
-    private async Task ValidateDeclaredOutputsAsync(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
+    private void ValidateDeclaredOutputs(IReadOnlyDictionary<string, HashSet<GateTrust.TrustSource>> sources)
     {
         List<GateSpec> gates = NonNull(_gates);
         if (gates.TrueForAll(g => g.Outputs is not { Count: > 0 }))

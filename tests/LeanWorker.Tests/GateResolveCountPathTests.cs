@@ -13,7 +13,7 @@ public class GateResolveCountPathTests
         JsonNode root = Root("""{"runs":[{"results":[1,2,3]}]}""");
         JsonNode? node = Gate.ResolveCountPath(root, "runs[0].results");
         _ = Assert.IsType<JsonArray>(node);
-        Assert.Equal(3, ((JsonArray)node!).Count);
+        Assert.Equal(3, ((JsonArray)node).Count);
     }
 
     [Fact]

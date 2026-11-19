@@ -147,7 +147,7 @@ public class RepoTokenTests
                 ?? new DirectoryInfo(dir).FullName;
             string? root = await RepoToken.RootAsync(dir);
             Assert.NotNull(root);
-            Assert.Equal(expected.TrimEnd('/'), root!.TrimEnd('/'));
+            Assert.Equal(expected.TrimEnd('/'), root.TrimEnd('/'));
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
