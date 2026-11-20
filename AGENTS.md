@@ -52,11 +52,31 @@ Never commit to `master` directly and never force-push it.
 
 ## Decision gate
 
-The operator's rule of 2026-11-16 (every repository in ~/Repository_v2): anything found along the way that is
-not part of the approved task (a review finding outside the PR's own change, a residual route, a flaky test, an
-idea, a new rule) is filed as a GitHub issue in this repository with the label `needs-decision`: what was found,
-where (file:line), the evidence and the proposed fix. It is not worked on, and not put on an epic or backlog
-checklist, until the operator labels it `decision:do`; a no-do is closed as not planned. Only `decision:do` issues
-and work the operator approved in words are taken. A finding on the PR's own change that blocks it (a MAJOR, a red
-test) is part of the approved task and is fixed in that PR. This overrides any rule above that puts findings on an
-epic checklist or files work without the operator's decision.
+The operator's rule of 2026-11-16 (every repository in ~/Repository_v2), made automatic on 2026-11-20: anything
+found along the way that is not part of the approved task (a review finding outside the PR's own change, a residual
+route, a flaky test, an idea, a new rule) is filed as a GitHub issue in this repository with the label
+`needs-decision`: what was found, where (file:line), the evidence, the proposed fix and the class the filer proposes
+(below). It is not worked on, and not put on an epic or backlog checklist, until it is triaged. A finding on the
+PR's own change that blocks it (a MAJOR, a red test) is part of the approved task and is fixed in that PR. This
+overrides any rule above that puts findings on an epic checklist.
+
+Triage (automatic, the operator's word of 2026-11-20): at the end of every train of tasks (the last PR of a batch
+merged, or the session about to wait on rulings) and at session start, the orchestrating session reviews every open
+`needs-decision` issue of this repository and decides it alone. The main goals are the open `decision:do` tasks,
+the gates' integrity (fail-closed, trust, security, no false green) and a green build, test and CI run. Each issue
+gets exactly one class, with a one-line reason as an issue comment:
+
+1. `triage:drop`: small, changes nothing that matters, costs more time than it saves (cosmetic, a workaround that
+   holds and will not recur, an idea with no user). Closed as not planned.
+2. `triage:batch`: real but not urgent. Stays open with its area named in the comment (one file area or tool).
+   When 5-8 batch issues share an area, or no `decision:do` task is open, the oldest area pack becomes one task
+   and one PR: its issues get `decision:do`.
+3. `triage:now` (+ `decision:do`): urgent and tied to the main goals: it blocks a `decision:do` task, makes a gate
+   fail open or report a false green, is a security defect, or breaks the build, tests or CI. Worked on at once,
+   in the blocked task's PR when it is its own change, otherwise its own PR.
+
+Reserved for the operator, never auto-decided (`triage:operator`, stays `needs-decision`): a new analyzer or gate
+rule, loosening a gate (a ban, allowance, suppression, threshold or widened trust), dependency-bot merges the
+operator keeps, and anything the operator has claimed. When such an issue blocks a main goal, the handoff and the
+session's report name it first. The operator overrides any class by relabelling; that wins. The full rule:
+sy11a_analyzers AGENTS.md (sy11a/sy11a_analyzers#1331).
