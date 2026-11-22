@@ -113,21 +113,35 @@ internal static class OwnerKeys
     }
 
     /// <summary>
-    /// The caller of <c>status</c>, resolved as at launch: inside a lean-worker run
-    /// (LEAN_WORKER_RUN_ID) the caller is that run; else its session keys. The key for --owner is
-    /// the run key, else the session key, else the pid key.
+    /// The caller of <c>status</c>, resolved as at launch without an --owner: inside a lean-worker
+    /// run (LEAN_WORKER_RUN_ID) the caller is that run; else its session keys; LEAN_WORKER_OWNER,
+    /// when it passes the key check, is one more key in either case. The key for --owner is the run
+    /// key, else the session key, else the pid key, else the LEAN_WORKER_OWNER key.
     /// </summary>
     public static Caller CallerOf(Func<string, string?> env, ProcFs proc)
     {
         string? relay = RelayName(env);
+        string? owner = Value(env, OwnerVariable) is { } fromEnv && Valid(fromEnv) ? fromEnv : null;
+        List<string> keys;
+        string? key;
         if (RunId(Value(env, RunIdVariable)) is { } run)
         {
-            return new Caller([RunPrefix + run], relay, RunPrefix + run);
+            keys = [RunPrefix + run];
+            key = RunPrefix + run;
+        }
+        else
+        {
+            Session session = SessionKeys(env, proc);
+            keys = session.Keys;
+            key = session.Keys.Find(k => !k.StartsWith(PidPrefix, StringComparison.Ordinal)) ?? session.Keys.FirstOrDefault();
         }
 
-        Session session = SessionKeys(env, proc);
-        string? key = session.Keys.Find(k => !k.StartsWith(PidPrefix, StringComparison.Ordinal)) ?? session.Keys.FirstOrDefault();
-        return new Caller(session.Keys, relay, key);
+        if (owner is not null)
+        {
+            keys.Add(owner);
+        }
+
+        return new Caller([.. keys.Distinct(StringComparer.Ordinal)], relay, key ?? owner);
     }
 
     /// <summary>

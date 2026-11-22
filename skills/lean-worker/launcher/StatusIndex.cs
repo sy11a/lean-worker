@@ -190,7 +190,7 @@ internal static class StatusIndex
         string path = Path.Combine(folder, name);
         try
         {
-            _ = budget.Run(() => DeleteIfPointer(path), out bool _);
+            _ = budget.Run(() => DeleteIfPointer(folder, path), out bool _);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -198,10 +198,17 @@ internal static class StatusIndex
         }
     }
 
-    private static bool DeleteIfPointer(string path)
+    private static bool DeleteIfPointer(string folder, string path)
     {
         FileInfo info = new(path);
         if (info.LinkTarget is not null || !info.Exists || info.Attributes.HasFlag(FileAttributes.Directory) || info.Length is 0)
+        {
+            return false;
+        }
+
+        // Checked again right before the delete: a folder swapped for a link since it was listed
+        // would have the delete land in the link's target.
+        if (StatusFile.IsLink(folder))
         {
             return false;
         }

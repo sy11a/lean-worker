@@ -28,6 +28,27 @@ internal static class StatusIndexScan
     internal sealed record Pointer(string File, string RunDir, string? ParentRun, List<string> OwnerKeys, JsonObject Launcher, DateTimeOffset? CreatedAt)
     {
         public string RunId => Path.GetFileName(RunDir);
+
+        /// <summary>
+        /// The run ids its <c>run:&lt;id&gt;</c> owner keys name (a run launched with
+        /// <c>--owner run:&lt;id&gt;</c> belongs to that run as a child does).
+        /// </summary>
+        public IEnumerable<string> OwnerRuns
+        {
+            get
+            {
+                return OwnerKeys
+                    .Where(k => k.StartsWith(LeanWorker.OwnerKeys.RunPrefix, StringComparison.Ordinal))
+                    .Select(k => LeanWorker.OwnerKeys.RunId(k[LeanWorker.OwnerKeys.RunPrefix.Length..]))
+                    .OfType<string>();
+            }
+        }
+
+        /// <summary>
+        /// The run this one is listed under: its parent_run, else the first run its owner keys
+        /// name that is in <paramref name="runs"/>; null when neither.
+        /// </summary>
+        public string? ParentIn(IReadOnlySet<string> runs) => ParentRun is { } parent && runs.Contains(parent) ? parent : OwnerRuns.FirstOrDefault(r => runs.Contains(r));
     }
 
     /// <summary>
@@ -53,6 +74,7 @@ internal static class StatusIndexScan
         (List<string> names, bool complete) = StatusIndex.List(folder, budget);
         List<Entry> entries = [.. names.Order(StringComparer.Ordinal).Select(n => Load(folder, n, budget)).OfType<Entry>()];
         HashSet<string> shared = Shared(entries);
+        HashSet<string> indexed = new(entries.Select(e => e.Pointer?.RunId).OfType<string>(), StringComparer.Ordinal);
         HashSet<string> scope = keys is null
             ? new HashSet<string>(entries.Select(e => e.File), StringComparer.Ordinal)
             : Match(entries, keys);
@@ -71,7 +93,7 @@ internal static class StatusIndexScan
                 continue;
             }
 
-            StatusRow row = RowFor(pointer, shared, reader, budget);
+            StatusRow row = RowFor(pointer, shared, indexed, reader, budget);
             rows.Add(row);
             if (reap && Reapable(row, pointer, now))
             {
@@ -161,8 +183,9 @@ internal static class StatusIndexScan
 
     /// <summary>
     /// The pointers in scope: those whose owner keys meet <paramref name="keys"/>, then, until
-    /// nothing changes, those whose parent_run is a run in scope. A run key among the caller's keys
-    /// (the caller is that run) puts that run's own children in scope too.
+    /// nothing changes, those whose parent_run, or a <c>run:&lt;id&gt;</c> owner key, names a run in
+    /// scope. A run key among the caller's keys (the caller is that run) puts that run's own
+    /// children in scope too.
     /// </summary>
     private static HashSet<string> Match(List<Entry> entries, IReadOnlyCollection<string> keys)
     {
@@ -181,7 +204,7 @@ internal static class StatusIndexScan
         while (grew)
         {
             grew = false;
-            foreach (Pointer p in pointers.Where(p => !files.Contains(p.File) && p.ParentRun is { } parent && runs.Contains(parent)))
+            foreach (Pointer p in pointers.Where(p => !files.Contains(p.File) && p.ParentIn(runs) is not null))
             {
                 _ = files.Add(p.File);
                 _ = runs.Add(p.RunId);
@@ -192,22 +215,29 @@ internal static class StatusIndexScan
         return files;
     }
 
-    private static StatusRow RowFor(Pointer p, HashSet<string> shared, StatusReader reader, ReadBudget budget)
+    /// <summary>
+    /// The row of one pointer: its parent is its parent_run (the pointer's, else the status
+    /// file's), else the first indexed run a <c>run:&lt;id&gt;</c> owner key names, so it is listed
+    /// under that run.
+    /// </summary>
+    private static StatusRow RowFor(Pointer p, HashSet<string> shared, HashSet<string> indexed, StatusReader reader, ReadBudget budget)
     {
         string? owner = p.OwnerKeys.Count > 0 ? p.OwnerKeys[0] : null;
+        string? ownerRun = p.OwnerRuns.FirstOrDefault(r => indexed.Contains(r));
         if (shared.Contains(p.RunDir))
         {
             return new StatusRow(p.RunDir, StatusReader.StampName(p.RunId), StatusStates.SharedDir, Liveness.Unknown, Status: null,
                 "another pointer names the same run dir; neither row can be trusted", StartedAt: null, EndedAt: null, Attention: true, Quiet: null)
             {
                 Pointer = p.File,
+                PointerLauncher = p.Launcher,
                 OwnerKey = owner,
-                ParentRun = p.ParentRun,
+                ParentRun = p.ParentRun ?? ownerRun,
             };
         }
 
         StatusRow row = reader.Read(p.RunDir, budget, p.Launcher);
-        return row with { Pointer = p.File, OwnerKey = owner ?? row.OwnerKey, ParentRun = p.ParentRun ?? row.ParentRun };
+        return row with { Pointer = p.File, PointerLauncher = p.Launcher, OwnerKey = owner ?? row.OwnerKey, ParentRun = p.ParentRun ?? row.ParentRun ?? ownerRun };
     }
 
     private static StatusRow UnreadablePointer(string folder, Entry entry)

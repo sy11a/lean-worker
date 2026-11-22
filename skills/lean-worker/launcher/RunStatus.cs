@@ -41,9 +41,9 @@ internal sealed class RunStatus
     public const string LauncherSignalled = "launcher-signalled";
 
     /// <summary>
-    /// How long the signal handler waits for a status write in progress before it gives up: the
-    /// signal's default action follows either way, so the handler never holds the launcher's end
-    /// up for longer than this plus its own write.
+    /// How long the signal handler waits for a status write in progress and its own write together
+    /// before it gives up: the signal's default action follows either way, so the handler never
+    /// holds the launcher's end up for longer than this.
     /// </summary>
     internal static readonly TimeSpan SignalLockWait = TimeSpan.FromSeconds(1);
 
@@ -80,6 +80,7 @@ internal sealed class RunStatus
     private DateTimeOffset? _lastEventAt;
     private LastTool? _lastTool;
     private JsonObject? _end;
+    private (string Phase, int? GateRound)? _beforeSignal;
     private long _seq;
     private string? _shown;
     private long _lastWriteTimestamp;
@@ -209,13 +210,15 @@ internal sealed class RunStatus
     }
 
     /// <summary>
-    /// Registers the record-only signal handler (<see cref="Signalled"/>) until the run's last write.
+    /// Registers the record-only signal handler (<see cref="Signalled"/>) until the run's last
+    /// write, for the signals the launcher does not ignore (<see cref="ProcFs.IgnoredSignals"/>; none
+    /// when that cannot be read).
     /// </summary>
     internal void HandleSignals()
     {
         BestEffort(() =>
         {
-            StatusSignals signals = StatusSignals.Register(signal => _ = Signalled(signal));
+            StatusSignals signals = StatusSignals.Register(signal => _ = Signalled(signal), _proc.IgnoredSignals());
             lock (_lock)
             {
                 _signals = signals;
@@ -226,11 +229,33 @@ internal sealed class RunStatus
     /// <summary>
     /// The launcher got <paramref name="signal"/>: unless the run already has its end, the file
     /// gets <c>phase: failed</c> and <c>end.status: launcher-signalled</c> with the signal's name.
-    /// The lock is waited for at most <see cref="SignalLockWait"/>: a write in progress that holds
-    /// it longer (a blocked disk) makes the handler give up, so it can never deadlock with the
-    /// writer, and the signal's default action follows either way. True when it was recorded.
+    /// The wait for the lock and the write together take at most <see cref="SignalLockWait"/>: they
+    /// run on a thread of their own, and a write in progress that holds the lock longer, or a write
+    /// of the handler's own that blocks (a stalled disk), is abandoned, so the handler can never
+    /// deadlock with the writer and the signal's default action follows either way. True when it
+    /// was recorded within the bound.
     /// </summary>
     internal bool Signalled(PosixSignal signal)
+    {
+        // Set once the handler gives up: a record that only then gets the lock writes nothing.
+        int abandoned = 0;
+        try
+        {
+            if (new ReadBudget(SignalLockWait, TimeSpan.Zero).Run(() => RecordSignal(signal, () => Volatile.Read(ref abandoned) is 1), out bool recorded))
+            {
+                return recorded;
+            }
+        }
+        catch (IOException)
+        {
+            // RecordSignal keeps its own failures; nothing may leave the handler.
+        }
+
+        _ = Interlocked.Exchange(ref abandoned, 1);
+        return false;
+    }
+
+    private bool RecordSignal(PosixSignal signal, Func<bool> abandoned)
     {
         if (!Monitor.TryEnter(_lock, SignalLockWait))
         {
@@ -239,11 +264,12 @@ internal sealed class RunStatus
 
         try
         {
-            if (_end is not null)
+            if (_end is not null || abandoned())
             {
                 return false;
             }
 
+            _beforeSignal = (_phase, _gateRound);
             _phase = RunPhase.Failed;
             _gateRound = null;
             _end = new JsonObject
@@ -266,6 +292,24 @@ internal sealed class RunStatus
         {
             Monitor.Exit(_lock);
         }
+    }
+
+    /// <summary>
+    /// Under the lock, before any later write: a launcher that still writes survived the signal it
+    /// recorded (its default action did not end it: a SIGTERM inherited as ignored, which the
+    /// runtime's own handler hides from SigIgn, does that), so that end goes and the phase before
+    /// the signal is back until the write sets its own.
+    /// </summary>
+    private void SurvivedSignal()
+    {
+        if (_beforeSignal is not { } before)
+        {
+            return;
+        }
+
+        (_phase, _gateRound) = before;
+        _end = null;
+        _beforeSignal = null;
     }
 
     /// <summary>
@@ -323,6 +367,7 @@ internal sealed class RunStatus
                 ["sid"] = pgid is not null && present ? probe.Stat.Session : null,
                 ["start_ticks"] = present ? probe.Stat.StartTicks : null,
             };
+            SurvivedSignal();
             _phase = RunPhase.Worker;
             WriteLocked();
         }
@@ -347,6 +392,7 @@ internal sealed class RunStatus
     {
         lock (_lock)
         {
+            SurvivedSignal();
             DateTimeOffset now = _clock.GetUtcNow();
             _lastEventAt = now;
             bool due = activity is not null;
@@ -402,6 +448,7 @@ internal sealed class RunStatus
     {
         lock (_lock)
         {
+            SurvivedSignal();
             _phase = phase;
             _gateRound = phase is RunPhase.Gate ? gateRound : null;
             WriteLocked();
@@ -424,6 +471,7 @@ internal sealed class RunStatus
         {
             _phase = RunPhase.Done;
             _gateRound = null;
+            _beforeSignal = null;
             _end = new JsonObject
             {
                 ["status"] = status,
@@ -453,6 +501,7 @@ internal sealed class RunStatus
         {
             _phase = RunPhase.Failed;
             _gateRound = null;
+            _beforeSignal = null;
             _end = new JsonObject
             {
                 ["status"] = LaunchFailed,

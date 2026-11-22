@@ -26,10 +26,10 @@ internal static class StatusLayout
         Dictionary<string, StatusRow> ByRunId);
 
     /// <summary>
-    /// Groups the rows by their status file's chain id: the latest round (the highest round number)
-    /// stands for the chain; an earlier round with an end is final, not ending, though its launcher
-    /// still runs the later round (<see cref="StatusReader.EarlierRound"/>). A row without a chain id
-    /// is a chain of its own.
+    /// Groups the rows by their status file's chain id: the chain's row is its worst round
+    /// (attention over live over ended), the latest (the highest round number) among equals; an
+    /// earlier round with an end is final, not ending, though its launcher still runs the later
+    /// round (<see cref="StatusReader.EarlierRound"/>). A row without a chain id is a chain of its own.
     /// </summary>
     public static View Chains(IReadOnlyList<StatusRow> rows, StatusReader reader, DateTimeOffset now)
     {
@@ -42,6 +42,11 @@ internal static class StatusLayout
             string? chainId = members.Count > 1 ? ChainId(latest) : null;
             List<StatusRow> derived = [.. members.Select(m => Derive(m, latest, chainId, members.Count, reader, now))];
             StatusRow head = derived[^1];
+            foreach (StatusRow d in derived.Where(d => Rank(d) > Rank(head)))
+            {
+                head = d;
+            }
+
             shown.Add(head);
             rounds[head] = derived;
             foreach (StatusRow m in members)
@@ -53,11 +58,24 @@ internal static class StatusLayout
         return new View(shown, rounds, byRunId);
     }
 
+    // Attention over live over ended: what a chain's row shows.
+    private static int Rank(StatusRow r)
+    {
+        if (r.Attention)
+        {
+            return 2;
+        }
+
+        return r.Live ? 1 : 0;
+    }
+
     /// <summary>
-    /// The chains, each in round order: rows of one chain id among which is the chain's first run
-    /// (the launcher names a chain after its first round's run dir) and whose round numbers are all
-    /// distinct (a chain has one run dir per round). Rows that claim a chain id otherwise are no
-    /// chain's rounds, so each of them stands alone and none is hidden behind another.
+    /// The chains, each in round order. Every round of a chain is run by the same launcher process
+    /// (Launcher.RunAsync loops over the rounds), which the launcher names the chain after its first
+    /// round's run dir; so a chain is the run whose id is the chain id plus the rows of that chain
+    /// id whose launcher identity (pid, start ticks and boot id, the same in the status file and
+    /// the pointer) is that run's, all with distinct round numbers. A row that does not prove its
+    /// membership so stands alone, and none is hidden behind another.
     /// </summary>
     private static IEnumerable<List<StatusRow>> Groups(IReadOnlyList<StatusRow> rows)
     {
@@ -65,25 +83,57 @@ internal static class StatusLayout
             .GroupBy(x => x.Key, x => x.Row, StringComparer.Ordinal);
         foreach (IGrouping<string, StatusRow> group in groups)
         {
-            List<StatusRow> members = [.. group.OrderBy(r => Round(r))];
-            if (members.Count is 1 || IsChain(members))
+            List<StatusRow> all = [.. group.OrderBy(r => Round(r))];
+            List<StatusRow> members = all.Count is 1 ? [] : Members(all);
+            HashSet<StatusRow> chained = new(ReferenceEqualityComparer.Instance);
+            if (members.Count > 1)
             {
+                chained.UnionWith(members);
                 yield return members;
-                continue;
             }
 
-            foreach (StatusRow alone in members)
+            foreach (StatusRow alone in all.Where(r => !chained.Contains(r)))
             {
                 yield return [alone];
             }
         }
     }
 
-    private static bool IsChain(List<StatusRow> members)
+    /// <summary>
+    /// The rows of <paramref name="claims"/> (one chain id, in round order) that are the chain: its
+    /// first run and the rows launched by that run's launcher, when their round numbers are
+    /// distinct; empty when they are no chain.
+    /// </summary>
+    private static List<StatusRow> Members(List<StatusRow> claims)
     {
-        string? id = ChainId(members[0]);
-        return members.Exists(m => string.Equals(m.RunId, id, StringComparison.Ordinal))
-               && new HashSet<long>(members.Select(r => Round(r))).Count == members.Count;
+        string? id = ChainId(claims[0]);
+        if (claims.Find(m => string.Equals(m.RunId, id, StringComparison.Ordinal)) is not { } first || LauncherIdentity(first) is not { } launcher)
+        {
+            return [];
+        }
+
+        List<StatusRow> members = [.. claims.Where(r => string.Equals(LauncherIdentity(r), launcher, StringComparison.Ordinal))];
+        return new HashSet<long>(members.Select(r => Round(r))).Count == members.Count ? members : [];
+    }
+
+    /// <summary>
+    /// The launcher identity a row proves: pid, start ticks and boot id of its status file, which
+    /// the pointer it was read through (if any) must give too; null when either lacks one.
+    /// </summary>
+    private static string? LauncherIdentity(StatusRow r)
+    {
+        string? own = Identity(r.Status?["launcher"] as JsonObject);
+        return r.PointerLauncher is null || string.Equals(Identity(r.PointerLauncher), own, StringComparison.Ordinal) ? own : null;
+    }
+
+    private static string? Identity(JsonObject? launcher)
+    {
+        long? pid = StatusProbe.NumOrNull(launcher?["pid"]);
+        long? ticks = StatusProbe.NumOrNull(launcher?["start_ticks"]);
+        string? boot = Json.Str(launcher, "boot_id");
+        return pid is > 0 && ticks is { } t && boot is { Length: > 0 }
+            ? string.Create(CultureInfo.InvariantCulture, $"{pid}/{t}/{boot}")
+            : null;
     }
 
     private static StatusRow Derive(StatusRow m, StatusRow latest, string? chainId, int count, StatusReader reader, DateTimeOffset now)

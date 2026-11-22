@@ -66,6 +66,29 @@ internal sealed class ProcFs(string root)
     }
 
     /// <summary>
+    /// The signals this process ignores: the <c>SigIgn</c> mask of <c>self/status</c>, bit
+    /// <c>n - 1</c> for signal number <c>n</c>; null when the file or the line cannot be read.
+    /// </summary>
+    public ulong? IgnoredSignals()
+    {
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(Path.Combine(Root, "self", "status"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+
+        const string Field = "SigIgn:";
+        string? line = Array.Find(lines, l => l.StartsWith(Field, StringComparison.Ordinal));
+        return line is not null && ulong.TryParse(line.AsSpan(Field.Length).Trim(), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out ulong mask)
+            ? mask
+            : null;
+    }
+
+    /// <summary>
     /// Whether some live process (not a zombie) is in group <paramref name="pgid"/> and session
     /// <paramref name="sid"/>. True when one is found; false when the scan read every entry and
     /// found none; null when the scan could not tell (the listing or an entry could not be read).

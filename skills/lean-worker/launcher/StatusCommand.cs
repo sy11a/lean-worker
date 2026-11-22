@@ -188,13 +188,14 @@ internal static class StatusCommand
     private const string ListingStopped = "the listing stopped at an entry that did not answer in time";
 
     /// <summary>
-    /// The listing: a gate chain is one row (its latest round), --since hides old ended rows, the
+    /// The listing: a gate chain is one row (its worst round), --since hides old ended rows, the
     /// rows go in display order with nested runs right after their parent; --json keeps every round.
     /// </summary>
     private static async Task PrintAsync(TextWriter output, bool json, Listing listing, StatusReader reader, DateTimeOffset now, string sinceText)
     {
         StatusLayout.View view = StatusLayout.Chains(listing.Rows, reader, now);
-        List<StatusRow> shown = listing.Since is { } window ? [.. view.Rows.Where(r => Shown(r, now - window))] : view.Rows;
+        // A chain is hidden only when every one of its rounds would be: never while one is live or needs to be seen.
+        List<StatusRow> shown = listing.Since is { } window ? [.. view.Rows.Where(r => view.Rounds[r].Exists(m => Shown(m, now - window)))] : view.Rows;
         int hidden = view.Rows.Count - shown.Count;
         List<(StatusRow Row, int Depth)> nested = StatusLayout.Nest(StatusText.Order(shown), view.ByRunId);
         if (json)

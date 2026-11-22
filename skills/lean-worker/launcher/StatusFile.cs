@@ -62,6 +62,29 @@ internal static class StatusFile
     public static bool IsLink(string path) => new FileInfo(Path.TrimEndingDirectorySeparator(path)).LinkTarget is not null;
 
     /// <summary>
+    /// Whether an entry is at <paramref name="path"/> (an lstat, not followed): true when there is
+    /// one, false only when the path provably names nothing (ENOENT, or a part of it that is no
+    /// directory), null when the lstat failed otherwise (a permission, an I/O error). Unlike
+    /// <see cref="FileSystemInfo.Exists"/>, which is false for every failure.
+    /// </summary>
+    public static bool? Exists(string path)
+    {
+        try
+        {
+            // An lstat whose ENOENT and ENOTDIR give -1 and whose other errors throw.
+            return (int)new FileInfo(Path.TrimEndingDirectorySeparator(path)).Attributes is not -1;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// The bytes of the regular file at <paramref name="path"/>, or why it is not read, with a
     /// budget of its own (<see cref="ReadBudget.Default"/>).
     /// </summary>
