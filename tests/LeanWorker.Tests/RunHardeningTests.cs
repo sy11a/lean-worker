@@ -89,6 +89,7 @@ public sealed class RunHardeningTests : IDisposable
         string oldCwd = Directory.GetCurrentDirectory();
         string cwd = _dirs.Create("lw-cwd");
         TextWriter oldOut = Console.Out;
+        using StateDirScope state = new();
         await using StringWriter outWriter = new();
         try
         {

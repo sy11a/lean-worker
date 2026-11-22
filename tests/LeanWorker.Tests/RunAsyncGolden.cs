@@ -58,10 +58,10 @@ internal static partial class RunAsyncGolden
 
     public static string SystemPath(string root) => Path.Combine(root, "system", $"{Sha12(Notes)}.md");
 
-    private static string Stub(string script)
+    private static string Stub(string script, string name = "claude")
     {
         string dir = Directory.CreateTempSubdirectory("lw-stub").FullName;
-        string path = Path.Combine(dir, "claude");
+        string path = Path.Combine(dir, name);
         File.WriteAllText(path, "#!/bin/sh\ncat >/dev/null\n" + script);
         if (!OperatingSystem.IsWindows())
         {
@@ -99,11 +99,17 @@ internal static partial class RunAsyncGolden
     }
 
     /// <summary>
-    /// Runs RunAsync with the stub on PATH; returns the exit code and stdout, or rethrows what RunAsync throws.
+    /// Runs RunAsync with the stub on PATH; returns the exit code and stdout, or rethrows what RunAsync throws. The
+    /// run index points at <paramref name="stateDir"/> (LEAN_WORKER_STATE_DIR) or, without one, at a temp directory
+    /// of this call. <paramref name="environment"/> sets (or, with a null value, removes) more variables for the
+    /// call, after the index folder is set, so a test can move or remove the index variable too;
+    /// <paramref name="stubName"/> is the executable the script is written as (claude, or opencode).
     /// </summary>
     public static async Task<(int Code, string Stdout)> RunAsync(string root, string script, Action<Options>? configure = null, string? apiKey = "dummy-test-key",
-        GateContext? gateContext = null)
+        GateContext? gateContext = null, string? stateDir = null, (string Name, string? Value)[]? environment = null, string stubName = "claude")
     {
+        using StateDirScope state = new(stateDir);
+        using EnvScope extra = new(environment ?? []);
         string? oldPath = Environment.GetEnvironmentVariable("PATH");
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
         string oldCwd = Directory.GetCurrentDirectory();
@@ -112,7 +118,7 @@ internal static partial class RunAsyncGolden
         TextWriter oldOut = Console.Out;
         try
         {
-            Environment.SetEnvironmentVariable("PATH", Stub(script) + Path.PathSeparator + oldPath);
+            Environment.SetEnvironmentVariable("PATH", Stub(script, stubName) + Path.PathSeparator + oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", apiKey);
             Directory.SetCurrentDirectory(cleanCwd);
             Console.SetOut(outWriter);

@@ -146,6 +146,7 @@ public class WorkspaceRootTests
             string? oldPath = Environment.GetEnvironmentVariable("PATH");
             string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
             string oldCwd = Directory.GetCurrentDirectory();
+            using StateDirScope state = new();
             try
             {
                 Environment.SetEnvironmentVariable("PATH", stubDir + Path.PathSeparator + oldPath);
@@ -202,6 +203,7 @@ public class WorkspaceRootTests
             string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
             string oldCwd = Directory.GetCurrentDirectory();
             int code;
+            using StateDirScope state = new();
             await using StringWriter outWriter = new();
             TextWriter oldOut = Console.Out;
             try
@@ -525,6 +527,7 @@ public class WorkspaceRootTests
         string? oldPath = Environment.GetEnvironmentVariable("PATH");
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
         string oldCwd = Directory.GetCurrentDirectory();
+        using StateDirScope state = new();
         await using StringWriter outWriter = new();
         TextWriter oldOut = Console.Out;
         try

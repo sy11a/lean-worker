@@ -30,6 +30,7 @@ public class OpencodeScratchDirectoryTests
     {
         _ = Directory.CreateDirectory(runsRoot);
         await File.WriteAllTextAsync(Path.Combine(runsRoot, "project.md"), "notes", TestContext.Current.CancellationToken);
+        using StateDirScope state = new();
         string? oldPath = Environment.GetEnvironmentVariable("PATH");
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
         string oldCwd = Directory.GetCurrentDirectory();

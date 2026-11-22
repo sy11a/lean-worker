@@ -29,9 +29,13 @@ public sealed class RunStatusLaunchTests : IDisposable
     private readonly TempDirs _dirs = new();
     private readonly string? _oldKillSwitch = Environment.GetEnvironmentVariable(RunStatus.KillSwitch);
 
+    // No owner variable of the machine's own session reaches a launch of this class.
+    private readonly EnvScope _env = EnvScope.Clean();
+
     public void Dispose()
     {
         Environment.SetEnvironmentVariable(RunStatus.KillSwitch, _oldKillSwitch);
+        _env.Dispose();
         _dirs.Dispose();
     }
 
@@ -63,7 +67,11 @@ public sealed class RunStatusLaunchTests : IDisposable
         Assert.Equal("claude-haiku-4-5", status["spec"]!["model"]!.GetValue<string>());
         Assert.Equal(Environment.ProcessId, status["launcher"]!["pid"]!.GetValue<int>());
         Assert.True(status["worker"]!["pid"]!.GetValue<int>() > 0);
-        Assert.Null(status["owner"]);
+        // Train 2: the owner is captured at launch; with no owner variable and no --owner it is the "none" owner.
+        JsonObject owner = status["owner"]!.AsObject();
+        Assert.Equal("none", owner["source"]!.GetValue<string>());
+        Assert.Empty(owner["keys"]!.AsArray());
+        Assert.Null(status["run"]!["parent_run"]);
     }
 
     [Fact]
@@ -178,6 +186,7 @@ public sealed class RunStatusLaunchTests : IDisposable
     {
         Environment.SetEnvironmentVariable(RunStatus.KillSwitch, value: null);
         string runDir = _dirs.Create("lw-open");
+        using StateDirScope state = new();
 
         RunStatus? status = Open(runDir);
 
@@ -186,6 +195,8 @@ public sealed class RunStatusLaunchTests : IDisposable
         Assert.Equal("starting", doc["phase"]!.GetValue<string>());
         Assert.Equal(1, doc["seq"]!.GetValue<long>());
         Assert.Equal(Environment.ProcessId, doc["launcher"]!["pid"]!.GetValue<int>());
+        // Open registers the signal handler; the run's last write unregisters it.
+        status.Finish("success", 0);
     }
 
     [Fact]
@@ -193,6 +204,7 @@ public sealed class RunStatusLaunchTests : IDisposable
     {
         Environment.SetEnvironmentVariable(RunStatus.KillSwitch, "off");
         string runDir = _dirs.Create("lw-open");
+        using StateDirScope state = new();
 
         RunStatus? status = Open(runDir);
 

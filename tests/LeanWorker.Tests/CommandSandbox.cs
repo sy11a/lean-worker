@@ -8,7 +8,7 @@ namespace LeanWorker.Tests;
 /// </summary>
 internal sealed class CommandSandbox : IDisposable
 {
-    private static readonly string[] _vars = ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR", "PATH"];
+    private static readonly string[] _vars = ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR", "PATH", StateDirScope.Variable];
     private readonly Dictionary<string, string?> _old = new(StringComparer.Ordinal);
 
     public CommandSandbox()
@@ -34,9 +34,16 @@ internal sealed class CommandSandbox : IDisposable
         Environment.SetEnvironmentVariable("XDG_DATA_HOME", Path.Combine(Root, "data"));
         Environment.SetEnvironmentVariable("CLAUDE_CONFIG_DIR", ClaudeConfigDir);
         Environment.SetEnvironmentVariable("PATH", BinDir + Path.PathSeparator + _old["PATH"]);
+        // The launcher's per-user run index of anything started in here is this sandbox's, never ~/.local/state.
+        Environment.SetEnvironmentVariable(StateDirScope.Variable, StateDir);
     }
 
     public string Root { get; }
+
+    /// <summary>
+    /// LEAN_WORKER_STATE_DIR while the sandbox lives: the launcher's run index is <c>&lt;it&gt;/runs</c>.
+    /// </summary>
+    public string StateDir => Path.Combine(Root, "state");
 
     public string RunsRoot { get; }
 
