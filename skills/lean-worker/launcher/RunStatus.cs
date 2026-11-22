@@ -279,8 +279,15 @@ internal sealed class RunStatus
                 ["at"] = Stamp(_clock.GetUtcNow()),
                 ["signal"] = StatusSignals.Name(signal),
             };
-            WriteLocked();
-            return true;
+            // Asked again at the last point before the file is replaced: a write that stalled anywhere
+            // until the handler gave up publishes nothing, and the state is the one before the signal.
+            if (WriteLocked(() => !abandoned()))
+            {
+                return true;
+            }
+
+            SurvivedSignal();
+            return false;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
@@ -666,14 +673,28 @@ internal sealed class RunStatus
     }
 
     // A failure here propagates to BestEffort, which leaves the note.
-    private void WriteLocked()
+    private void WriteLocked() => _ = WriteLocked(static () => true);
+
+    /// <summary>
+    /// The write, published only while <paramref name="publish"/> says so at the last point before the
+    /// file is replaced. When it says no, the file and the write's own state (seq, shown counters, last
+    /// write time) stay as they were. True when the file was replaced.
+    /// </summary>
+    private bool WriteLocked(Func<bool> publish)
     {
+        (long seq, string? shown, long lastWrite) = (_seq, _shown, _lastWriteTimestamp);
         _seq++;
         JsonObject counters = Counters();
         _shown = counters.ToJsonString();
         JsonObject doc = Build(counters);
         _lastWriteTimestamp = _clock.GetTimestamp();
-        Launcher.WritePlain(_path, doc.ToJsonString(Json.Indented));
+        if (Launcher.WritePlain(_path, doc.ToJsonString(Json.Indented), publish))
+        {
+            return true;
+        }
+
+        (_seq, _shown, _lastWriteTimestamp) = (seq, shown, lastWrite);
+        return false;
     }
 
     /// <summary>

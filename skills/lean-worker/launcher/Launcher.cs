@@ -292,13 +292,26 @@ internal static class Launcher
     /// The synchronous twin of <see cref="WritePlainAsync"/> (temp sibling plus rename), for the
     /// stream thread's status writes.
     /// </summary>
-    internal static void WritePlain(string path, string content)
+    internal static void WritePlain(string path, string content) => _ = WritePlain(path, content, static () => true);
+
+    /// <summary>
+    /// <see cref="WritePlain(string, string)"/>, but <paramref name="publish"/> is asked after the temp
+    /// file is written, immediately before the rename: when it says no, the temp file is removed and
+    /// <paramref name="path"/> stays as it was. True when the file was replaced.
+    /// </summary>
+    internal static bool WritePlain(string path, string content, Func<bool> publish)
     {
         string temp = TempSibling(path);
         try
         {
             File.WriteAllText(temp, content, Json.Utf8);
+            if (!publish())
+            {
+                return false;
+            }
+
             File.Move(temp, path, overwrite: true);
+            return true;
         }
         finally
         {
