@@ -7,7 +7,8 @@ namespace LeanWorker.Tests;
 /// <summary>
 /// What the `status` output must never carry, written out from the list the sanitiser promises (and
 /// not taken from the sanitiser): the C0 controls, DEL, the C1 controls, U+2028, U+2029, the bidi
-/// controls and a lone surrogate.
+/// controls (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069), the invisible format
+/// characters (U+200B to U+200D, U+2060, U+FEFF) and a lone surrogate.
 /// </summary>
 internal static class TerminalAssert
 {
@@ -16,8 +17,8 @@ internal static class TerminalAssert
     /// </summary>
     public static bool IsListedUnsafe(int code)
     {
-        return code is <= 0x1F or (>= 0x7F and <= 0x9F) or 0x2028 or 0x2029 or 0x200E or 0x200F
-            or (>= 0x202A and <= 0x202E) or (>= 0x2066 and <= 0x2069) or (>= 0xD800 and <= 0xDFFF);
+        return code is <= 0x1F or (>= 0x7F and <= 0x9F) or 0x2028 or 0x2029 or 0x061C or 0x200B or 0x200C or 0x200D or 0x200E or 0x200F
+            or (>= 0x202A and <= 0x202E) or 0x2060 or (>= 0x2066 and <= 0x2069) or 0xFEFF or (>= 0xD800 and <= 0xDFFF);
     }
 
     /// <summary>

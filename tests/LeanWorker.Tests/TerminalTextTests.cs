@@ -4,7 +4,8 @@ namespace LeanWorker.Tests;
 
 /// <summary>
 /// The sanitiser of the `status` output, against the list it promises: every C0 control, DEL, every C1
-/// control, U+2028, U+2029, the bidi controls and a lone surrogate become `?`; a cell longer than its
+/// control, U+2028, U+2029, the bidi controls, the invisible format characters (U+200B to U+200D,
+/// U+2060, U+FEFF) and a lone surrogate become `?`; a cell longer than its
 /// limit is cut with a trailing `~` and never splits a surrogate pair; ordinary text passes unchanged.
 /// </summary>
 public sealed class TerminalTextTests
@@ -25,9 +26,25 @@ public sealed class TerminalTextTests
     {
         int[] codes = _unsafeList;
 
-        int[] ends = [0x00, 0x1F, 0x7F, 0x80, 0x9F, 0x2028, 0x2029, 0x200E, 0x200F, 0x202A, 0x202E, 0x2066, 0x2069];
+        int[] ends = [0x00, 0x1F, 0x7F, 0x80, 0x9F, 0x061C, 0x200B, 0x200D, 0x2028, 0x2029, 0x200E, 0x200F, 0x202A, 0x202E, 0x2060, 0x2066, 0x2069, 0xFEFF];
         Assert.All(ends, e => Assert.Contains(e, codes));
-        Assert.Equal(32 + 33 + 2 + 2 + 5 + 4, codes.Length);
+        Assert.Equal(32 + 33 + 2 + 5 + 5 + 1 + 1 + 4 + 1, codes.Length);
+    }
+
+    [Theory]
+    [InlineData(0x061C)]
+    [InlineData(0x200B)]
+    [InlineData(0x200C)]
+    [InlineData(0x200D)]
+    [InlineData(0x2060)]
+    [InlineData(0xFEFF)]
+    public void An_invisible_format_character_becomes_a_question_mark_inside_a_longer_text(int code)
+    {
+        string c = ((char)code).ToString();
+
+        Assert.Equal("ev?il", TerminalText.Clean("ev" + c + "il", Wide));
+        Assert.Equal("??ab?", TerminalText.Clean(c + c + "ab" + c, Wide));
+        Assert.Equal("a?b~", TerminalText.Clean("a" + c + "bcd", 4));
     }
 
     [Theory]
@@ -47,14 +64,18 @@ public sealed class TerminalTextTests
     [InlineData(0xA0)]
     [InlineData(0xA1)]
     [InlineData(0xE9)]
-    [InlineData(0x200B)]
-    [InlineData(0x200D)]
+    [InlineData(0x061B)]
+    [InlineData(0x061D)]
+    [InlineData(0x200A)]
     [InlineData(0x2027)]
     [InlineData(0x202F)]
+    [InlineData(0x205F)]
+    [InlineData(0x2061)]
     [InlineData(0x2065)]
     [InlineData(0x206A)]
     [InlineData(0x3042)]
-    [InlineData(0xFEFF)]
+    [InlineData(0xFEFE)]
+    [InlineData(0xFF00)]
     public void A_character_next_to_a_listed_range_is_left_alone(int code)
     {
         string c = ((char)code).ToString();
