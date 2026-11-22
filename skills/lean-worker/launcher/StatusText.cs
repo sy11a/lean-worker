@@ -67,19 +67,41 @@ internal static class StatusText
     internal const int ScopeLimit = 300;
 
     /// <summary>
+    /// The longest OWNER cell (a key's short form).
+    /// </summary>
+    internal const int OwnerLimit = 40;
+
+    /// <summary>
     /// The run lines, the columns padded to the widest value. Every cell passes through
     /// <see cref="TerminalText.Clean"/> with its column's limit, so one run stays one line whatever
-    /// its files hold.
+    /// its files hold. A nested row's name is indented two spaces per level (<see cref="StatusRow.Depth"/>);
+    /// with <paramref name="ownerColumn"/> an OWNER cell (the run's first owner key, short) follows the name.
     /// </summary>
-    public static List<string> Lines(IReadOnlyList<StatusRow> rows, DateTimeOffset now)
+    public static List<string> Lines(IReadOnlyList<StatusRow> rows, DateTimeOffset now, bool ownerColumn = false)
     {
-        List<string[]> cells = [.. rows.Select(r => Cells(r, now).Select((cell, c) => TerminalText.Clean(cell, CellLimits[c])).ToArray())];
+        List<string[]> cells = [.. rows.Select(r => RowCells(r, now, ownerColumn))];
         int columns = cells.Count > 0 ? cells[0].Length : 0;
         int[] widths = [.. Enumerable.Range(0, columns).Select(c => cells.Max(row => row[c].Length))];
-        return [.. cells.Select(row => string.Join("  ", row.Select((cell, c) => Pad(cell, widths[c], c))).TrimEnd())];
+        int shift = ownerColumn ? 1 : 0;
+        return [.. cells.Select(row => string.Join("  ", row.Select((cell, c) => Pad(cell, widths[c], c - shift))).TrimEnd())];
     }
 
-    // Numbers right-aligned (calls, cost, elapsed); text left-aligned; the detail is last and not padded.
+    private static string[] RowCells(StatusRow r, DateTimeOffset now, bool ownerColumn)
+    {
+        string[] cells = [.. Cells(r, now).Select((cell, c) => TerminalText.Clean(cell, CellLimits[c]))];
+        cells[1] = new string(' ', 2 * Math.Clamp(r.Depth, 0, StatusLayout.MaxDepth)) + cells[1];
+        if (!ownerColumn)
+        {
+            return cells;
+        }
+
+        string owner = r.OwnerKey is { } key ? TerminalText.Clean(OwnerKeys.Short(key), OwnerLimit) : "-";
+        return [cells[0], cells[1], owner, .. cells[2..]];
+    }
+
+    // Numbers right-aligned (calls, cost, elapsed); text left-aligned; the detail is last and not
+    // padded. The column is counted without the OWNER column: every column before the numbers is
+    // text, so shifting them by one keeps them left-aligned.
     private static string Pad(string cell, int width, int column)
     {
         return column switch
@@ -107,9 +129,13 @@ internal static class StatusText
 
     private static string StateText(StatusRow r, JsonObject? live)
     {
-        return r.State is StatusStates.Gate && StatusProbe.NumOrNull(live?["gate_round"]) is { } round
-            ? "gate r" + round.ToString(_ic)
-            : r.State;
+        if (r.State is not StatusStates.Gate || StatusProbe.NumOrNull(live?["gate_round"]) is not { } round)
+        {
+            return r.State;
+        }
+
+        string max = StatusProbe.NumOrNull(live?["gate_max_rounds"]) is { } m ? "/" + m.ToString(_ic) : string.Empty;
+        return "gate r" + round.ToString(_ic) + max;
     }
 
     /// <summary>
@@ -187,9 +213,9 @@ internal static class StatusText
             return Json.Bool(end, "after_summary") ? $"(after summary: {Json.Str(end, "summary_status")}) {error}" : error;
         }
 
-        if (Json.Str(end, "status") is "launcher-signalled")
+        if (Json.Str(end, "status") is RunStatus.LauncherSignalled)
         {
-            return "(signalled)";
+            return Json.Str(end, "signal") is { } signal ? "(signalled, " + signal + ")" : "(signalled)";
         }
 
         string turns = StatusProbe.NumOrNull((doc["live"] as JsonObject)?["turns"]) is { } t ? ", " + t.ToString(_ic) + " turns" : string.Empty;
@@ -200,14 +226,30 @@ internal static class StatusText
     /// The --json document: each run its status.json content (or the directory-only fields) plus
     /// the derived state, liveness and detail.
     /// </summary>
-    public static JsonObject Document(IEnumerable<StatusRow> rows, DateTimeOffset now)
+    public static JsonObject Document(IEnumerable<StatusRow> rows, DateTimeOffset now) => Document(rows, now, scope: null, caller: null);
+
+    /// <summary>
+    /// The --json document with the listing's scope and, for an owner scope, the caller's keys.
+    /// </summary>
+    public static JsonObject Document(IEnumerable<StatusRow> rows, DateTimeOffset now, string? scope, JsonObject? caller)
     {
-        return new JsonObject
+        JsonObject doc = new()
         {
             ["schema"] = ListSchema,
             ["generated_at"] = RunStatus.Stamp(now),
-            ["runs"] = new JsonArray([.. rows.Select(r => (JsonNode)RowJson(r))]),
         };
+        if (scope is not null)
+        {
+            doc["scope"] = scope;
+        }
+
+        if (caller is not null)
+        {
+            doc["caller"] = caller;
+        }
+
+        doc["runs"] = new JsonArray([.. rows.Select(r => (JsonNode)RowJson(r))]);
+        return doc;
     }
 
     private static JsonObject RowJson(StatusRow r)
@@ -228,7 +270,32 @@ internal static class StatusText
             o["quiet_ms"] = (long)Clamp(q).TotalMilliseconds;
         }
 
+        AddListingFields(o, r);
         return o;
+    }
+
+    /// <summary>
+    /// The fields the listing adds to a row: its gate chain, its nesting level, the index pointer it
+    /// was read through; each only when there is one.
+    /// </summary>
+    private static void AddListingFields(JsonObject o, StatusRow r)
+    {
+        if (r.Chain is { } chain)
+        {
+            o["chain"] = chain.DeepClone();
+        }
+
+        if (r.Depth > 0)
+        {
+            o["depth"] = r.Depth;
+        }
+
+        if (r.Pointer is not { } pointer)
+        {
+            return;
+        }
+
+        o["pointer"] = pointer;
     }
 
     /// <summary>

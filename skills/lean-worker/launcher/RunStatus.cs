@@ -5,12 +5,16 @@
 // inside it, so no older object is published after a newer one.
 //
 // Best effort: a failed write never fails or changes the run. The first failure leaves one note
-// for the summary; later writes are still tried. LEAN_WORKER_STATUS=off turns the writer off.
+// for the summary; later writes are still tried. LEAN_WORKER_STATUS=off turns the writer off, and
+// with it the run's pointer in the per-user index (StatusIndex, written once after the first
+// status.json) and the record-only signal handler (StatusSignals). The owner (OwnerKeys) is
+// resolved once at the start and recorded in both files.
 //
 // The file is trusted for display only: no verdict, no ledger field and no exit code is read
 // from it (docs/research/live-status/README.md, section 4.1).
 
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -32,6 +36,18 @@ internal sealed class RunStatus
     public const string LaunchFailed = "launch-failed";
 
     /// <summary>
+    /// The end status of a launcher that got SIGTERM, SIGINT or SIGHUP (not a ledger status).
+    /// </summary>
+    public const string LauncherSignalled = "launcher-signalled";
+
+    /// <summary>
+    /// How long the signal handler waits for a status write in progress before it gives up: the
+    /// signal's default action follows either way, so the handler never holds the launcher's end
+    /// up for longer than this plus its own write.
+    /// </summary>
+    internal static readonly TimeSpan SignalLockWait = TimeSpan.FromSeconds(1);
+
+    /// <summary>
     /// A stream line that changes nothing displayed still refreshes the file when the last write is
     /// this old, so <c>last_event_at</c> does not lag a long-streaming step by more than this.
     /// </summary>
@@ -51,6 +67,10 @@ internal sealed class RunStatus
     private readonly long _startTimestamp;
     private readonly string _path;
     private readonly JsonObject _launcher;
+    private readonly int _launcherPid;
+    private RunOwner? _owner;
+    private StatusSignals? _signals;
+    private int? _gateMaxRounds;
     private JsonObject? _worker;
     private Meter? _meter;
     private Outcome? _outcome;
@@ -79,6 +99,7 @@ internal sealed class RunStatus
         _startTimestamp = clock.GetTimestamp();
         _lastWriteTimestamp = _startTimestamp;
         _path = Path.Combine(spec.RunDir, FileName);
+        _launcherPid = launcherPid;
         _launcher = new JsonObject { ["pid"] = launcherPid, ["start_ticks"] = null, ["boot_id"] = null };
         BestEffort(() =>
         {
@@ -112,21 +133,155 @@ internal sealed class RunStatus
     /// <summary>
     /// The writer of a launch, from what the run records at its start: null when
     /// <see cref="KillSwitch"/> is off. The first write (<c>phase: starting</c>) happens here,
-    /// right after the run dir exists.
+    /// right after the run dir exists, then the pointer in the per-user index; from here until
+    /// the run's last status write, SIGTERM, SIGINT and SIGHUP are recorded. <paramref name="owner"/>
+    /// is the launch's --owner key (already checked), if any.
     /// </summary>
     public static RunStatus? Open(string runDir, string name, string chainId, int round, string? profile, string runtime,
-        string provider, string model, decimal budgetUsd, decimal? wrapUpUsd, int timeoutMinutes, DateTimeOffset startedAt, string? worktree)
+        string provider, string model, decimal budgetUsd, decimal? wrapUpUsd, int timeoutMinutes, DateTimeOffset startedAt, string? worktree,
+        string? owner = null)
     {
-        if (!Enabled(Environment.GetEnvironmentVariable(KillSwitch)))
+        RunStatusSpec spec = new(runDir, name, chainId, round, profile, runtime, provider, model, budgetUsd, wrapUpUsd,
+            timeoutMinutes, startedAt, worktree);
+        return Open(spec, owner, variable => Environment.GetEnvironmentVariable(variable), ProcFs.Host, TimeProvider.System, Environment.ProcessId, handleSignals: true);
+    }
+
+    /// <summary>
+    /// <see cref="Open(string, string, string, int, string?, string, string, string, decimal, decimal?, int, DateTimeOffset, string?, string?)"/>
+    /// with its inputs: the environment (the kill switch, the owner variables, the index folder),
+    /// /proc, the clock, the launcher's pid and whether the signal handler is registered.
+    /// </summary>
+    internal static RunStatus? Open(RunStatusSpec spec, string? owner, Func<string, string?> env, ProcFs proc, TimeProvider clock,
+        int launcherPid, bool handleSignals)
+    {
+        if (!Enabled(env(KillSwitch)))
         {
             return null;
         }
 
-        RunStatusSpec spec = new(runDir, name, chainId, round, profile, runtime, provider, model, budgetUsd, wrapUpUsd,
-            timeoutMinutes, startedAt, worktree);
-        RunStatus status = new(spec, ProcFs.Host, TimeProvider.System, Environment.ProcessId);
+        RunStatus status = new(spec, proc, clock, launcherPid);
+        status.BestEffort(() => status.Own(OwnerKeys.AtLaunch(owner, env, proc)));
         status.Phase(RunPhase.Starting);
+        status.WritePointer(StatusIndex.Folder(env));
+        if (handleSignals)
+        {
+            status.HandleSignals();
+        }
+
         return status;
+    }
+
+    /// <summary>
+    /// The owner the status file and the pointer record.
+    /// </summary>
+    internal void Own(RunOwner owner)
+    {
+        lock (_lock)
+        {
+            _owner = owner;
+        }
+    }
+
+    /// <summary>
+    /// Writes the run's pointer into the index folder <paramref name="folder"/> (null: none could
+    /// be found), once; a failure is a status failure like any other (one note, the run goes on).
+    /// </summary>
+    internal void WritePointer(string? folder) => BestEffort(() => RecordPointer(folder), "the run index pointer");
+
+    private void RecordPointer(string? folder)
+    {
+        if (folder is null)
+        {
+            throw new IOException("no folder for it: HOME, XDG_STATE_HOME and LEAN_WORKER_STATE_DIR give no absolute path");
+        }
+
+        JsonObject pointer;
+        string fileName;
+        lock (_lock)
+        {
+            RunOwner owner = _owner ?? RunOwner.None;
+            pointer = StatusIndex.Pointer(_clock.GetUtcNow(), Path.GetFullPath(_spec.RunDir), _spec.ChainId, owner.ParentRun, owner.Keys,
+                _launcher.DeepClone().AsObject());
+            fileName = StatusIndex.FileName(_spec.StartedAt, _launcherPid, _spec.Round);
+        }
+
+        _ = StatusIndex.Write(folder, fileName, pointer);
+    }
+
+    /// <summary>
+    /// Registers the record-only signal handler (<see cref="Signalled"/>) until the run's last write.
+    /// </summary>
+    internal void HandleSignals()
+    {
+        BestEffort(() =>
+        {
+            StatusSignals signals = StatusSignals.Register(signal => _ = Signalled(signal));
+            lock (_lock)
+            {
+                _signals = signals;
+            }
+        });
+    }
+
+    /// <summary>
+    /// The launcher got <paramref name="signal"/>: unless the run already has its end, the file
+    /// gets <c>phase: failed</c> and <c>end.status: launcher-signalled</c> with the signal's name.
+    /// The lock is waited for at most <see cref="SignalLockWait"/>: a write in progress that holds
+    /// it longer (a blocked disk) makes the handler give up, so it can never deadlock with the
+    /// writer, and the signal's default action follows either way. True when it was recorded.
+    /// </summary>
+    internal bool Signalled(PosixSignal signal)
+    {
+        if (!Monitor.TryEnter(_lock, SignalLockWait))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (_end is not null)
+            {
+                return false;
+            }
+
+            _phase = RunPhase.Failed;
+            _gateRound = null;
+            _end = new JsonObject
+            {
+                ["status"] = LauncherSignalled,
+                ["exit_code"] = null,
+                ["at"] = Stamp(_clock.GetUtcNow()),
+                ["signal"] = StatusSignals.Name(signal),
+            };
+            WriteLocked();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            // The lock is held here, so the note is set without waiting for it again.
+            _note ??= $"status.json could not be updated ({ex.GetType().Name}); the run itself is not affected";
+            return false;
+        }
+        finally
+        {
+            Monitor.Exit(_lock);
+        }
+    }
+
+    /// <summary>
+    /// Ends the signal handler: the run's last write is done.
+    /// </summary>
+    private void StopSignals()
+    {
+        StatusSignals? signals;
+        lock (_lock)
+        {
+            signals = _signals;
+            _signals = null;
+        }
+
+        // Outside the lock: a handler waiting for it is never waited on here.
+        signals?.Dispose();
     }
 
     /// <summary>
@@ -218,6 +373,22 @@ internal sealed class RunStatus
     public void GateStarted(int round) => Phase(RunPhase.Gate, round);
 
     /// <summary>
+    /// The gate of round <paramref name="round"/> of at most <paramref name="maxRounds"/> runs.
+    /// </summary>
+    public void GateStarted(int round, int maxRounds)
+    {
+        BestEffort(() =>
+        {
+            lock (_lock)
+            {
+                _gateMaxRounds = maxRounds;
+            }
+
+            RecordPhase(RunPhase.Gate, round);
+        });
+    }
+
+    /// <summary>
     /// The launcher decides the worktree, computes the stats and writes the summary.
     /// </summary>
     public void Finishing() => Phase(RunPhase.Finishing);
@@ -241,7 +412,11 @@ internal sealed class RunStatus
     /// The run is done: summary, report and ledger row are written. <paramref name="status"/> is the
     /// ledger's status, <paramref name="exitCode"/> the launcher's exit code for this round.
     /// </summary>
-    public void Finish(string status, int exitCode) => BestEffort(() => RecordFinish(status, exitCode));
+    public void Finish(string status, int exitCode)
+    {
+        BestEffort(() => RecordFinish(status, exitCode));
+        BestEffort(() => StopSignals());
+    }
 
     private void RecordFinish(string status, int exitCode)
     {
@@ -266,7 +441,11 @@ internal sealed class RunStatus
     /// written, else null. Like every write it never throws: the caller's exception stays the one
     /// that propagates.
     /// </summary>
-    public void Fail(string message, string? summaryStatus) => BestEffort(() => RecordFailure(message, summaryStatus));
+    public void Fail(string message, string? summaryStatus)
+    {
+        BestEffort(() => RecordFailure(message, summaryStatus));
+        BestEffort(() => StopSignals());
+    }
 
     private void RecordFailure(string message, string? summaryStatus)
     {
@@ -298,7 +477,7 @@ internal sealed class RunStatus
     /// a public method of the writer, so the stream pump, the Meter and the launcher's own paths
     /// see the run exactly as with the writer off.
     /// </summary>
-    private void BestEffort(Action update)
+    private void BestEffort(Action update, string what = FileName)
     {
         try
         {
@@ -308,7 +487,7 @@ internal sealed class RunStatus
         {
             lock (_lock)
             {
-                _note ??= $"status.json could not be written ({ex.Message}); the run itself is not affected";
+                _note ??= $"{what} could not be written ({ex.Message}); the run itself is not affected";
             }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
@@ -316,7 +495,7 @@ internal sealed class RunStatus
             // The type only: the message of a parse or format failure can carry the stream's content.
             lock (_lock)
             {
-                _note ??= $"status.json could not be updated ({ex.GetType().Name}); the run itself is not affected";
+                _note ??= $"{what} could not be updated ({ex.GetType().Name}); the run itself is not affected";
             }
         }
     }
@@ -471,6 +650,11 @@ internal sealed class RunStatus
         live["elapsed_ms"] = (long)_clock.GetElapsedTime(_startTimestamp).TotalMilliseconds;
         live["last_event_at"] = _lastEventAt is { } at ? Stamp(at) : null;
         live["gate_round"] = _gateRound;
+        if (_gateMaxRounds is { } maxRounds)
+        {
+            live["gate_max_rounds"] = maxRounds;
+        }
+
         return new JsonObject
         {
             ["schema"] = Schema,
@@ -483,11 +667,11 @@ internal sealed class RunStatus
                 ["name"] = _spec.Name,
                 ["chain_id"] = _spec.ChainId,
                 ["round"] = _spec.Round,
-                ["parent_run"] = null,
+                ["parent_run"] = _owner?.ParentRun,
             },
             ["launcher"] = _launcher.DeepClone(),
             ["worker"] = _worker?.DeepClone(),
-            ["owner"] = null,
+            ["owner"] = _owner?.ToJson(),
             ["spec"] = SpecJson(),
             ["phase"] = _phase,
             ["live"] = live,

@@ -799,6 +799,10 @@ needs today's exact file set.
 
 Each with this design's recommendation.
 
+*Ruled 2026-11-22:* the operator took the recommendations for questions 1, 3, 4, 5, 6, 10 and 11,
+declined a rendering package (2) and changes in other repositories (7), and declined slice 7
+(legacy counters) as not needed.
+
 1. **Status files always on, or behind a flag?** Recommendation: always on, with the
    `LEAN_WORKER_STATUS=off` kill switch (section 6). It touches "today's launcher behaviour unchanged
    by default" only by adding files.

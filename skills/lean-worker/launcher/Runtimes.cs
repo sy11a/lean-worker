@@ -33,6 +33,11 @@ internal static class Runtimes
         return $"{exe} hook --run-dir {Q(Path.GetFullPath(runDir))}";
     }
 
+    /// <summary>
+    /// The run id the worker's environment carries as LEAN_WORKER_RUN_ID: the run dir's name.
+    /// </summary>
+    public static string RunId(string runDir) => Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(runDir)));
+
     private static string Q(string s) => "\"" + s.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
     /// <summary>

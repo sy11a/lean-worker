@@ -55,6 +55,10 @@ internal sealed class Options
           --no-user-env              lean mode: do not carry the user settings' env block into the worker
           --no-gate                  do not run the profile's gate (profile key "gate")
           --gate-max-rounds <n>      overrides gate.maxRounds for this run (profile key "gate.maxRounds")
+          --owner <key>              the owner `status` lists this run under (default: LEAN_WORKER_OWNER, the
+                                     enclosing lean-worker run, else the calling session); pass
+                                     "$(lean-worker status --whoami --key)" from a launch that does not inherit
+                                     the session's environment
 
         Other commands:
           hook --run-dir <dir>       the worker's pre-tool hook (installed by the launcher)
@@ -69,12 +73,17 @@ internal sealed class Options
                                      the profiles <runs-root>/profiles.json maps: name, runtime, model (a chain as "a -> b"),
                                      the default marked, so a delegator reads the local mapping instead of trusting memory
           prices                     the merged price book: sources and each entry's date
-          status --run <dir> [--json] | status --here [--runs-root <dir>] [--since <dur>] [--json]
-                                     live state of one run, or of this repository's runs (<git root>/.lean-worker),
-                                     from each run's status.json: phase, calls, cost, last tool, and whether the
-                                     launcher is alive (orphaned / lost when it died); --since (default 24h) limits
-                                     ended and legacy rows; read-only; LEAN_WORKER_STATUS=off stops the launcher
-                                     writing status.json
+          status [--owner <key> | --all | --here [--runs-root <dir>] | --run <dir>] [--since <dur>] [--json]
+          status --whoami [--key]
+                                     live state of the calling session's runs (default; through the per-user index
+                                     $XDG_STATE_HOME/lean-worker/runs), of one owner's, of every indexed run, of this
+                                     repository's runs (<git root>/.lean-worker) or of one run, from each run's
+                                     status.json: phase, calls, cost, last tool, and whether the launcher is alive
+                                     (orphaned / lost when it died); --since (default 24h for --here and --all, none
+                                     for an owner) limits ended and legacy rows; --whoami prints the caller's owner
+                                     keys (--key: the one to pass to a launch's --owner); reaps index entries of runs
+                                     ended over 7 days ago; LEAN_WORKER_STATUS=off stops the launcher writing
+                                     status.json and its index entry
           sweep-worktrees [--repo <path>]... [--root <dir>] [--older-than-days <n>] [--apply] [--protect <glob>]...
                                      sweep the linked worktrees of the repositories (--repo, or every repository
                                      under --root; default the parent of this repository): one line per worktree,
@@ -118,6 +127,9 @@ internal sealed class Options
     public bool Help;
     public string Mode = "auto";
 
+    // The owner key the run records for `status` (--owner), already checked.
+    public string? Owner;
+
     // The worktree the run owns (--worktree): the branch and the ref it is branched from.
     public string? Worktree;
     public string? WorktreeBase;
@@ -125,9 +137,32 @@ internal sealed class Options
     public static Options Parse(string[] args)
     {
         Options o = new();
-        ArgReader.Read(args, (arg, next) => o.TrySetText(arg, next) || o.TrySetWorktree(arg, next) || o.TrySetParsed(arg, next) || o.TrySetFlag(arg));
+        ArgReader.Read(args, (arg, next) => o.TrySetText(arg, next) || o.TrySetWorktree(arg, next) || o.TrySetOwner(arg, next)
+                                            || o.TrySetParsed(arg, next) || o.TrySetFlag(arg));
 
         return o;
+    }
+
+    /// <summary>
+    /// --owner: the owner key the run records (section 4.4 of docs/research/live-status/README.md),
+    /// checked here, so a key the index could not hold is a usage error before anything starts.
+    /// </summary>
+    private bool TrySetOwner(string arg, Func<string> next)
+    {
+        if (arg is not "--owner")
+        {
+            return false;
+        }
+
+        string key = next();
+        if (!OwnerKeys.Valid(key))
+        {
+            throw new LaunchException($"--owner needs a key of 1 to {OwnerKeys.MaxLength} characters of A-Z, a-z, 0-9 and _.:@/- " +
+                                      "(for example the output of `status --whoami --key`)");
+        }
+
+        Owner = key;
+        return true;
     }
 
     private bool TrySetText(string arg, Func<string> next)

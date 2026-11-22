@@ -230,6 +230,8 @@ internal sealed class OpencodeRuntime : IRuntime
             // The plugin puts the user's own value back for the worker's shell commands (git, gh and others).
             ["LEAN_WORKER_XDG_CONFIG_HOME"] = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME") ?? string.Empty,
             ["LEAN_WORKER_RUN_DIR"] = Path.GetFullPath(s.RunDir),
+            // A launcher started inside the worker records this run as its parent (status's nesting).
+            [OwnerKeys.RunIdVariable] = Runtimes.RunId(s.RunDir),
             ["LEAN_WORKER_WRAPUP"] = s.WrapUp ? "1" : "0",
             ["OPENCODE_CONFIG_CONTENT"] = config.ToJsonString(),
             ["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1",
