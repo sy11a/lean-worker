@@ -13,14 +13,17 @@ internal static class WorkerProcess
     /// The exit code is the process's own, also after a timeout kill (<see cref="Launcher.RunWorkerAsync"/> maps that to -1).
     /// The worker leads a process group of its own (see <see cref="Prepared.Group"/>), and that group is
     /// signalled after the worker exits: the processes it leaves behind are reparented to init then and
-    /// out of a tree kill's reach (issue #116).
+    /// out of a tree kill's reach (issue #116). <paramref name="live"/> (the run's status file, when
+    /// there is one) records the worker's pid and group once it runs, before the first stdout line.
     /// </summary>
     internal static async Task<(int ExitCode, bool TimedOut, bool CapKilled)> RunAsync(Prepared prep, string stdin,
-        string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine)
+        string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine,
+        RunStatus? live = null)
     {
         ProcessStartInfo psi = StartInfo(prep);
         using Process p = Process.Start(psi) ?? throw new LaunchException($"could not start {prep.Executable}");
         await prep.ResolveGroupAsync(p.Id).ConfigureAwait(false);
+        live?.WorkerStarted(p.Id, prep.Group);
         using CancellationTokenSource cts = new();
         StreamWriter stream = new(streamPath, append: false, Json.Utf8);
         await using ConfiguredAsyncDisposable streamDisposal = stream.ConfigureAwait(false);

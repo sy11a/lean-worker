@@ -393,6 +393,27 @@ internal sealed class OpencodeRuntime : IRuntime
         return null;
     }
 
+    /// <summary>
+    /// The live status's view of a stream line: a tool_use event is a finished tool call (opencode
+    /// emits it on completion or error), with the tool's name (part.tool), its call id
+    /// (part.callID) and its state (part.state.status); an error event is an error.
+    /// </summary>
+    public StreamActivity? Activity(JsonObject line)
+    {
+        switch (Json.Str(line, "type"))
+        {
+            case "error":
+                return StreamActivity.Problem;
+            case "tool_use" when line["part"] is JsonObject part:
+                {
+                    string state = Json.Str(part["state"] as JsonObject, "status") ?? StreamActivity.Completed;
+                    return StreamActivity.ToolEnd(Json.Str(part, "tool") ?? "?", Json.Str(part, "callID"), state);
+                }
+            default:
+                return null;
+        }
+    }
+
     // opencode's messages for a rule that denies the call and for a rejected permission prompt.
     private static bool IsPermissionError(string error)
     {

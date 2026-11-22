@@ -69,6 +69,12 @@ internal sealed class Options
                                      the profiles <runs-root>/profiles.json maps: name, runtime, model (a chain as "a -> b"),
                                      the default marked, so a delegator reads the local mapping instead of trusting memory
           prices                     the merged price book: sources and each entry's date
+          status --run <dir> [--json] | status --here [--runs-root <dir>] [--since <dur>] [--json]
+                                     live state of one run, or of this repository's runs (<git root>/.lean-worker),
+                                     from each run's status.json: phase, calls, cost, last tool, and whether the
+                                     launcher is alive (orphaned / lost when it died); --since (default 24h) limits
+                                     ended and legacy rows; read-only; LEAN_WORKER_STATUS=off stops the launcher
+                                     writing status.json
           sweep-worktrees [--repo <path>]... [--root <dir>] [--older-than-days <n>] [--apply] [--protect <glob>]...
                                      sweep the linked worktrees of the repositories (--repo, or every repository
                                      under --root; default the parent of this repository): one line per worktree,

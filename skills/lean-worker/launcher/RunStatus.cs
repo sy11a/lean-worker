@@ -1,0 +1,425 @@
+// The live status of one run: <run-dir>/status.json (schema lean-worker.status/1), the whole
+// object written again at each phase change, at wrap-up and after each stream line that changes a
+// displayed field. A reader (`status`) sees the old or the new file, never a torn one: every write
+// goes through a temp sibling plus rename, and one lock serialises every write and assigns `seq`
+// inside it, so no older object is published after a newer one.
+//
+// Best effort: a failed write never fails or changes the run. The first failure leaves one note
+// for the summary; later writes are still tried. LEAN_WORKER_STATUS=off turns the writer off.
+//
+// The file is trusted for display only: no verdict, no ledger field and no exit code is read
+// from it (docs/research/live-status/README.md, section 4.1).
+
+using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+namespace LeanWorker;
+
+/// <summary>
+/// The writer of <c>status.json</c>. The main thread reports the phases, the stream thread the
+/// lines; both go through one lock.
+/// </summary>
+internal sealed class RunStatus
+{
+    public const string FileName = "status.json";
+    public const string Schema = "lean-worker.status/1";
+    public const string KillSwitch = "LEAN_WORKER_STATUS";
+
+    /// <summary>
+    /// The end status of a launcher that failed with an exception (not a ledger status).
+    /// </summary>
+    public const string LaunchFailed = "launch-failed";
+
+    /// <summary>
+    /// A stream line that changes nothing displayed still refreshes the file when the last write is
+    /// this old, so <c>last_event_at</c> does not lag a long-streaming step by more than this.
+    /// </summary>
+    internal static readonly TimeSpan RefreshAfter = TimeSpan.FromSeconds(30);
+
+    private static readonly JsonSerializerOptions _snakeCase = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    private readonly object _lock = new();
+    private readonly RunStatusSpec _spec;
+    private readonly ProcFs _proc;
+    private readonly TimeProvider _clock;
+    private readonly long _startTimestamp;
+    private readonly string _path;
+    private readonly JsonObject _launcher;
+    private JsonObject? _worker;
+    private Meter? _meter;
+    private Outcome? _outcome;
+    private IRuntime? _runtime;
+    private string _phase = RunPhase.Starting;
+    private int? _gateRound;
+    private DateTimeOffset? _lastEventAt;
+    private LastTool? _lastTool;
+    private JsonObject? _end;
+    private long _seq;
+    private string? _shown;
+    private long _lastWriteTimestamp;
+    private string? _note;
+    private bool _noteTaken;
+
+    /// <summary>
+    /// A writer for the run in <paramref name="spec"/>, reading /proc through <paramref name="proc"/>
+    /// and the time from <paramref name="clock"/>; <paramref name="launcherPid"/> is the launcher's
+    /// own pid. Nothing is written until the first phase is reported.
+    /// </summary>
+    public RunStatus(RunStatusSpec spec, ProcFs proc, TimeProvider clock, int launcherPid)
+    {
+        _spec = spec;
+        _proc = proc;
+        _clock = clock;
+        _startTimestamp = clock.GetTimestamp();
+        _lastWriteTimestamp = _startTimestamp;
+        _path = Path.Combine(spec.RunDir, FileName);
+        ProcProbe self = proc.Stat(launcherPid);
+        _launcher = new JsonObject
+        {
+            ["pid"] = launcherPid,
+            ["start_ticks"] = self.Kind is ProbeKind.Present ? self.Stat.StartTicks : null,
+            ["boot_id"] = proc.BootId(),
+        };
+    }
+
+    /// <summary>
+    /// The sequence number of the last write (0 before the first).
+    /// </summary>
+    public long Seq
+    {
+        get { lock (_lock) { return _seq; } }
+    }
+
+    /// <summary>
+    /// The note of the first failed write; null while every write worked.
+    /// </summary>
+    public string? Note
+    {
+        get { lock (_lock) { return _note; } }
+    }
+
+    /// <summary>
+    /// Whether the environment's <see cref="KillSwitch"/> value leaves the writer on: anything but "off".
+    /// </summary>
+    public static bool Enabled(string? killSwitch) => !string.Equals(killSwitch?.Trim(), "off", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The writer of a launch, from what the run records at its start: null when
+    /// <see cref="KillSwitch"/> is off. The first write (<c>phase: starting</c>) happens here,
+    /// right after the run dir exists.
+    /// </summary>
+    public static RunStatus? Open(string runDir, string name, string chainId, int round, string? profile, string runtime,
+        string provider, string model, decimal budgetUsd, decimal? wrapUpUsd, int timeoutMinutes, DateTimeOffset startedAt, string? worktree)
+    {
+        if (!Enabled(Environment.GetEnvironmentVariable(KillSwitch)))
+        {
+            return null;
+        }
+
+        RunStatusSpec spec = new(runDir, name, chainId, round, profile, runtime, provider, model, budgetUsd, wrapUpUsd,
+            timeoutMinutes, startedAt, worktree);
+        RunStatus status = new(spec, ProcFs.Host, TimeProvider.System, Environment.ProcessId);
+        status.Phase(RunPhase.Starting);
+        return status;
+    }
+
+    /// <summary>
+    /// The live counters' sources: the Meter (calls, tokens, cost, wrap-up), the outcome and the
+    /// runtime (turns, thinking tokens).
+    /// </summary>
+    public void Track(Meter meter, Outcome outcome, IRuntime runtime)
+    {
+        lock (_lock)
+        {
+            _meter = meter;
+            _outcome = outcome;
+            _runtime = runtime;
+        }
+    }
+
+    /// <summary>
+    /// The worker runs: its pid, and its group as the launcher read it.
+    /// </summary>
+    public void WorkerStarted(int pid, WorkerGroup group) =>
+        WorkerStarted(pid, group.Available && group.GroupId > 0 ? group.GroupId : null);
+
+    /// <summary>
+    /// The worker runs: its pid, its group id (null without a group of its own), and its session
+    /// and start time read from /proc. The phase becomes <c>worker</c>.
+    /// </summary>
+    public void WorkerStarted(int pid, int? pgid)
+    {
+        ProcProbe probe = _proc.Stat(pid);
+        bool present = probe.Kind is ProbeKind.Present;
+        lock (_lock)
+        {
+            _worker = new JsonObject
+            {
+                ["pid"] = pid,
+                ["pgid"] = pgid,
+                ["sid"] = pgid is not null && present ? probe.Stat.Session : null,
+                ["start_ticks"] = present ? probe.Stat.StartTicks : null,
+            };
+            _phase = RunPhase.Worker;
+            WriteLocked();
+        }
+    }
+
+    /// <summary>
+    /// One stream line, after the Meter has seen it: the runtime reads what it says besides usage
+    /// (<see cref="IRuntime.Activity"/>); <paramref name="usage"/> is whether it carried usage.
+    /// </summary>
+    public void OnLine(IRuntime runtime, JsonObject line, bool usage) => OnLine(runtime.Activity(line), usage);
+
+    /// <summary>
+    /// One stream line, after the Meter has seen it: <paramref name="activity"/> is what the runtime
+    /// read from it besides usage, <paramref name="usage"/> whether it carried usage. The file is
+    /// written when a displayed field changed (a call, tokens, cost, turns, wrap-up, a tool), on an
+    /// error or retry event, and when the last write is older than <see cref="RefreshAfter"/>.
+    /// </summary>
+    public void OnLine(StreamActivity? activity, bool usage)
+    {
+        lock (_lock)
+        {
+            DateTimeOffset now = _clock.GetUtcNow();
+            _lastEventAt = now;
+            bool due = activity is not null;
+            if (activity is not null)
+            {
+                Apply(activity, now);
+            }
+
+            if (!due && usage)
+            {
+                due = !string.Equals(Counters().ToJsonString(), _shown, StringComparison.Ordinal);
+            }
+
+            if (due || _clock.GetElapsedTime(_lastWriteTimestamp) >= RefreshAfter)
+            {
+                WriteLocked();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The gate of round <paramref name="round"/> runs.
+    /// </summary>
+    public void GateStarted(int round) => Phase(RunPhase.Gate, round);
+
+    /// <summary>
+    /// The launcher decides the worktree, computes the stats and writes the summary.
+    /// </summary>
+    public void Finishing() => Phase(RunPhase.Finishing);
+
+    /// <summary>
+    /// A phase change; <paramref name="gateRound"/> is the round of the <c>gate</c> phase.
+    /// </summary>
+    public void Phase(string phase, int? gateRound = null)
+    {
+        lock (_lock)
+        {
+            _phase = phase;
+            _gateRound = phase is RunPhase.Gate ? gateRound : null;
+            WriteLocked();
+        }
+    }
+
+    /// <summary>
+    /// The run is done: summary, report and ledger row are written. <paramref name="status"/> is the
+    /// ledger's status, <paramref name="exitCode"/> the launcher's exit code for this round.
+    /// </summary>
+    public void Finish(string status, int exitCode)
+    {
+        lock (_lock)
+        {
+            _phase = RunPhase.Done;
+            _gateRound = null;
+            _end = new JsonObject
+            {
+                ["status"] = status,
+                ["exit_code"] = exitCode,
+                ["at"] = Stamp(_clock.GetUtcNow()),
+                ["summary"] = "summary.json",
+            };
+            WriteLocked();
+        }
+    }
+
+    /// <summary>
+    /// The launcher failed with an exception and is about to print LEAN-WORKER LAUNCH FAILED.
+    /// <paramref name="summaryStatus"/> is the summary's status when summary.json was already
+    /// written, else null.
+    /// </summary>
+    public void Fail(string message, string? summaryStatus)
+    {
+        lock (_lock)
+        {
+            _phase = RunPhase.Failed;
+            _gateRound = null;
+            _end = new JsonObject
+            {
+                ["status"] = LaunchFailed,
+                ["exit_code"] = null,
+                ["at"] = Stamp(_clock.GetUtcNow()),
+                ["error"] = message,
+                ["after_summary"] = summaryStatus is not null,
+            };
+            if (summaryStatus is not null)
+            {
+                _end["summary_status"] = summaryStatus;
+            }
+
+            WriteLocked();
+        }
+    }
+
+    /// <summary>
+    /// Adds the note of the first failed write to <paramref name="notes"/>, once.
+    /// </summary>
+    public void AddNoteTo(List<string> notes)
+    {
+        lock (_lock)
+        {
+            if (_note is null || _noteTaken)
+            {
+                return;
+            }
+
+            _noteTaken = true;
+            notes.Add(_note);
+        }
+    }
+
+    /// <summary>
+    /// The object the next write would publish, with the current seq (for tests).
+    /// </summary>
+    internal JsonObject Snapshot()
+    {
+        lock (_lock)
+        {
+            return Build(Counters());
+        }
+    }
+
+    /// <summary>
+    /// A UTC time as the status files write it: ISO 8601 with milliseconds and a Z.
+    /// </summary>
+    public static string Stamp(DateTimeOffset t) =>
+        t.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// A tool start, or a tool end that names its tool, becomes the last tool; a tool end that
+    /// names only its call (claude's tool_result) updates the last tool when it is that call.
+    /// </summary>
+    private void Apply(StreamActivity activity, DateTimeOffset now)
+    {
+        string state = activity.State ?? StreamActivity.Completed;
+        if (activity.Kind is StreamActivityKind.ToolStart || (activity.Kind is StreamActivityKind.ToolEnd && activity.Tool is not null))
+        {
+            _lastTool = new LastTool(activity.Tool ?? "?", activity.CallId, now, state);
+        }
+        else if (activity.Kind is StreamActivityKind.ToolEnd && _lastTool is not null && activity.CallId is not null
+                 && string.Equals(activity.CallId, _lastTool.CallId, StringComparison.Ordinal))
+        {
+            _lastTool = _lastTool with { At = now, State = state };
+        }
+    }
+
+    private void WriteLocked()
+    {
+        _seq++;
+        JsonObject counters = Counters();
+        _shown = counters.ToJsonString();
+        JsonObject doc = Build(counters);
+        _lastWriteTimestamp = _clock.GetTimestamp();
+        try
+        {
+            Launcher.WritePlain(_path, doc.ToJsonString(Json.Indented));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _note ??= $"status.json could not be written ({ex.Message}); the run itself is not affected";
+        }
+    }
+
+    /// <summary>
+    /// The counters a write compares against the last one: a change in any of them is a displayed change.
+    /// </summary>
+    private JsonObject Counters()
+    {
+        List<Usage> calls = _meter?.Calls() ?? [];
+        long? turns = _outcome is not null && _runtime is not null ? _runtime.LiveTurns(_outcome) : null;
+        return new JsonObject
+        {
+            ["api_calls"] = calls.Count,
+            ["turns"] = turns,
+            ["tokens"] = Usage.Totals(calls, _outcome?.Thinking ?? 0),
+            ["cost_usd"] = decimal.Round(_meter?.Spent ?? 0m, 6, MidpointRounding.ToEven),
+            ["wrapped_up"] = _meter?.WrappedUp ?? false,
+            ["last_tool"] = _lastTool?.ToJson(),
+        };
+    }
+
+    private JsonObject Build(JsonObject live)
+    {
+        live["elapsed_ms"] = (long)_clock.GetElapsedTime(_startTimestamp).TotalMilliseconds;
+        live["last_event_at"] = _lastEventAt is { } at ? Stamp(at) : null;
+        live["gate_round"] = _gateRound;
+        return new JsonObject
+        {
+            ["schema"] = Schema,
+            ["seq"] = _seq,
+            ["updated_at"] = Stamp(_clock.GetUtcNow()),
+            ["run"] = new JsonObject
+            {
+                ["id"] = Path.GetFileName(_spec.RunDir),
+                ["dir"] = Path.GetFullPath(_spec.RunDir),
+                ["name"] = _spec.Name,
+                ["chain_id"] = _spec.ChainId,
+                ["round"] = _spec.Round,
+                ["parent_run"] = null,
+            },
+            ["launcher"] = _launcher.DeepClone(),
+            ["worker"] = _worker?.DeepClone(),
+            ["owner"] = null,
+            ["spec"] = SpecJson(),
+            ["phase"] = _phase,
+            ["live"] = live,
+            ["end"] = _end?.DeepClone(),
+        };
+    }
+
+    /// <summary>
+    /// The spec section: the run's settings, its start and the worker's deadline, in snake_case.
+    /// </summary>
+    private JsonNode? SpecJson()
+    {
+        SpecSection section = new(_spec.Profile, _spec.Runtime, _spec.Provider, _spec.Model, _spec.BudgetUsd, _spec.WrapUpUsd,
+            _spec.TimeoutMinutes, Stamp(_spec.StartedAt), Stamp(_spec.StartedAt.AddMinutes(_spec.TimeoutMinutes)), _spec.Worktree);
+        return JsonSerializer.SerializeToNode(section, _snakeCase);
+    }
+
+    /// <summary>
+    /// The fields of the spec section, in the order the file shows them.
+    /// </summary>
+    private sealed record SpecSection(string? Profile, string Runtime, string Provider, string Model, decimal BudgetUsd,
+        decimal? WrapUpUsd, int TimeoutMinutes, string StartedAt, string DeadlineAt, string? Worktree);
+
+    /// <summary>
+    /// The last tool call the stream showed: its name, its call id (to match the result), when the
+    /// last event about it came and its state.
+    /// </summary>
+    private sealed record LastTool(string Name, string? CallId, DateTimeOffset At, string State)
+    {
+        public JsonObject ToJson()
+        {
+            return new JsonObject
+            {
+                ["name"] = Name,
+                ["at"] = Stamp(At),
+                ["state"] = State,
+            };
+        }
+    }
+}

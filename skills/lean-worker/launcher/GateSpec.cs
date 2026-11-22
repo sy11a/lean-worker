@@ -337,6 +337,25 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
         return false;
     }
 
+    /// <summary>
+    /// One declared <c>gate.outputs</c> entry as an absolute path: a relative entry against
+    /// <paramref name="anchor"/> (the workspace root), an absolute one normalised. A path the OS
+    /// layer refuses is a launch error naming <paramref name="label"/>'s entry.
+    /// </summary>
+    internal static string ResolveOutputEntry(string entry, string anchor, string label)
+    {
+        try
+        {
+            return Path.GetFullPath(Path.Combine(anchor, entry));
+        }
+        catch (ArgumentException ex)
+        {
+            // Spec validation (non-empty, no globs, no ".." in a relative entry) has passed; this is a
+            // path the OS layer still refuses. A configuration mistake → launch error, not a crash.
+            throw new LaunchException($"profile {label}.outputs entry '{entry}' is invalid: {ex.Message}");
+        }
+    }
+
     private static Regex ReadReportRegex(JsonObject holder, string label)
     {
         if (!holder.TryGetPropertyValue("reportFromLastLine", out JsonNode? rn) || rn is null)
@@ -554,7 +573,7 @@ internal sealed partial record GateSpec(List<string> Command, Regex ReportFromLa
             string normalized = s.Replace('\\', '/');
             // A relative entry resolves against the git root (or the working directory when not in
             // git), so it stays inside the repo; an absolute entry is used as-is (normalised by
-            // LaunchRun.ResolveOutputEntry), which is how a gate report outside the repo is declared.
+            // ResolveOutputEntry), which is how a gate report outside the repo is declared.
             if (!Path.IsPathFullyQualified(normalized))
             {
                 // No parent traversal in a relative entry: ".." would let a declared output reach
