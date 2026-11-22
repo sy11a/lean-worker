@@ -4,7 +4,6 @@
 // are its inputs, so a test drives it without a real /proc.
 
 using System.Globalization;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace LeanWorker;
@@ -28,31 +27,58 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     public static StatusReader Host() => new(ProcFs.Host, TimeProvider.System, ProcFs.Host.BootId());
 
     /// <summary>
-    /// One run dir: a legacy row without status.json, an unreadable row when the file does not
-    /// parse (after one retry), else the state the ended rule gives.
+    /// The detail of a run whose files gave the reader something it could not use.
+    /// </summary>
+    internal const string UnusableDetail = "the run's files hold content the reader cannot use";
+
+    /// <summary>
+    /// One run dir: a legacy row without status.json, an unreadable row when the run dir or one of
+    /// its files is not a plain directory or regular file, when status.json does not parse (after
+    /// one retry), or when anything about the run fails while it is read; else the state the ended
+    /// rule gives. Nothing about one run dir throws out of here.
     /// </summary>
     public StatusRow Read(string runDir)
     {
         string id = Path.GetFileName(Path.TrimEndingDirectorySeparator(runDir));
+        try
+        {
+            return ReadChecked(runDir, id);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            // Whatever the run's files hold: the row says so with a fixed text, never the exception's.
+            return Unreadable(runDir, id, UnusableDetail);
+        }
+    }
+
+    private StatusRow ReadChecked(string runDir, string id)
+    {
+        if (StatusFile.IsLink(runDir))
+        {
+            return Unreadable(runDir, id, "the run dir is a symbolic link; not followed");
+        }
+
         string path = Path.Combine(runDir, RunStatus.FileName);
-        if (!File.Exists(path))
+        (JsonObject? doc, string? problem, bool retry) = Load(path);
+        if (doc is null && problem is null)
         {
             return Legacy(runDir, id);
         }
 
-        (JsonObject? doc, string? error) = Load(path);
-        if (doc is null)
+        if (doc is null && retry)
         {
-            (doc, error) = Load(path);
+            (doc, problem, _) = Load(path);
         }
 
-        if (doc is null)
-        {
-            return new StatusRow(runDir, StampName(id), StatusStates.Unreadable, Liveness.Unknown, Status: null,
-                $"{RunStatus.FileName}: {error}", Stamp(id), EndedAt: null, Attention: true, Quiet: null);
-        }
+        return doc is null
+            ? Unreadable(runDir, id, $"{RunStatus.FileName}: {problem ?? "is gone"}")
+            : FromStatus(runDir, id, doc);
+    }
 
-        return FromStatus(runDir, id, doc);
+    private StatusRow Unreadable(string runDir, string id, string detail)
+    {
+        return new StatusRow(runDir, StampName(id), StatusStates.Unreadable, Liveness.Unknown, Status: null, detail, Stamp(id),
+            EndedAt: null, Attention: true, Quiet: null);
     }
 
     private StatusRow FromStatus(string runDir, string id, JsonObject doc)
@@ -111,7 +137,13 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         }
 
         DateTimeOffset? updated = Time(Json.Str(doc, "updated_at"));
-        if (SummaryStatus(runDir) is { } summary)
+        (string? summary, string? summaryProblem) = SummaryStatus(runDir);
+        if (summaryProblem is not null)
+        {
+            return Unreadable(runDir, Path.GetFileName(Path.TrimEndingDirectorySeparator(runDir)), summaryProblem);
+        }
+
+        if (summary is not null)
         {
             return new StatusRow(runDir, name, summary, Liveness.Gone, doc,
                 "launcher gone before its last status write; status from summary.json", started, updated, IsFailure(summary), Quiet: null);
@@ -129,7 +161,12 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// </summary>
     private StatusRow Legacy(string runDir, string id)
     {
-        string? summary = SummaryStatus(runDir);
+        (string? summary, string? problem) = SummaryStatus(runDir);
+        if (problem is not null)
+        {
+            return Unreadable(runDir, id, problem);
+        }
+
         string detail = summary is null ? "no status.json, no summary.json" : $"no status.json; summary: {summary}";
         return new StatusRow(runDir, StampName(id), StatusStates.Legacy, Liveness.Unknown, Status: null, detail, Stamp(id),
             EndedAt: null, Attention: false, Quiet: null)
@@ -143,37 +180,39 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// </summary>
     internal static bool IsFailure(string state) => state is not ("success" or "wrapped-up");
 
-    private static (JsonObject? Doc, string? Error) Load(string path)
+    /// <summary>
+    /// status.json: the object; nothing at all when the file is absent; else the problem (a fixed
+    /// text) and whether it is a parse problem, which is worth one retry (a torn read).
+    /// </summary>
+    private static (JsonObject? Doc, string? Problem, bool Retry) Load(string path)
     {
-        try
+        StatusFile.Content content = StatusFile.Read(path);
+        if (content.Bytes is not { } bytes)
         {
-            if (JsonNode.Parse(File.ReadAllText(path, Json.Utf8)) is not JsonObject doc)
-            {
-                return (null, "not a JSON object");
-            }
+            return (null, content.Problem, false);
+        }
 
-            return Json.Str(doc, "schema") is RunStatus.Schema ? (doc, null) : (null, "unknown schema");
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        if (StatusFile.ParseObject(bytes, out string? problem) is not { } doc)
         {
-            return (null, ex.Message);
+            return (null, problem, true);
         }
+
+        return Json.Str(doc, "schema") is RunStatus.Schema ? (doc, null, false) : (null, "unknown schema", true);
     }
 
     /// <summary>
-    /// The status in a run dir's summary.json; null when there is none or it does not parse.
+    /// The status in a run dir's summary.json: null when there is none or it does not parse; a
+    /// problem (a fixed text) when it is there but is no regular file the reader may read.
     /// </summary>
-    private static string? SummaryStatus(string runDir)
+    private static (string? Status, string? Problem) SummaryStatus(string runDir)
     {
-        string path = Path.Combine(runDir, "summary.json");
-        try
+        StatusFile.Content content = StatusFile.Read(Path.Combine(runDir, "summary.json"));
+        if (content.Bytes is not { } bytes)
         {
-            return File.Exists(path) && JsonNode.Parse(File.ReadAllText(path, Json.Utf8)) is JsonObject s ? Json.Str(s, "status") : null;
+            return (null, content.Problem is { } problem ? "summary.json: " + problem : null);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-        {
-            return null;
-        }
+
+        return (StatusFile.ParseObject(bytes, out _) is { } s ? Json.Str(s, "status") : null, null);
     }
 
     /// <summary>
@@ -207,6 +246,6 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// <summary>
     /// The run name in a run dir name: what follows the stamp and its dash, else the whole name.
     /// </summary>
-    private static string StampName(string id) =>
+    internal static string StampName(string id) =>
         id.Length > StampLength + 1 && id[StampLength] is '-' ? id[(StampLength + 1)..] : id;
 }

@@ -79,13 +79,13 @@ internal sealed class RunStatus
         _startTimestamp = clock.GetTimestamp();
         _lastWriteTimestamp = _startTimestamp;
         _path = Path.Combine(spec.RunDir, FileName);
-        ProcProbe self = proc.Stat(launcherPid);
-        _launcher = new JsonObject
+        _launcher = new JsonObject { ["pid"] = launcherPid, ["start_ticks"] = null, ["boot_id"] = null };
+        BestEffort(() =>
         {
-            ["pid"] = launcherPid,
-            ["start_ticks"] = self.Kind is ProbeKind.Present ? self.Stat.StartTicks : null,
-            ["boot_id"] = proc.BootId(),
-        };
+            ProcProbe self = proc.Stat(launcherPid);
+            _launcher["start_ticks"] = self.Kind is ProbeKind.Present ? self.Stat.StartTicks : null;
+            _launcher["boot_id"] = proc.BootId();
+        });
     }
 
     /// <summary>
@@ -147,13 +147,15 @@ internal sealed class RunStatus
     /// The worker runs: its pid, and its group as the launcher read it.
     /// </summary>
     public void WorkerStarted(int pid, WorkerGroup group) =>
-        WorkerStarted(pid, group.Available && group.GroupId > 0 ? group.GroupId : null);
+        BestEffort(() => WorkerStarted(pid, group.Available && group.GroupId > 0 ? group.GroupId : null));
 
     /// <summary>
     /// The worker runs: its pid, its group id (null without a group of its own), and its session
     /// and start time read from /proc. The phase becomes <c>worker</c>.
     /// </summary>
-    public void WorkerStarted(int pid, int? pgid)
+    public void WorkerStarted(int pid, int? pgid) => BestEffort(() => RecordWorker(pid, pgid));
+
+    private void RecordWorker(int pid, int? pgid)
     {
         ProcProbe probe = _proc.Stat(pid);
         bool present = probe.Kind is ProbeKind.Present;
@@ -174,8 +176,9 @@ internal sealed class RunStatus
     /// <summary>
     /// One stream line, after the Meter has seen it: the runtime reads what it says besides usage
     /// (<see cref="IRuntime.Activity"/>); <paramref name="usage"/> is whether it carried usage.
+    /// What the runtime cannot read in the line is a failed status update like any other.
     /// </summary>
-    public void OnLine(IRuntime runtime, JsonObject line, bool usage) => OnLine(runtime.Activity(line), usage);
+    public void OnLine(IRuntime runtime, JsonObject line, bool usage) => BestEffort(() => OnLine(runtime.Activity(line), usage));
 
     /// <summary>
     /// One stream line, after the Meter has seen it: <paramref name="activity"/> is what the runtime
@@ -183,7 +186,9 @@ internal sealed class RunStatus
     /// written when a displayed field changed (a call, tokens, cost, turns, wrap-up, a tool), on an
     /// error or retry event, and when the last write is older than <see cref="RefreshAfter"/>.
     /// </summary>
-    public void OnLine(StreamActivity? activity, bool usage)
+    public void OnLine(StreamActivity? activity, bool usage) => BestEffort(() => RecordLine(activity, usage));
+
+    private void RecordLine(StreamActivity? activity, bool usage)
     {
         lock (_lock)
         {
@@ -220,7 +225,9 @@ internal sealed class RunStatus
     /// <summary>
     /// A phase change; <paramref name="gateRound"/> is the round of the <c>gate</c> phase.
     /// </summary>
-    public void Phase(string phase, int? gateRound = null)
+    public void Phase(string phase, int? gateRound = null) => BestEffort(() => RecordPhase(phase, gateRound));
+
+    private void RecordPhase(string phase, int? gateRound)
     {
         lock (_lock)
         {
@@ -234,7 +241,9 @@ internal sealed class RunStatus
     /// The run is done: summary, report and ledger row are written. <paramref name="status"/> is the
     /// ledger's status, <paramref name="exitCode"/> the launcher's exit code for this round.
     /// </summary>
-    public void Finish(string status, int exitCode)
+    public void Finish(string status, int exitCode) => BestEffort(() => RecordFinish(status, exitCode));
+
+    private void RecordFinish(string status, int exitCode)
     {
         lock (_lock)
         {
@@ -254,9 +263,12 @@ internal sealed class RunStatus
     /// <summary>
     /// The launcher failed with an exception and is about to print LEAN-WORKER LAUNCH FAILED.
     /// <paramref name="summaryStatus"/> is the summary's status when summary.json was already
-    /// written, else null.
+    /// written, else null. Like every write it never throws: the caller's exception stays the one
+    /// that propagates.
     /// </summary>
-    public void Fail(string message, string? summaryStatus)
+    public void Fail(string message, string? summaryStatus) => BestEffort(() => RecordFailure(message, summaryStatus));
+
+    private void RecordFailure(string message, string? summaryStatus)
     {
         lock (_lock)
         {
@@ -267,16 +279,72 @@ internal sealed class RunStatus
                 ["status"] = LaunchFailed,
                 ["exit_code"] = null,
                 ["at"] = Stamp(_clock.GetUtcNow()),
-                ["error"] = message,
+                // An exception's message can quote stream content: no lone surrogate may make the file unwritable.
+                ["error"] = WellFormed(message),
                 ["after_summary"] = summaryStatus is not null,
             };
             if (summaryStatus is not null)
             {
-                _end["summary_status"] = summaryStatus;
+                _end["summary_status"] = WellFormed(summaryStatus);
             }
 
             WriteLocked();
         }
+    }
+
+    /// <summary>
+    /// Runs one status update; any failure of it (an I/O error, a stream value the runtime cannot
+    /// read, a counter that overflows) leaves the first note and nothing else: no exception leaves
+    /// a public method of the writer, so the stream pump, the Meter and the launcher's own paths
+    /// see the run exactly as with the writer off.
+    /// </summary>
+    private void BestEffort(Action update)
+    {
+        try
+        {
+            update();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            lock (_lock)
+            {
+                _note ??= $"status.json could not be written ({ex.Message}); the run itself is not affected";
+            }
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            // The type only: the message of a parse or format failure can carry the stream's content.
+            lock (_lock)
+            {
+                _note ??= $"status.json could not be updated ({ex.GetType().Name}); the run itself is not affected";
+            }
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="text"/> with every lone surrogate replaced by U+FFFD, so it can be written as JSON.
+    /// </summary>
+    internal static string WellFormed(string text)
+    {
+        if (!text.Any(c => char.IsSurrogate(c)))
+        {
+            return text;
+        }
+
+        char[] chars = text.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (char.IsHighSurrogate(chars[i]) && i + 1 < chars.Length && char.IsLowSurrogate(chars[i + 1]))
+            {
+                i++;
+            }
+            else if (char.IsSurrogate(chars[i]))
+            {
+                chars[i] = '�';
+            }
+        }
+
+        return new string(chars);
     }
 
     /// <summary>
@@ -319,7 +387,7 @@ internal sealed class RunStatus
     /// </summary>
     private void Apply(StreamActivity activity, DateTimeOffset now)
     {
-        string state = activity.State ?? StreamActivity.Completed;
+        string? state = ToolState(activity.State);
         if (activity.Kind is StreamActivityKind.ToolStart || (activity.Kind is StreamActivityKind.ToolEnd && activity.Tool is not null))
         {
             _lastTool = new LastTool(ToolName(activity.Tool), activity.CallId, now, state);
@@ -329,6 +397,22 @@ internal sealed class RunStatus
         {
             _lastTool = _lastTool with { At = now, State = state };
         }
+    }
+
+    /// <summary>
+    /// A tool state as the file stores it: <c>running</c> (opencode's <c>pending</c> too),
+    /// <c>completed</c> (also when the event gives none) or <c>error</c>; null for anything else,
+    /// which is never stored as the stream gave it.
+    /// </summary>
+    internal static string? ToolState(string? state)
+    {
+        return state switch
+        {
+            null or StreamActivity.Completed => StreamActivity.Completed,
+            StreamActivity.Running or "pending" => StreamActivity.Running,
+            StreamActivity.Error => StreamActivity.Error,
+            _ => null,
+        };
     }
 
     /// <summary>
@@ -353,6 +437,7 @@ internal sealed class RunStatus
         });
     }
 
+    // A failure here propagates to BestEffort, which leaves the note.
     private void WriteLocked()
     {
         _seq++;
@@ -360,14 +445,7 @@ internal sealed class RunStatus
         _shown = counters.ToJsonString();
         JsonObject doc = Build(counters);
         _lastWriteTimestamp = _clock.GetTimestamp();
-        try
-        {
-            Launcher.WritePlain(_path, doc.ToJsonString(Json.Indented));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _note ??= $"status.json could not be written ({ex.Message}); the run itself is not affected";
-        }
+        Launcher.WritePlain(_path, doc.ToJsonString(Json.Indented));
     }
 
     /// <summary>
@@ -437,7 +515,7 @@ internal sealed class RunStatus
     /// The last tool call the stream showed: its name, its call id (to match the result), when the
     /// last event about it came and its state.
     /// </summary>
-    private sealed record LastTool(string Name, string? CallId, DateTimeOffset At, string State)
+    private sealed record LastTool(string Name, string? CallId, DateTimeOffset At, string? State)
     {
         public JsonObject ToJson()
         {

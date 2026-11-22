@@ -55,6 +55,7 @@ internal static class StatusCommand
         string scope;
         List<StatusRow> rows;
         int hidden = 0;
+        DateTimeOffset now = reader.Clock.GetUtcNow();
         if (a.Run is { } run)
         {
             scope = Path.GetFullPath(run, cwd);
@@ -64,18 +65,18 @@ internal static class StatusCommand
                 return 2;
             }
 
-            rows = [reader.Read(scope)];
+            rows = [StatusText.Checked(reader.Read(scope), now)];
         }
         else
         {
             scope = a.RunsRoot is { } root ? Path.GetFullPath(root, cwd) : await DefaultRunsRootAsync(cwd).ConfigureAwait(false);
-            List<StatusRow> all = [.. RunDirs(scope).Select(dir => reader.Read(dir))];
-            DateTimeOffset cutoff = reader.Clock.GetUtcNow() - since;
+            List<StatusRow> all = [.. RunDirs(scope).Select(dir => StatusText.Checked(reader.Read(dir), now))];
+            DateTimeOffset cutoff = now - since;
             rows = [.. all.Where(r => Shown(r, cutoff))];
             hidden = all.Count - rows.Count;
         }
 
-        await PrintAsync(output, a.Json, scope, StatusText.Order(rows), hidden, a.Since ?? "24h", reader.Clock.GetUtcNow()).ConfigureAwait(false);
+        await PrintAsync(output, a.Json, scope, StatusText.Order(rows), hidden, a.Since ?? "24h", now).ConfigureAwait(false);
         return 0;
     }
 
@@ -222,11 +223,19 @@ internal static class StatusCommand
     }
 
     /// <summary>
-    /// The run dirs under a runs root: every directory in &lt;runs-root&gt;/runs; none when it does not exist.
+    /// The run dirs under a runs root: every directory in &lt;runs-root&gt;/runs and every symbolic
+    /// link there (listed, never followed: the reader makes it an unreadable row); none when the
+    /// folder does not exist. One level only, so no link can lead the scan elsewhere or round a loop.
     /// </summary>
     private static List<string> RunDirs(string runsRoot)
     {
         string runs = Path.Combine(runsRoot, "runs");
-        return Directory.Exists(runs) ? [.. Directory.EnumerateDirectories(runs)] : [];
+        if (!Directory.Exists(runs))
+        {
+            return [];
+        }
+
+        IEnumerable<FileSystemInfo> entries = new DirectoryInfo(runs).EnumerateFileSystemInfos();
+        return [.. entries.Where(e => e is DirectoryInfo || e.Attributes.HasFlag(FileAttributes.ReparsePoint)).Select(e => e.FullName)];
     }
 }

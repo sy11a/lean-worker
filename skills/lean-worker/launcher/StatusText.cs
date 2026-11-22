@@ -118,14 +118,22 @@ internal static class StatusText
     /// </summary>
     private static TimeSpan Elapsed(StatusRow r, JsonObject doc, JsonObject? live, DateTimeOffset now)
     {
-        TimeSpan elapsed = TimeSpan.FromMilliseconds(Json.Num(live?["elapsed_ms"]));
+        // Clamped before any arithmetic: the file's count can be anything (negative, 1e300).
+        TimeSpan elapsed = TimeSpan.FromMilliseconds(Math.Clamp(Json.Num(live?["elapsed_ms"]), 0, (long)MaxDuration.TotalMilliseconds));
         if (r.Live && StatusReader.Time(Json.Str(doc, "updated_at")) is { } updated && now > updated)
         {
-            elapsed += now - updated;
+            elapsed += Clamp(now - updated);
         }
 
-        return elapsed;
+        return Clamp(elapsed);
     }
+
+    /// <summary>
+    /// The longest duration shown: anything longer is shown as this.
+    /// </summary>
+    internal static readonly TimeSpan MaxDuration = TimeSpan.FromDays(3650);
+
+    private static TimeSpan Clamp(TimeSpan t) => t > MaxDuration ? MaxDuration : t;
 
     /// <summary>
     /// The detail of a live run: the gate round, the last tool and its age, or the quiet age.
@@ -184,7 +192,7 @@ internal static class StatusText
             return "(signalled)";
         }
 
-        string turns = StatusProbe.NumOrNull(doc["live"]?["turns"]) is { } t ? ", " + t.ToString(_ic) + " turns" : string.Empty;
+        string turns = StatusProbe.NumOrNull((doc["live"] as JsonObject)?["turns"]) is { } t ? ", " + t.ToString(_ic) + " turns" : string.Empty;
         return runDir + turns;
     }
 
@@ -217,10 +225,36 @@ internal static class StatusText
         o["detail"] = r.Detail;
         if (r.Quiet is { } q)
         {
-            o["quiet_ms"] = (long)q.TotalMilliseconds;
+            o["quiet_ms"] = (long)Clamp(q).TotalMilliseconds;
         }
 
         return o;
+    }
+
+    /// <summary>
+    /// The detail of a row whose content could not be shown.
+    /// </summary>
+    internal const string UnshowableDetail = "the run's status holds content that cannot be shown";
+
+    /// <summary>
+    /// <paramref name="r"/> when both outputs can show it (its plain cells and its --json object are
+    /// built and written once here, at <paramref name="now"/>), else an unreadable row for its
+    /// directory with a fixed detail: whatever a run's files hold, the failure stays in its row.
+    /// </summary>
+    public static StatusRow Checked(StatusRow r, DateTimeOffset now)
+    {
+        try
+        {
+            _ = Cells(r, now).Select((cell, c) => TerminalText.Clean(cell, CellLimits[c])).ToArray();
+            _ = RowJson(r).ToJsonString(Json.Indented);
+            return r;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            string id = Path.GetFileName(Path.TrimEndingDirectorySeparator(r.Dir));
+            return new StatusRow(r.Dir, StatusReader.StampName(id), StatusStates.Unreadable, Liveness.Unknown, Status: null,
+                UnshowableDetail, r.StartedAt, EndedAt: null, Attention: true, Quiet: null);
+        }
     }
 
     private static string Money(decimal? usd) => usd is { } d ? "$" + d.ToString("0.00", _ic) : "-";
@@ -234,6 +268,8 @@ internal static class StatusText
         {
             t = TimeSpan.Zero;
         }
+
+        t = Clamp(t);
 
         if (t.TotalHours >= 1)
         {

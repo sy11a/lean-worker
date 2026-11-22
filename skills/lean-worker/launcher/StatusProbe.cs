@@ -28,14 +28,20 @@ internal sealed class StatusProbe(ProcFs proc, string? bootId)
             return Unknown("the current boot id cannot be read");
         }
 
-        if (recordedBoot is null || ticks is null || pid <= 0 || pid > int.MaxValue)
+        if (recordedBoot is null)
         {
             return Unknown("no launcher identity recorded");
         }
 
+        // The boot first: a launcher of another boot is gone whatever else the file recorded.
         if (!string.Equals(recordedBoot, bootId, StringComparison.Ordinal))
         {
             return new LauncherVerdict(LeanWorker.Liveness.Gone, OtherBoot: true, Reason: null);
+        }
+
+        if (ticks is null || pid <= 0 || pid > int.MaxValue)
+        {
+            return Unknown("no launcher identity recorded");
         }
 
         ProcProbe probe = proc.Stat((int)pid);
@@ -52,7 +58,8 @@ internal sealed class StatusProbe(ProcFs proc, string? bootId)
     /// Step 5 for a run that ended with neither an end record nor a summary: another boot is lost
     /// with no scan; a group leader with the recorded worker start ticks is orphaned; a leader pid
     /// with other start ticks is a recycled number, lost; a gone leader with members left in the
-    /// recorded group and session is orphaned; otherwise lost. A probe that fails is unknown.
+    /// recorded group and session is orphaned; otherwise lost. Without recorded worker start ticks
+    /// only the member scan decides. A probe that fails is unknown.
     /// </summary>
     public GroupVerdict Group(JsonObject? worker, bool otherBoot)
     {
@@ -74,12 +81,9 @@ internal sealed class StatusProbe(ProcFs proc, string? bootId)
             return new GroupVerdict(StatusStates.Lost, "launcher gone; the worker had no process group of its own");
         }
 
-        if (ticks is null)
-        {
-            return new GroupVerdict(StatusStates.Unknown, "launcher gone; the worker's start time was not recorded");
-        }
-
-        return Leader((int)group, ticks.Value, sid);
+        // Without the worker's start ticks the leader cannot be told from a recycled pid: no probe
+        // failed, so the members of the recorded group and session decide (orphaned, else lost).
+        return ticks is { } start ? Leader((int)group, start, sid) : Members((int)group, sid);
     }
 
     private GroupVerdict Leader(int pgid, long ticks, long? sid)

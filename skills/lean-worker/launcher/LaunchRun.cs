@@ -1496,7 +1496,12 @@ internal sealed class LaunchRun
             reportedModel = u.Model;
         }
         bool capReached = meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
-        live?.OnLine(runtime, obj, usage: true);
+        // At the cap the stop comes first: this line's status write is skipped (finishing and done show the final counters).
+        if (!capReached)
+        {
+            live?.OnLine(runtime, obj, usage: true);
+        }
+
         return capReached;
     }
 
