@@ -102,7 +102,8 @@ public sealed class StatusChainTests : IDisposable
     [Fact]
     public async Task A_finished_chain_is_one_row_in_the_final_state_of_its_latest_round_and_counts_as_one_endedAsync()
     {
-        StatusIndexRig.Added first = FirstRound();
+        // One launcher (900, ended) ran all three rounds, as a real chain's launcher does.
+        StatusIndexRig.Added first = _rig.Add("chain", _mine, endedAgo: TimeSpan.FromMinutes(25), startedAgo: TimeSpan.FromMinutes(30));
         _ = _rig.Add("chain-gate2", _mine, endedAgo: TimeSpan.FromMinutes(2), startedAgo: TimeSpan.FromMinutes(20), status: "wrapped-up", chain: first.Id, round: 2);
         _ = _rig.Add("chain-gate3", _mine, endedAgo: TimeSpan.FromMinutes(1), startedAgo: TimeSpan.FromMinutes(10), status: "error", chain: first.Id, round: 3);
 

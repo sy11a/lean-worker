@@ -9,6 +9,7 @@ namespace LeanWorker.Tests;
 /// written once and never rewritten or replaced, where the folder is, and that an index that cannot be written never
 /// changes the run (one note, the status file still written).
 /// </summary>
+[Collection("launcher-process-state")]
 public sealed class RunStatusPointerTests : IDisposable
 {
     private const int LauncherPid = 4000;

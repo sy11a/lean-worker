@@ -97,7 +97,7 @@ public sealed class StatusIndexReaderTests : IDisposable
     [Fact]
     public async Task A_removed_run_dir_is_a_gone_row_that_is_ended_and_needs_no_attentionAsync()
     {
-        StatusIndexRig.Added run = _rig.Add("removed", _mine);
+        StatusIndexRig.Added run = _rig.Add("removed", _mine, tweak: d => d["launcher"]!["pid"] = 900);
         Directory.Delete(run.Dir, recursive: true);
 
         (_, string plain) = await _rig.CallAsync(Caller());
@@ -114,7 +114,7 @@ public sealed class StatusIndexReaderTests : IDisposable
     [Fact]
     public async Task A_run_dir_without_its_status_file_is_a_gone_row_when_it_was_reached_through_a_pointerAsync()
     {
-        StatusIndexRig.Added run = _rig.Add("no-status", _mine);
+        StatusIndexRig.Added run = _rig.Add("no-status", _mine, tweak: d => d["launcher"]!["pid"] = 900);
         File.Delete(Path.Combine(run.Dir, "status.json"));
 
         JsonObject row = await OneRowAsync();

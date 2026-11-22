@@ -100,8 +100,8 @@ public sealed class StatusIndexReapTests : IDisposable
     [Fact]
     public async Task A_gone_run_loses_its_pointer_when_the_pointer_is_more_than_7_days_oldAsync()
     {
-        StatusIndexRig.Added old = _rig.Add("gone-old", _mine, startedAgo: _week + _second);
-        StatusIndexRig.Added young = _rig.Add("gone-young", _mine, startedAgo: _week - _second);
+        StatusIndexRig.Added old = _rig.Add("gone-old", _mine, startedAgo: _week + _second, tweak: d => d["launcher"]!["pid"] = 900);
+        StatusIndexRig.Added young = _rig.Add("gone-young", _mine, startedAgo: _week - _second, tweak: d => d["launcher"]!["pid"] = 900);
         Directory.Delete(old.Dir, recursive: true);
         Directory.Delete(young.Dir, recursive: true);
 
@@ -178,7 +178,7 @@ public sealed class StatusIndexReapTests : IDisposable
     {
         StatusIndexRig.Added ended = _rig.Add("ended-long-ago", _mine, endedAgo: TimeSpan.FromDays(20), startedAgo: TimeSpan.FromDays(21));
         StatusIndexRig.Added lost = Lost("lost-long-ago", TimeSpan.FromDays(20));
-        StatusIndexRig.Added gone = _rig.Add("gone-long-ago", _mine, startedAgo: TimeSpan.FromDays(20));
+        StatusIndexRig.Added gone = _rig.Add("gone-long-ago", _mine, startedAgo: TimeSpan.FromDays(20), tweak: d => d["launcher"]!["pid"] = 900);
         Directory.Delete(gone.Dir, recursive: true);
         string[] before = StatusIndexRig.Snapshot(_rig.Root, _rig.Proc.Root);
 

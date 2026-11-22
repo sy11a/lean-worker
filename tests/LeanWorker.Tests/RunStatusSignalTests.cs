@@ -11,6 +11,7 @@ namespace LeanWorker.Tests;
 /// signal: what <c>Signalled</c> writes, when it writes nothing, and that it gives up after a bounded wait when a
 /// status write holds the lock. The real-signal test is in LauncherSignalProcessTests.
 /// </summary>
+[Collection("launcher-process-state")]
 public sealed class RunStatusSignalTests : IDisposable
 {
     private readonly StatusRig _rig = new(new OpencodeRuntime());
