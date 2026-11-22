@@ -9,7 +9,7 @@
 // .NET 11 runtime the launcher rolls forward to: an inherited ignored SIGHUP stays in SigIgn, but
 // the runtime's own SIGTERM handler is installed before Main, so an ignored SIGTERM is not in
 // SigIgn; a handler for it runs and the launcher survives, which is why RunStatus drops a
-// recorded end as soon as the launcher writes again.
+// recorded end when the launcher is still running after RunStatus.SignalHold.
 
 using System.Runtime.InteropServices;
 

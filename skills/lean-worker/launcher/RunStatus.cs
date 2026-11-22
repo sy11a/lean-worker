@@ -54,6 +54,13 @@ internal sealed class RunStatus
     internal static readonly TimeSpan RefreshAfter = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// How long the writes stay held back after a recorded signal: a launcher still running when
+    /// this has passed survived the signal (its default action did not end it), and the file shows
+    /// its own state again.
+    /// </summary>
+    internal static readonly TimeSpan SignalHold = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// The longest tool name stored: the name comes from the worker's stream.
     /// </summary>
     internal const int ToolNameLimit = 64;
@@ -80,7 +87,11 @@ internal sealed class RunStatus
     private DateTimeOffset? _lastEventAt;
     private LastTool? _lastTool;
     private JsonObject? _end;
-    private (string Phase, int? GateRound)? _beforeSignal;
+    // The recorded signal's end while the hold runs: the file shows it (phase failed, no gate round)
+    // over the run's own state, which the held-back writers keep updating underneath.
+    private JsonObject? _signalEnd;
+    private IDisposable? _holdTimer;
+    private long _holdGeneration;
     private long _seq;
     private string? _shown;
     private long _lastWriteTimestamp;
@@ -101,6 +112,7 @@ internal sealed class RunStatus
         _lastWriteTimestamp = _startTimestamp;
         _path = Path.Combine(spec.RunDir, FileName);
         _launcherPid = launcherPid;
+        HoldTimer = (due, fire) => clock.CreateTimer(_ => fire(), state: null, due, Timeout.InfiniteTimeSpan);
         _launcher = new JsonObject { ["pid"] = launcherPid, ["start_ticks"] = null, ["boot_id"] = null };
         BestEffort(() =>
         {
@@ -109,6 +121,13 @@ internal sealed class RunStatus
             _launcher["boot_id"] = proc.BootId();
         });
     }
+
+    /// <summary>
+    /// The one-shot timer of the signal hold (the test seam): it calls the action once after the
+    /// time given and is disposed to cancel it. The default is a timer of the writer's clock, which
+    /// never keeps the process alive.
+    /// </summary>
+    internal Func<TimeSpan, Action, IDisposable> HoldTimer { get; set; }
 
     /// <summary>
     /// The sequence number of the last write (0 before the first).
@@ -228,8 +247,11 @@ internal sealed class RunStatus
 
     /// <summary>
     /// The launcher got <paramref name="signal"/>: unless the run already has its end, the file
-    /// gets <c>phase: failed</c> and <c>end.status: launcher-signalled</c> with the signal's name.
-    /// The wait for the lock and the write together take at most <see cref="SignalLockWait"/>: they
+    /// gets <c>phase: failed</c> and <c>end.status: launcher-signalled</c> with the signal's name,
+    /// and the other writes are held back for <see cref="SignalHold"/> (a second signal records
+    /// again and restarts it), so none erases the record while the launcher dies of it; a launcher
+    /// still running then survived it and the file shows its own state again (<c>Finish</c> and
+    /// <c>Fail</c> write their end at once). The wait for the lock and the write together take at most <see cref="SignalLockWait"/>: they
     /// run on a thread of their own, and a write in progress that holds the lock longer, or a write
     /// of the handler's own that blocks (a stalled disk), is abandoned, so the handler can never
     /// deadlock with the writer and the signal's default action follows either way. True when it
@@ -269,10 +291,11 @@ internal sealed class RunStatus
                 return false;
             }
 
-            _beforeSignal = (_phase, _gateRound);
-            _phase = RunPhase.Failed;
-            _gateRound = null;
-            _end = new JsonObject
+            // The hold starts (or, for a second signal during it, starts again) before the record is
+            // set: a record whose write throws is still taken back when the hold ends.
+            JsonObject? before = _signalEnd;
+            StartHold();
+            _signalEnd = new JsonObject
             {
                 ["status"] = LauncherSignalled,
                 ["exit_code"] = null,
@@ -286,7 +309,12 @@ internal sealed class RunStatus
                 return true;
             }
 
-            SurvivedSignal();
+            _signalEnd = before;
+            if (before is null)
+            {
+                StopHold();
+            }
+
             return false;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
@@ -302,21 +330,63 @@ internal sealed class RunStatus
     }
 
     /// <summary>
-    /// Under the lock, before any later write: a launcher that still writes survived the signal it
-    /// recorded (its default action did not end it: a SIGTERM inherited as ignored, which the
-    /// runtime's own handler hides from SigIgn, does that), so that end goes and the phase before
-    /// the signal is back until the write sets its own.
+    /// Under the lock: (re)starts the one-shot timer of the signal hold. Only the timer of the
+    /// latest start acts when it fires.
     /// </summary>
-    private void SurvivedSignal()
+    private void StartHold()
     {
-        if (_beforeSignal is not { } before)
+        StopHold();
+        long generation = _holdGeneration;
+        _holdTimer = HoldTimer(SignalHold, () => BestEffort(() => HoldEnded(generation)));
+    }
+
+    /// <summary>
+    /// Under the lock: cancels the hold's timer; a callback already on its way finds a newer
+    /// generation and does nothing.
+    /// </summary>
+    private void StopHold()
+    {
+        _holdGeneration++;
+        IDisposable? timer = _holdTimer;
+        _holdTimer = null;
+        timer?.Dispose();
+    }
+
+    /// <summary>
+    /// The hold's timer fired: the launcher is still running, so it survived the signal it recorded
+    /// (its default action did not end it: a SIGTERM inherited as ignored, which the runtime's own
+    /// handler hides from SigIgn, does that). The record goes and one write shows the run's own
+    /// state, with whatever the held-back writers changed. Nothing happens after the run's end, or
+    /// for a timer a later signal or the end replaced.
+    /// </summary>
+    private void HoldEnded(long generation)
+    {
+        lock (_lock)
+        {
+            if (generation != _holdGeneration || _signalEnd is null || _end is not null)
+            {
+                return;
+            }
+
+            StopHold();
+            _signalEnd = null;
+            WriteLocked();
+        }
+    }
+
+    /// <summary>
+    /// Under the lock: a normal write, unless a recorded signal is held (the launcher may be dying
+    /// of it, and no write may erase the record before that); the state it carries is written when
+    /// the hold ends.
+    /// </summary>
+    private void WriteUnlessHeld()
+    {
+        if (_signalEnd is not null)
         {
             return;
         }
 
-        (_phase, _gateRound) = before;
-        _end = null;
-        _beforeSignal = null;
+        WriteLocked();
     }
 
     /// <summary>
@@ -374,9 +444,8 @@ internal sealed class RunStatus
                 ["sid"] = pgid is not null && present ? probe.Stat.Session : null,
                 ["start_ticks"] = present ? probe.Stat.StartTicks : null,
             };
-            SurvivedSignal();
             _phase = RunPhase.Worker;
-            WriteLocked();
+            WriteUnlessHeld();
         }
     }
 
@@ -399,7 +468,6 @@ internal sealed class RunStatus
     {
         lock (_lock)
         {
-            SurvivedSignal();
             DateTimeOffset now = _clock.GetUtcNow();
             _lastEventAt = now;
             bool due = activity is not null;
@@ -415,7 +483,7 @@ internal sealed class RunStatus
 
             if (due || _clock.GetElapsedTime(_lastWriteTimestamp) >= RefreshAfter)
             {
-                WriteLocked();
+                WriteUnlessHeld();
             }
         }
     }
@@ -455,10 +523,9 @@ internal sealed class RunStatus
     {
         lock (_lock)
         {
-            SurvivedSignal();
             _phase = phase;
             _gateRound = phase is RunPhase.Gate ? gateRound : null;
-            WriteLocked();
+            WriteUnlessHeld();
         }
     }
 
@@ -478,7 +545,9 @@ internal sealed class RunStatus
         {
             _phase = RunPhase.Done;
             _gateRound = null;
-            _beforeSignal = null;
+            // The run's own end replaces a held signal record at once.
+            StopHold();
+            _signalEnd = null;
             _end = new JsonObject
             {
                 ["status"] = status,
@@ -508,7 +577,8 @@ internal sealed class RunStatus
         {
             _phase = RunPhase.Failed;
             _gateRound = null;
-            _beforeSignal = null;
+            StopHold();
+            _signalEnd = null;
             _end = new JsonObject
             {
                 ["status"] = LaunchFailed,
@@ -719,7 +789,8 @@ internal sealed class RunStatus
     {
         live["elapsed_ms"] = (long)_clock.GetElapsedTime(_startTimestamp).TotalMilliseconds;
         live["last_event_at"] = _lastEventAt is { } at ? Stamp(at) : null;
-        live["gate_round"] = _gateRound;
+        bool signalled = _signalEnd is not null;
+        live["gate_round"] = signalled ? null : _gateRound;
         if (_gateMaxRounds is { } maxRounds)
         {
             live["gate_max_rounds"] = maxRounds;
@@ -743,9 +814,9 @@ internal sealed class RunStatus
             ["worker"] = _worker?.DeepClone(),
             ["owner"] = _owner?.ToJson(),
             ["spec"] = SpecJson(),
-            ["phase"] = _phase,
+            ["phase"] = signalled ? RunPhase.Failed : _phase,
             ["live"] = live,
-            ["end"] = _end?.DeepClone(),
+            ["end"] = (_signalEnd ?? _end)?.DeepClone(),
         };
     }
 

@@ -74,8 +74,8 @@ internal static class StatusLayout
     /// (Launcher.RunAsync loops over the rounds), which the launcher names the chain after its first
     /// round's run dir; so a chain is the run whose id is the chain id plus the rows of that chain
     /// id whose launcher identity (pid, start ticks and boot id, the same in the status file and
-    /// the pointer) is that run's, all with distinct round numbers. A row that does not prove its
-    /// membership so stands alone, and none is hidden behind another.
+    /// the pointer) is that run's, in the shape an honest chain has (<see cref="Shaped"/>). When
+    /// they do not, every row of the chain id stands alone, and none is hidden behind another.
     /// </summary>
     private static IEnumerable<List<StatusRow>> Groups(IReadOnlyList<StatusRow> rows)
     {
@@ -101,8 +101,8 @@ internal static class StatusLayout
 
     /// <summary>
     /// The rows of <paramref name="claims"/> (one chain id, in round order) that are the chain: its
-    /// first run and the rows launched by that run's launcher, when their round numbers are
-    /// distinct; empty when they are no chain.
+    /// first run and the rows launched by that run's launcher, when they have a chain's shape;
+    /// empty when they are no chain.
     /// </summary>
     private static List<StatusRow> Members(List<StatusRow> claims)
     {
@@ -113,7 +113,48 @@ internal static class StatusLayout
         }
 
         List<StatusRow> members = [.. claims.Where(r => string.Equals(LauncherIdentity(r), launcher, StringComparison.Ordinal))];
-        return new HashSet<long>(members.Select(r => Round(r))).Count == members.Count ? members : [];
+        return Shaped(members, first) ? members : [];
+    }
+
+    /// <summary>
+    /// Whether <paramref name="members"/> (in round order) have the shape an honest chain has; the
+    /// launcher identity can be copied from another run's files, so the proof alone is not enough.
+    /// The launcher numbers a chain's rounds 1, 2, ... in one process (round 1 is the run whose dir
+    /// names the chain; Launcher.RunAsync starts round k+1 only after round k's gate said continue,
+    /// and the gate runs only after a <c>success</c> worker, which is the status round k's end
+    /// records). So the rounds are exactly 1..N with <paramref name="first"/> as round 1; every
+    /// round below N ended <c>success</c> or has no end (its final write was lost); and a round that
+    /// reads live and not ending can only be round N (the one round its launcher still runs).
+    /// </summary>
+    private static bool Shaped(List<StatusRow> members, StatusRow first)
+    {
+        if (!ReferenceEquals(members[0], first))
+        {
+            return false;
+        }
+
+        for (int i = 0; i < members.Count; i++)
+        {
+            StatusRow r = members[i];
+            if (Round(r) != i + 1)
+            {
+                return false;
+            }
+
+            bool last = i == members.Count - 1;
+            if (!last && r.Status?["end"] is { } end
+                && !(end is JsonObject ended && string.Equals(Json.Str(ended, "status"), "success", StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            if (!last && r.Live && r.State is not StatusStates.Ending)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
