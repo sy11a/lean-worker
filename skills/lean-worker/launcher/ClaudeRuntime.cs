@@ -270,4 +270,47 @@ internal sealed class ClaudeRuntime : IRuntime
     public void Finish(Outcome o, int exitCode)
     {
     }
+
+    /// <summary>
+    /// claude counts its turns only on the result line, so there is no live count before it.
+    /// </summary>
+    public long? LiveTurns(Outcome o) => o.HasResult ? o.Turns : null;
+
+    /// <summary>
+    /// The live status's view of a stream line: an assistant message's tool_use blocks start a
+    /// tool call (the last one named wins), a user message's tool_result block finishes the call
+    /// its tool_use_id names, and a system/api_retry event is a retry.
+    /// </summary>
+    public StreamActivity? Activity(JsonObject line)
+    {
+        string? type = Json.Str(line, "type");
+        if (type is "system")
+        {
+            return Json.Str(line, "subtype") is "api_retry" ? StreamActivity.Problem : null;
+        }
+
+        if (type is not ("assistant" or "user") || line["message"] is not JsonObject msg || msg["content"] is not JsonArray content)
+        {
+            return null;
+        }
+
+        StreamActivity? last = null;
+        foreach (JsonObject block in content.OfType<JsonObject>())
+        {
+            last = ContentActivity(type, block) ?? last;
+        }
+
+        return last;
+    }
+
+    private static StreamActivity? ContentActivity(string type, JsonObject block)
+    {
+        return (type, Json.Str(block, "type")) switch
+        {
+            ("assistant", "tool_use") => StreamActivity.ToolStart(Json.Str(block, "name") ?? "?", Json.Str(block, "id")),
+            ("user", "tool_result") => StreamActivity.ToolEnd(tool: null, Json.Str(block, "tool_use_id"),
+                Json.Bool(block, "is_error") ? StreamActivity.Error : StreamActivity.Completed),
+            _ => null,
+        };
+    }
 }

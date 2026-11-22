@@ -272,43 +272,14 @@ internal static class ProcessGroup
     }
 
     /// <summary>
-    /// The fields of a process's stat line that matter here: its state and its process group.
-    /// </summary>
-    private readonly record struct ProcStat(char State, int Pgrp);
-
-    /// <summary>
-    /// The stat line of a process, read from /proc: its state (the third field of the line) and its
-    /// process group (the fifth) — counted after the command name, which sits in parentheses and
-    /// may hold spaces and parentheses of its own. Null when the process is gone or its line
-    /// cannot be read.
+    /// The stat line of a process, read from /proc (<see cref="ProcFs.Stat"/>, which counts the
+    /// fields after the command name): its state and its process group among them. Null when the
+    /// process is gone or its line cannot be read.
     /// </summary>
     private static ProcStat? Stat(int pid)
     {
-        try
-        {
-            string line = File.ReadAllText("/proc/" + pid.ToString(CultureInfo.InvariantCulture) + "/stat");
-            // The command name sits in parentheses and can hold spaces and parentheses of its own:
-            // the fields after the last ')' are the ones that matter.
-            int close = line.LastIndexOf(')');
-            if (close < 0)
-            {
-                return null;
-            }
-
-            string[] fields = line[(close + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (fields.Length < 3 || fields[0].Length is 0)
-            {
-                return null;
-            }
-
-            return new ProcStat(
-                fields[0][0],
-                int.Parse(fields[2], CultureInfo.InvariantCulture));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or OverflowException or ArgumentException)
-        {
-            return null;
-        }
+        ProcProbe probe = ProcFs.Host.Stat(pid);
+        return probe.Kind is ProbeKind.Present ? probe.Stat : null;
     }
 
     /// <summary>

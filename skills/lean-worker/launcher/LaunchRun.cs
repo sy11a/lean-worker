@@ -135,6 +135,10 @@ internal sealed class LaunchRun
     // Status
     private string _status = string.Empty;
 
+    // The live status file (status.json): null before the run dir exists and with LEAN_WORKER_STATUS=off.
+    private RunStatus? _live;
+    private bool _summaryWritten;
+
     // Gate chain (round 1 has no GateContext; round N+1 builds it from round N's GateOutcome).
     /// <summary>
     /// The chain loop reads <c>LastGate</c> to decide whether to start the next round; the rest are the chain
@@ -270,22 +274,29 @@ internal sealed class LaunchRun
             ResolveMode();
             await SnapshotTrustAsync().ConfigureAwait(false);
             await PrepareTaskAsync().ConfigureAwait(false);
+            OpenStatus();
             await WriteSystemAsync().ConfigureAwait(false);
             await ExecuteAsync().ConfigureAwait(false);
             _status = Status();
             await RunGateAsync().ConfigureAwait(false);
+            _live?.Finishing();
             await FinishWorktreeAsync().ConfigureAwait(false);
             await ComputeSummaryStatsAsync().ConfigureAwait(false);
+            _live?.AddNoteTo(_notes);
             BuildSummary();
             await WriteSummaryAsync().ConfigureAwait(false);
-            await PrintAsync().ConfigureAwait(false);
             // The exit code of the launcher: 0 for a success, 3 for a wrap-up (the run continues on the
             // operator's go), 1 for every other status — a failed run, and a run the provider's
             // output limit truncated (issue #115) alike.
-            return _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
+            int code = _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
+            _live?.Finish(_status, Launcher.ChainExitCode(LastGate, code));
+            await PrintAsync().ConfigureAwait(false);
+            return code;
         }
-        catch
+        catch (Exception ex)
         {
+            // The status file records the failure (with the summary's status when it was written).
+            _live?.Fail(ex.Message, _summaryWritten ? _status : null);
             // A launch that dies leaves the worktree behind as well: the same decision as after a
             // finished run, reported on the error stream (the run's own report is never written).
             // A launch that died before the after-worker pass could say whether the run touched
@@ -1029,6 +1040,16 @@ internal sealed class LaunchRun
     }
 
     /// <summary>
+    /// The live status file (status.json), right after the run dir exists: what it records about
+    /// this run from its start.
+    /// </summary>
+    private void OpenStatus()
+    {
+        _live = RunStatus.Open(RunDir, _name, ChainId, Round, _profileName, _runtimeName, _provider, _model,
+            _budget, _wrapUp ? _budget * _wrapUpAt : null, _o.TimeoutMinutes, _started, _worktree?.WorktreePath);
+    }
+
+    /// <summary>
     /// A task text without its continuation and gate sections: the part that is the original task
     /// (a fresh worker gets it, and a gate round builds on it).
     /// </summary>
@@ -1133,6 +1154,8 @@ internal sealed class LaunchRun
         Outcome outcome = _outcome;
         string model = _model;
         string? reportedModel = null;
+        RunStatus? live = _live;
+        live?.Track(meter, outcome, runtime);
         int exitCode;
         bool timedOut;
         bool capKilled;
@@ -1141,7 +1164,8 @@ internal sealed class LaunchRun
             await File.WriteAllTextAsync(Path.Combine(RunDir, "command.txt"), prepared.CommandText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
             await TakeBeforeSnapshotsAsync().ConfigureAwait(false);
             (exitCode, timedOut, capKilled) = await Launcher.RunWorkerAsync(prepared, _taskText, streamPath, _stderrPath, _o.TimeoutMinutes,
-                line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel)).ConfigureAwait(false);
+                line => runtime.Record(line), line => HandleUsageLine(line, runtime, outcome, meter, model, ref reportedModel, live),
+                live).ConfigureAwait(false);
         }
         finally
         {
@@ -1453,7 +1477,7 @@ internal sealed class LaunchRun
         return changed.Count is 0 ? outOfScope : [.. outOfScope ?? [], .. changed.Select(f => InvokingPrefix + f)];
     }
 
-    private static bool HandleUsageLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model, ref string? reportedModel)
+    private static bool HandleUsageLine(string line, IRuntime runtime, Outcome outcome, Meter meter, string model, ref string? reportedModel, RunStatus? live)
     {
         if (Json.TryParseObject(line) is not { } obj)
         {
@@ -1463,6 +1487,7 @@ internal sealed class LaunchRun
         Usage? u = runtime.Parse(obj, outcome);
         if (u is null)
         {
+            live?.OnLine(runtime, obj, usage: false);
             return false;
         }
 
@@ -1470,7 +1495,14 @@ internal sealed class LaunchRun
         {
             reportedModel = u.Model;
         }
-        return meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
+        bool capReached = meter.Add(u.Model.Length > 0 ? u : u with { Model = model });
+        // At the cap the stop comes first: this line's status write is skipped (finishing and done show the final counters).
+        if (!capReached)
+        {
+            live?.OnLine(runtime, obj, usage: true);
+        }
+
+        return capReached;
     }
 
     private async Task SnapshotTrustAsync()
@@ -1857,19 +1889,7 @@ internal sealed class LaunchRun
     // (The anchor the declared outputs resolve against is the workspace root, the same one the
     // trust entries resolve against.)
 
-    private static string ResolveOutputEntry(string entry, string anchor, string label)
-    {
-        try
-        {
-            return Path.GetFullPath(Path.Combine(anchor, entry));
-        }
-        catch (ArgumentException ex)
-        {
-            // Spec validation (non-empty, no globs, no ".." in a relative entry) has passed; this is a
-            // path the OS layer still refuses. A configuration mistake → launch error, not a crash.
-            throw new LaunchException($"profile {label}.outputs entry '{entry}' is invalid: {ex.Message}");
-        }
-    }
+    private static string ResolveOutputEntry(string entry, string anchor, string label) => GateSpec.ResolveOutputEntry(entry, anchor, label);
 
     /// <summary>
     /// Refuses a round-1 snapshot value in a bad state (<see cref="GateTrust.IsBadValue"/>: nonregular
@@ -2051,6 +2071,8 @@ internal sealed class LaunchRun
         {
             return;
         }
+
+        _live?.GateStarted(Round);
 
         // One round: every command in profile order, each between its own two trust checks. A
         // finding never stops the round (the worker should see every tool's findings at once); the
@@ -2349,14 +2371,7 @@ internal sealed class LaunchRun
         _report = _outcome.Report;
         Meter meter = NonNull(_meter);
         _calls = meter.Calls();
-        _tok = new JsonObject
-        {
-            ["input"] = _calls.Sum(c => c.Input),
-            ["cache_write"] = _calls.Sum(c => c.CacheWrite5m + c.CacheWrite1h),
-            ["cache_read"] = _calls.Sum(c => c.CacheRead),
-            ["output"] = _calls.Sum(c => c.Output + c.Reasoning),
-            ["thinking"] = _outcome.Thinking,
-        };
+        _tok = Usage.Totals(_calls, _outcome.Thinking);
         List<long> contexts = [.. _calls.Select(c => c.Context)];
         _first = contexts.Count > 0 ? contexts[0] : 0;
         _peak = contexts.Count > 0 ? contexts.Max() : 0;
@@ -2524,6 +2539,7 @@ internal sealed class LaunchRun
         _evidence = evidence;
         _summary["evidence_lines"] = new JsonArray([.. evidence.Select(line => (JsonNode)line)]);
         await Launcher.WritePlainAsync(Path.Combine(RunDir, "summary.json"), _summary.ToJsonString(Json.Indented)).ConfigureAwait(false);
+        _summaryWritten = true;
         await Launcher.WritePlainAsync(Path.Combine(RunDir, "report.md"), EvidenceBlock.Render(_report, evidence)).ConfigureAwait(false);
         await File.AppendAllTextAsync(Path.Combine(_runsRoot, "runs.jsonl"), _summary.ToJsonString() + Environment.NewLine, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }

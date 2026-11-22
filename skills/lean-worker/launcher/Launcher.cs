@@ -65,12 +65,21 @@ internal static class Launcher
             code = await run.RunAsync().ConfigureAwait(false);
         }
 
-        if (run.LastGate is null)
+        return ChainExitCode(run.LastGate, code);
+    }
+
+    /// <summary>
+    /// The launcher's exit code after a round: the round's own code, or the gate chain's when the
+    /// round's gate ended the chain (0 clean, 4 stuck, 5 error).
+    /// </summary>
+    internal static int ChainExitCode(GateOutcome? lastGate, int code)
+    {
+        if (lastGate is null)
         {
             return code;
         }
 
-        return run.LastGate.Decision switch
+        return lastGate.Decision switch
         {
             GateChain.Clean => 0,
             GateChain.Stuck => 4,
@@ -122,10 +131,11 @@ internal static class Launcher
     /// timeout with exit code -1, whatever code the kill left behind.
     /// </summary>
     internal static async Task<(int ExitCode, bool TimedOut, bool CapKilled)> RunWorkerAsync(Prepared prep, string stdin,
-        string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine)
+        string streamPath, string stderrPath, int timeoutMinutes, Func<string, bool> record, Func<string, bool> onLine,
+        RunStatus? live = null)
     {
         (int exitCode, bool timedOut, bool capKilled) =
-            await WorkerProcess.RunAsync(prep, stdin, streamPath, stderrPath, timeoutMinutes, record, onLine).ConfigureAwait(false);
+            await WorkerProcess.RunAsync(prep, stdin, streamPath, stderrPath, timeoutMinutes, record, onLine, live).ConfigureAwait(false);
         return (timedOut ? -1 : exitCode, timedOut, capKilled);
     }
 
@@ -233,6 +243,25 @@ internal static class Launcher
         try
         {
             await File.WriteAllTextAsync(temp, content, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            try { File.Delete(temp); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// The synchronous twin of <see cref="WritePlainAsync"/> (temp sibling plus rename), for the
+    /// stream thread's status writes.
+    /// </summary>
+    internal static void WritePlain(string path, string content)
+    {
+        string temp = TempSibling(path);
+        try
+        {
+            File.WriteAllText(temp, content, Json.Utf8);
             File.Move(temp, path, overwrite: true);
         }
         finally
