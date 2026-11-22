@@ -257,7 +257,8 @@ The `dir` field holds the absolute path; `<repo>` stands for it here.
   shown cause no write. The measured rate of kept lines in recent runs is at most about 1.3 per
   second, and the qualifying events are far fewer (current-state, verification log), so there is no
   throttle and no timer. If a later runtime streams faster, a one-second coalescing floor is the
-  fallback.
+  fallback. Slice 1: a line that changes nothing shown still rewrites the file when the last write
+  is 30 seconds old, so `last_event_at` stays current; still no timer, the stream lines drive it.
 - No separate heartbeat. Liveness is proven by pid plus start time (below), not by a fresh mtime;
   `updated_at` and `last_event_at` are shown as ages only.
 - Best effort: an `IOException` or `UnauthorizedAccessException` on a status write never fails the
@@ -349,7 +350,9 @@ worker, which could rewrite both files; that is the same exposure `summary.json`
    `unknown`, never `lost`, and the run is not ended.
 7. Quietness is an annotation, never a state: a live run with `last_event_at` older than 10 minutes
    shows `quiet 41m` with a `!`. This is the #60 case: the launcher is alive, the worker is alive,
-   and nothing has come for a long time. The design shows it; it does not decide it.
+   and nothing has come for a long time. The design shows it; it does not decide it. Slice 1
+   annotates quiet only in the `worker` phase, since no stream lines arrive during a gate round,
+   and a zombie group leader does not count as alive (the group's members are looked for).
 
 **Reaping.** Any `status` call may delete a pointer, one file at a time, only on proof: the run is
 ended and ended more than 7 days ago, or it is `lost` and the pointer is more than 7 days old. An

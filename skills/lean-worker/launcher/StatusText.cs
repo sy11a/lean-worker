@@ -38,8 +38,9 @@ internal static class StatusText
     /// </summary>
     public static string Header(string scope, IReadOnlyCollection<StatusRow> rows, int hidden, string? since)
     {
+        int attention = rows.Count(r => r.Attention);
         string text = string.Create(_ic,
-            $"lean-worker status: {scope}, {rows.Count(r => r.Live)} live, {rows.Count(r => r.Ended)} ended, {rows.Count(r => r.Attention)} need attention");
+            $"lean-worker status: {TerminalText.Clean(scope, ScopeLimit)}, {rows.Count(r => r.Live)} live, {rows.Count(r => r.Ended)} ended, {attention} {(attention is 1 ? "needs" : "need")} attention");
         int legacy = rows.Count(r => r.State is StatusStates.Legacy);
         if (legacy > 0)
         {
@@ -55,11 +56,24 @@ internal static class StatusText
     }
 
     /// <summary>
-    /// The run lines, the columns padded to the widest value (names are never cut).
+    /// The longest value of each column the plain output prints (state, name, runtime, model,
+    /// calls, cost, elapsed, detail); a longer one is cut with a trailing <see cref="TerminalText.CutMark"/>.
+    /// </summary>
+    internal static readonly int[] CellLimits = [24, 120, 16, 64, 24, 32, 16, 300];
+
+    /// <summary>
+    /// The longest scope the header prints.
+    /// </summary>
+    internal const int ScopeLimit = 300;
+
+    /// <summary>
+    /// The run lines, the columns padded to the widest value. Every cell passes through
+    /// <see cref="TerminalText.Clean"/> with its column's limit, so one run stays one line whatever
+    /// its files hold.
     /// </summary>
     public static List<string> Lines(IReadOnlyList<StatusRow> rows, DateTimeOffset now)
     {
-        List<string[]> cells = [.. rows.Select(r => Cells(r, now))];
+        List<string[]> cells = [.. rows.Select(r => Cells(r, now).Select((cell, c) => TerminalText.Clean(cell, CellLimits[c])).ToArray())];
         int columns = cells.Count > 0 ? cells[0].Length : 0;
         int[] widths = [.. Enumerable.Range(0, columns).Select(c => cells.Max(row => row[c].Length))];
         return [.. cells.Select(row => string.Join("  ", row.Select((cell, c) => Pad(cell, widths[c], c))).TrimEnd())];

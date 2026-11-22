@@ -37,6 +37,11 @@ internal sealed class RunStatus
     /// </summary>
     internal static readonly TimeSpan RefreshAfter = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// The longest tool name stored: the name comes from the worker's stream.
+    /// </summary>
+    internal const int ToolNameLimit = 64;
+
     private static readonly JsonSerializerOptions _snakeCase = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
     private readonly object _lock = new();
@@ -317,13 +322,35 @@ internal sealed class RunStatus
         string state = activity.State ?? StreamActivity.Completed;
         if (activity.Kind is StreamActivityKind.ToolStart || (activity.Kind is StreamActivityKind.ToolEnd && activity.Tool is not null))
         {
-            _lastTool = new LastTool(activity.Tool ?? "?", activity.CallId, now, state);
+            _lastTool = new LastTool(ToolName(activity.Tool), activity.CallId, now, state);
         }
         else if (activity.Kind is StreamActivityKind.ToolEnd && _lastTool is not null && activity.CallId is not null
                  && string.Equals(activity.CallId, _lastTool.CallId, StringComparison.Ordinal))
         {
             _lastTool = _lastTool with { At = now, State = state };
         }
+    }
+
+    /// <summary>
+    /// A tool name as the file stores it: at most <see cref="ToolNameLimit"/> characters of
+    /// <c>[A-Za-z0-9_.:/-]</c>, any other character replaced by <c>?</c>; <c>?</c> when there is none.
+    /// </summary>
+    internal static string ToolName(string? tool)
+    {
+        if (string.IsNullOrEmpty(tool))
+        {
+            return "?";
+        }
+
+        string kept = tool.Length > ToolNameLimit ? tool[..ToolNameLimit] : tool;
+        return string.Create(kept.Length, kept, static (span, source) =>
+        {
+            for (int i = 0; i < source.Length; i++)
+            {
+                char c = source[i];
+                span[i] = char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or ':' or '/' or '-' ? c : '?';
+            }
+        });
     }
 
     private void WriteLocked()

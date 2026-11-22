@@ -18,6 +18,11 @@ internal static class StatusCommand
     public static readonly TimeSpan DefaultSince = TimeSpan.FromHours(24);
 
     /// <summary>
+    /// The longest usage-error message printed (it may echo an argument).
+    /// </summary>
+    private const int MessageLimit = 300;
+
+    /// <summary>
     /// Scopes and modes of later slices: named in the usage error instead of "unknown option".
     /// </summary>
     private static readonly string[] _later = ["--owner", "--all", "--whoami", "--wait", "--watch", "--key"];
@@ -42,7 +47,8 @@ internal static class StatusCommand
         }
         catch (LaunchException ex)
         {
-            await output.WriteLineAsync($"lean-worker status: {ex.Message}; usage: {Usage}").ConfigureAwait(false);
+            // The message may echo an argument (an unknown option, a --since value).
+            await output.WriteLineAsync($"lean-worker status: {TerminalText.Clean(ex.Message, MessageLimit)}; usage: {Usage}").ConfigureAwait(false);
             return 2;
         }
 
@@ -54,7 +60,7 @@ internal static class StatusCommand
             scope = Path.GetFullPath(run, cwd);
             if (!Directory.Exists(scope))
             {
-                await output.WriteLineAsync($"lean-worker status: no run dir {scope}; usage: {Usage}").ConfigureAwait(false);
+                await output.WriteLineAsync($"lean-worker status: no run dir {TerminalText.Clean(scope, StatusText.ScopeLimit)}; usage: {Usage}").ConfigureAwait(false);
                 return 2;
             }
 
@@ -90,11 +96,20 @@ internal static class StatusCommand
     }
 
     /// <summary>
-    /// Whether --here lists a row: live and unknown rows always; ended, legacy and unreadable rows
-    /// when they ended (or, without an end time, started) after the cutoff, or carry no time at all.
+    /// Whether --here lists a row: live, orphaned, unknown and unreadable rows always, whatever
+    /// their age (they are what the operator has to see); ended rows with a final state (lost
+    /// included) and legacy rows when they ended (or, without an end time, started) after the
+    /// cutoff, or carry no time at all.
     /// </summary>
-    private static bool Shown(StatusRow r, DateTimeOffset cutoff) =>
-        r.Live || r.State is StatusStates.Unknown || (r.EndedAt ?? r.StartedAt) is not { } t || t >= cutoff;
+    private static bool Shown(StatusRow r, DateTimeOffset cutoff)
+    {
+        if (r.Live || r.State is StatusStates.Orphaned or StatusStates.Unknown or StatusStates.Unreadable)
+        {
+            return true;
+        }
+
+        return (r.EndedAt ?? r.StartedAt) is not { } t || t >= cutoff;
+    }
 
     internal static StatusArgs Parse(string[] args)
     {
