@@ -74,7 +74,8 @@ public class RunAsyncCharacterizationTests
         Assert.Equal([RunAsyncGolden.BareWrapUpNote], RunAsyncGolden.Notes_(s));
         RunAsyncGolden.AssertLedgerHasOneRowEqualTo(root, s);
 
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
         Assert.Equal(RunAsyncGolden.BareCommand(root), RunAsyncGolden.Normalize(await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken), root).Replace("<ROOT>", root, StringComparison.Ordinal));
         Assert.Equal(RunAsyncGolden.ReportWithEvidence("DONE", s), await File.ReadAllTextAsync(Path.Combine(runDir, "report.md"), TestContext.Current.CancellationToken));
         Assert.Equal("do nothing", await File.ReadAllTextAsync(Path.Combine(runDir, "task.md"), TestContext.Current.CancellationToken));
@@ -118,7 +119,8 @@ public class RunAsyncCharacterizationTests
         Assert.Null(s["escalate_to"]);
         Assert.Equal([RunAsyncGolden.BareWrapUpNote], RunAsyncGolden.Notes_(s));
         RunAsyncGolden.AssertLedgerHasOneRowEqualTo(root, s);
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
         Assert.Equal(RunAsyncGolden.ReportWithEvidence("it broke", s), await File.ReadAllTextAsync(Path.Combine(runDir, "report.md"), TestContext.Current.CancellationToken));
     }
 
@@ -164,7 +166,8 @@ public class RunAsyncCharacterizationTests
         Assert.Null(s["escalate_to"]);
         Assert.Equal([RunAsyncGolden.BareWrapUpNote], RunAsyncGolden.Notes_(s));
         RunAsyncGolden.AssertLedgerHasOneRowEqualTo(root, s);
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
         Assert.Equal(60, (await File.ReadAllLinesAsync(Path.Combine(runDir, "stderr.txt"), TestContext.Current.CancellationToken)).Length);
         Assert.Equal(RunAsyncGolden.ReportWithEvidence(string.Empty, s), await File.ReadAllTextAsync(Path.Combine(runDir, "report.md"), TestContext.Current.CancellationToken));
     }
@@ -206,7 +209,8 @@ public class RunAsyncCharacterizationTests
         Assert.Null(s["escalate_to"]);
         Assert.Equal([RunAsyncGolden.BareWrapUpNote], RunAsyncGolden.Notes_(s));
         RunAsyncGolden.AssertLedgerHasOneRowEqualTo(root, s);
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
         Assert.Equal(RunAsyncGolden.BareCommand(root, "0.01"), await File.ReadAllTextAsync(Path.Combine(runDir, "command.txt"), TestContext.Current.CancellationToken));
     }
 
@@ -248,7 +252,8 @@ public class RunAsyncCharacterizationTests
         Assert.Null(s["escalate_to"]);
         Assert.Equal([RunAsyncGolden.BareWrapUpNote], RunAsyncGolden.Notes_(s));
         RunAsyncGolden.AssertLedgerHasOneRowEqualTo(root, s);
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
         Assert.Equal(RunAsyncGolden.ReportWithEvidence("ABCDEFGHIJKLMNOPQRST", s), await File.ReadAllTextAsync(Path.Combine(runDir, "report.md"), TestContext.Current.CancellationToken));
     }
 
@@ -307,7 +312,8 @@ public class RunAsyncCharacterizationTests
         string[] rows = await File.ReadAllLinesAsync(Path.Combine(root, "runs.jsonl"), TestContext.Current.CancellationToken);
         Assert.Equal(2, rows.Length);
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(rows[1]), s), rows[1]);
-        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        RunAsyncGolden.AssertFiles(runDir, "command.txt", "report.md", "status.json", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md");
+        StatusFileAssert.Done(runDir, s);
     }
 
     [Fact]
