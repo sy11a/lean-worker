@@ -409,7 +409,13 @@ internal static class WorktreeSweep
                 continue;
             }
 
-            await RemoveAsync(repo.Path, worktree.Path).ConfigureAwait(false);
+            if (await RemoveAsync(repo.Path, worktree.Path).ConfigureAwait(false))
+            {
+                // The worktree is gone: .worktrees/<repository> and .worktrees go with it while they
+                // are empty, the same way a run's own removal takes them (issue #157). The layout is
+                // the swept repository's own; nothing is reported, the total counts worktrees only.
+                WorktreeRun.RemoveEmptyLayoutFolders(repo.Path, worktree.Path);
+            }
         }
 
         if (options.Apply)
@@ -646,17 +652,18 @@ internal static class WorktreeSweep
 
     /// <summary>
     /// Removes one worktree. Git refuses when the worktree still holds changes; the refusal is reported and
-    /// the sweep carries on. No branch is deleted.
+    /// the sweep carries on. No branch is deleted. True when git removed the worktree.
     /// </summary>
-    private static async Task RemoveAsync(string repo, string path)
+    private static async Task<bool> RemoveAsync(string repo, string path)
     {
         Git.Result? result = await Git.RunResultAsync(repo, "worktree", "remove", path).ConfigureAwait(false);
         if (FailureLine(result, $"could not remove {path}") is not { } line)
         {
-            return;
+            return true;
         }
 
         await Console.Error.WriteLineAsync(line).ConfigureAwait(false);
+        return false;
     }
 
     /// <summary>

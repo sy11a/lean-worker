@@ -208,13 +208,27 @@ internal sealed class WorktreeRun
     /// <c>.worktrees/&lt;repository&gt;</c> first, then <c>.worktrees</c>. A folder that holds anything
     /// stays, and so does every folder above it; a symlink is never followed nor removed. A worktree
     /// that did not sit in the layout (one of the old layout) leaves every folder alone. Nothing here
-    /// is a reason: a folder that cannot be removed simply stays.
+    /// is a reason: a folder that cannot be removed simply stays. The layout is derived from the
+    /// repository, never from the worktree's path alone: the run and the sweep
+    /// (<see cref="WorktreeSweep"/>) share this, so a worktree elsewhere that merely sits in some
+    /// <c>.worktrees/&lt;x&gt;</c> folder removes nothing. When either layout folder is a symlink
+    /// (or cannot be examined) both stay: nothing is removed through one.
     /// </summary>
-    private static void RemoveEmptyLayoutFolders(string repoRoot, string worktreePath)
+    internal static void RemoveEmptyLayoutFolders(string repoRoot, string worktreePath)
     {
-        string[] folders = LayoutFolders(repoRoot);
+        string[] folders;
+        try
+        {
+            folders = LayoutFolders(repoRoot);
+        }
+        catch (LaunchException)
+        {
+            // A repository with no folder name (the file system root) has no layout folders.
+            return;
+        }
+
         string? holder = Path.GetDirectoryName(Path.GetFullPath(worktreePath));
-        if (holder?.Equals(folders[1], StringComparison.Ordinal) is not true)
+        if (holder?.Equals(folders[1], StringComparison.Ordinal) is not true || Array.Exists(folders, folder => IsLinked(folder)))
         {
             return;
         }
@@ -292,27 +306,54 @@ internal sealed class WorktreeRun
     /// </summary>
     private static bool ListsWorktree(string porcelain, string path, string branchRef)
     {
-        string? current = null;
+        return ListedWorktrees(porcelain).Exists(w =>
+            w.Branch.Equals(branchRef, StringComparison.Ordinal)
+            && GateTrust.Canonical(w.Path) is { Resolved: true } listed
+            && listed.Path.Equals(path, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// One worktree of <c>git worktree list --porcelain -z</c>: its path, the branch ref it has
+    /// checked out (empty when none: detached, bare, or a worktree git is still creating) and
+    /// whether it is locked.
+    /// </summary>
+    private sealed record ListedWorktree(string Path, string Branch, bool Locked);
+
+    /// <summary>
+    /// The worktrees <c>git worktree list --porcelain -z</c> prints: one block per worktree, every
+    /// entry ends with a NUL and an empty entry closes a block.
+    /// </summary>
+    private static List<ListedWorktree> ListedWorktrees(string porcelain)
+    {
+        List<ListedWorktree> listed = [];
+        ListedWorktree? current = null;
         foreach (string entry in porcelain.Split('\0'))
         {
-            if (entry.Length is 0)
+            if (entry.Length is 0 || entry.StartsWith("worktree ", StringComparison.Ordinal))
             {
-                current = null;
+                if (current is not null)
+                {
+                    listed.Add(current);
+                }
+
+                current = entry.Length is 0 ? null : new ListedWorktree(entry["worktree ".Length..], string.Empty, Locked: false);
             }
-            else if (entry.StartsWith("worktree ", StringComparison.Ordinal))
+            else if (current is not null && entry.StartsWith("branch ", StringComparison.Ordinal))
             {
-                current = entry["worktree ".Length..];
+                current = current with { Branch = entry["branch ".Length..] };
             }
-            else if (current is not null
-                && entry.Equals("branch " + branchRef, StringComparison.Ordinal)
-                && GateTrust.Canonical(current) is { Resolved: true } listed
-                && listed.Path.Equals(path, StringComparison.Ordinal))
+            else if (current is not null && (entry is "locked" || entry.StartsWith("locked ", StringComparison.Ordinal)))
             {
-                return true;
+                current = current with { Locked = true };
             }
         }
 
-        return false;
+        if (current is not null)
+        {
+            listed.Add(current);
+        }
+
+        return listed;
     }
 
     /// <summary>
@@ -346,10 +387,18 @@ internal sealed class WorktreeRun
             throw new LaunchException($"the worktree path is taken: {path}");
         }
 
-        if (await BranchExistsAsync(repoRoot, branch).ConfigureAwait(false))
+        // Whether the repository already has the branch. The argument starts with refs/heads/, so
+        // no branch name reaches git as an option.
+        Git.Result? branchProbe = await Git.RunResultAsync(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch).ConfigureAwait(false);
+        if (branchProbe?.ExitCode is 0)
         {
             throw new LaunchException($"the branch is taken: {branch}");
         }
+
+        // Exit 1 is git's own "no such ref": the branch is known to be absent right now. Anything
+        // else (git not run, timed out, a broken repository) proves nothing, and a branch found
+        // after a failed add is then never deleted.
+        bool absentBefore = branchProbe?.ExitCode is 1;
 
         // The base is resolved once, in the repository the launcher was called in: the commit it
         // names is what the branch is created from and what the worktree must still point at when
@@ -366,11 +415,15 @@ internal sealed class WorktreeRun
         Git.Result? added = await Git.RunResultAsync(repoRoot, "worktree", "add", "-b", branch, path, sha).ConfigureAwait(false);
         if (added is not { ExitCode: 0 })
         {
-            // Nothing was created: the folders made for it go again while they are empty.
+            // No worktree came of it: the folders made for it go again while they are empty. A
+            // folder git left at the path keeps them; it is not touched. git makes the branch
+            // before the worktree, so a branch it made may be left: it goes only when it is
+            // provably the one this call made and nothing uses it (issue #156).
             RemoveEmptyLayoutFolders(repoRoot, path);
+            string branchTail = await DropFailedBranchAsync(repoRoot, branch, sha, absentBefore).ConfigureAwait(false);
             throw new LaunchException(added is null
-                ? "git could not create the worktree: git could not be run"
-                : $"git could not create the worktree: {EvidenceBlock.OneLine(added.Stderr.Trim())}");
+                ? "git could not create the worktree: git could not be run" + branchTail
+                : $"git could not create the worktree: {EvidenceBlock.OneLine(added.Stderr.Trim())}{branchTail}");
         }
 
         try
@@ -901,13 +954,95 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
-    /// Whether the repository already has the branch.
+    /// After a failed <c>git worktree add -b</c>: the branch git made before it failed is deleted
+    /// when all of these hold — it did not exist before the call (<paramref name="absentBefore"/>),
+    /// it is a plain ref (no symbolic ref) at exactly the base commit <paramref name="sha"/>, no
+    /// worktree git lists has it checked out (a half-made one at the path included) and no locked
+    /// worktree without a branch is listed (one git may still be creating, which checks the branch
+    /// out last). The delete names the commit, so git refuses it when the branch moved in between.
+    /// Every argument that carries the branch starts with <c>refs/heads/</c>. Returns the tail of
+    /// the error: what became of the branch, or empty when git left none.
     /// </summary>
-    private static async Task<bool> BranchExistsAsync(string repoRoot, string branch)
+    private static async Task<string> DropFailedBranchAsync(string repoRoot, string branch, string sha, bool absentBefore)
     {
-        Git.Result? result = await Git.RunResultAsync(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch).ConfigureAwait(false);
-        return result?.ExitCode is 0;
+        string branchRef = "refs/heads/" + branch;
+        string stays = $"; the branch {branch} stays: ";
+        Git.Result? refs = await Git.RunResultAsync(repoRoot, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", branchRef).ConfigureAwait(false);
+        if (refs is not { ExitCode: 0 })
+        {
+            return $"; the branch {branch} is left as it is: git could not list it ({GitError(refs)})";
+        }
+
+        // for-each-ref matches by prefix (refs/heads/x also lists refs/heads/x/y): only the exact
+        // ref counts.
+        string[]? found = refs.Stdout.Split('\n')
+            .Select(line => line.Split('\0'))
+            .FirstOrDefault(fields => fields.Length is 3 && fields[0].Equals(branchRef, StringComparison.Ordinal));
+        if (found is null)
+        {
+            return string.Empty;
+        }
+
+        string? why;
+        if (!absentBefore)
+        {
+            why = "git could not tell whether it existed before the launch";
+        }
+        else if (found[2].Length > 0)
+        {
+            why = $"it is a symbolic ref to {found[2]}";
+        }
+        else if (!found[1].Equals(sha, StringComparison.Ordinal))
+        {
+            why = $"it points at {found[1]}, not at the base {sha}";
+        }
+        else
+        {
+            why = await WorktreeHoldsBranchAsync(repoRoot, branchRef).ConfigureAwait(false);
+        }
+
+        if (why is not null)
+        {
+            return stays + why;
+        }
+
+        // --no-deref: the ref itself is deleted, never one it would point to; the commit makes git
+        // refuse when the branch is no longer at the base.
+        Git.Result? deleted = await Git.RunResultAsync(repoRoot, "update-ref", "--no-deref", "-d", branchRef, sha).ConfigureAwait(false);
+        return deleted is { ExitCode: 0 }
+            ? $"; the branch {branch} git made for it was deleted again"
+            : stays + $"git did not delete it ({GitError(deleted)})";
     }
+
+    /// <summary>
+    /// Why a branch git just made must stay because of the worktrees git lists: one has it checked
+    /// out, or one is locked without a branch (git may still be creating it), or the list cannot be
+    /// read. Null when none of these holds.
+    /// </summary>
+    private static async Task<string?> WorktreeHoldsBranchAsync(string repoRoot, string branchRef)
+    {
+        Git.Result? list = await Git.RunResultAsync(repoRoot, "worktree", "list", "--porcelain", "-z").ConfigureAwait(false);
+        if (list is not { ExitCode: 0 })
+        {
+            return $"git could not list the worktrees ({GitError(list)})";
+        }
+
+        List<ListedWorktree> listed = ListedWorktrees(list.Stdout);
+        if (listed.Find(w => w.Branch.Equals(branchRef, StringComparison.Ordinal)) is { } holder)
+        {
+            return $"the worktree {holder.Path} has it checked out";
+        }
+
+        return listed.Find(w => w.Locked && w.Branch.Length is 0) is { } locked
+            ? $"the locked worktree {locked.Path} has no branch yet (git may still be creating it)"
+            : null;
+    }
+
+    /// <summary>
+    /// The one-line error of a git call that did not succeed.
+    /// </summary>
+    private static string GitError(Git.Result? result) =>
+        result is null ? "git could not be run" : EvidenceBlock.OneLine(result.Stderr.Trim());
 
     /// <summary>
     /// The commit the base ref names, resolved in the repository the launcher was called in. The
