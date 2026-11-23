@@ -61,7 +61,8 @@ internal static class StatusIndexScan
     /// <paramref name="keys"/> or whose parent_run is such a run (null: every pointer), and every
     /// pointer that cannot be read (its owner cannot be told, so it is shown in every scope).
     /// Complete is false when the listing stopped at an entry that did not answer in time. With
-    /// <paramref name="reap"/>, pointers whose row proves the run ended long ago are deleted.
+    /// <paramref name="reap"/>, pointers whose row proves the run ended long ago are deleted, and so
+    /// are claim and temp files of killed writers older than <see cref="ReapAfter"/>.
     /// </summary>
     public static (List<StatusRow> Rows, bool Complete) Read(string? folder, IReadOnlyCollection<string>? keys, StatusReader reader,
         ReadBudget budget, bool reap)
@@ -99,6 +100,11 @@ internal static class StatusIndexScan
             {
                 StatusIndex.Reap(folder, entry.File, budget);
             }
+        }
+
+        if (reap)
+        {
+            StatusIndex.ReapLeftovers(folder, now, ReapAfter, budget);
         }
 
         return (rows, complete);
