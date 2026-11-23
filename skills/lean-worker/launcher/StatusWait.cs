@@ -1,9 +1,12 @@
 // `status --wait` (docs/research/live-status/README.md, sections 4.2 and 4.5): block until every run
 // in scope has ended, then print the listing of those runs and exit with what they ended as. The
 // scope is fixed when the wait starts (after --expect runs appeared); a gate chain is one unit,
-// ended when its launcher is gone, not when a round is. It reads only: the first read is the
-// one-shot call's (with its reaping), every later read reaps nothing, and nothing is signalled,
-// killed or written.
+// ended when its launcher is gone, not when a round is, and judged by every row that names its
+// first round's launcher or chain, also the rounds the layout set apart. It reads only: the first
+// read is the one-shot call's (with its reaping), every later read reaps nothing, and nothing is
+// signalled, killed or written. Every span it waits (--timeout, --grace, --interval) is measured
+// on the clock's monotonic timestamp; the wall clock only gives the times shown and the times
+// compared with the files'.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -46,6 +49,13 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     /// </summary>
     public const int Unresolved = 8;
 
+    /// <summary>
+    /// The host's token stopped the wait before it was over: 128 + SIGINT, the code an interrupted
+    /// `status --wait` (and the line-mode watcher) already ends with when the signal's default action
+    /// ends the process.
+    /// </summary>
+    public const int Interrupted = 130;
+
     private static readonly CultureInfo _ic = CultureInfo.InvariantCulture;
 
     /// <summary>
@@ -65,8 +75,10 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
 
     /// <summary>
     /// One unit waited on: a run, or a gate chain keyed by its first round; its row (the chain's
-    /// row), its rounds, whether it ended (then the row is kept as it was), and since when its
-    /// launcher's state could not be told.
+    /// row), its rounds, the rows joined to it (keyed by <see cref="StatusListing.RowKey"/>: rows
+    /// that name its first round's launcher or chain but that the layout set apart), whether it
+    /// ended (then its rows are kept as they were), and since when (the clock's timestamp) it could
+    /// not be told.
     /// </summary>
     private sealed class Unit(string key, StatusRow row, List<StatusRow> rounds)
     {
@@ -76,51 +88,100 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
 
         public List<StatusRow> Rounds { get; set; } = rounds;
 
+        /// <summary>
+        /// The run id of the first round: a chain's id.
+        /// </summary>
+        public string FirstRunId { get; } = rounds.Count > 0 ? rounds[0].RunId : row.RunId;
+
+        /// <summary>
+        /// The launcher the first round names (the pointer is written once at launch).
+        /// </summary>
+        public string? FirstLauncher { get; } = StatusLayout.NamedLauncher(rounds.Count > 0 ? rounds[0] : row);
+
+        public Dictionary<string, StatusRow> Joined { get; } = new(StringComparer.Ordinal);
+
         public bool Ended { get; set; }
 
-        public DateTimeOffset? UnsureSince { get; set; }
+        public long? UnsureSince { get; set; }
+
+        /// <summary>
+        /// Whether the unit's own rows (its row and its rounds) have all ended.
+        /// </summary>
+        public bool OwnEnded => Row.Ended && Rounds.TrueForAll(r => r.Ended);
+
+        /// <summary>
+        /// Whether one of the unit's own rows is live.
+        /// </summary>
+        public bool OwnLive => Row.Live || Rounds.Exists(r => r.Live);
     }
 
     private DateTimeOffset Now => reader.Clock.GetUtcNow();
 
+    private long Stamp => reader.Clock.GetTimestamp();
+
     /// <summary>
     /// The wait over the scope <paramref name="read"/> reads (with reap: whether the read may reap),
-    /// starting from <paramref name="first"/>, the first read; the exit code.
+    /// starting from <paramref name="first"/>, the first read; the exit code. A wait the host's
+    /// token stops ends at once with <see cref="Interrupted"/>, never with an exception.
     /// </summary>
     public async Task<int> RunAsync(StatusScope.Listing first, Func<Task<StatusScope.Listing?>> read)
     {
-        DateTimeOffset start = Now;
+        try
+        {
+            return await ScopeAsync(first, read).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (host.Cancel.IsCancellationRequested)
+        {
+            await output.WriteLineAsync(string.Create(_ic, $"lean-worker status: wait stopped before it was over (exit {Interrupted})")).ConfigureAwait(false);
+            return Interrupted;
+        }
+    }
+
+    /// <summary>
+    /// The scope: the runs in it when the wait starts (after --expect runs appeared), then the wait
+    /// on them. A legacy row with a summary.json (a finished run of an older launcher) is not waited
+    /// on; a legacy row without one (a run that has not written its status yet, or whose status
+    /// writes failed) is, and holds the wait through --grace as an unknown run does.
+    /// </summary>
+    private async Task<int> ScopeAsync(StatusScope.Listing first, Func<Task<StatusScope.Listing?>> read)
+    {
+        long start = Stamp;
         StatusScope.Listing listing = first;
         while (true)
         {
-            DateTimeOffset now = Now;
-            StatusListing.Shown shown = StatusListing.Select(listing, reader, now, settings.StartedAfter);
-            List<StatusRow> candidates = [.. shown.Rows.Where(r => r.State is not StatusStates.Legacy && (settings.StartedAfter is not null || !r.Ended))];
+            StatusListing.Shown shown = StatusListing.Select(listing, reader, Now, settings.StartedAfter);
+            List<StatusRow> candidates = [.. shown.Rows.Where(r => !FinishedLegacy(r) && (settings.StartedAfter is not null || !r.Ended))];
             if (settings.Expect is not { } expect || candidates.Count >= expect)
             {
-                int legacy = shown.Rows.Count(r => r.State is StatusStates.Legacy);
-                return await WaitOnAsync(listing, [.. candidates.Select(r => NewUnit(r, shown.View))], legacy, start, read).ConfigureAwait(false);
+                int legacy = shown.Rows.Count(r => FinishedLegacy(r));
+                List<Unit> units = [.. candidates.Select(r => NewUnit(r, shown.View))];
+                Join(units, shown.View);
+                return await WaitOnAsync(listing, units, legacy, start, read).ConfigureAwait(false);
             }
 
-            if (now - start >= settings.Grace || now - start >= settings.Timeout)
+            TimeSpan elapsed = reader.Clock.GetElapsedTime(start);
+            if (elapsed >= settings.Grace || elapsed >= settings.Timeout)
             {
                 List<Unit> found = [.. candidates.Select(r => NewUnit(r, shown.View))];
-                bool late = now - start >= settings.Grace;
+                bool late = elapsed >= settings.Grace;
                 string text = late
                     ? string.Create(_ic, $"only {found.Count} of {expect} expected runs appeared within {StatusText.Duration(settings.Grace)}")
                     : string.Create(_ic, $"timed out after {StatusText.Duration(settings.Timeout)} with {found.Count} of {expect} expected runs");
                 return await FinishAsync(listing, found, late ? Unresolved : TimedOut, text).ConfigureAwait(false);
             }
 
-            await host.Sleep(Pause(start), host.Cancel).ConfigureAwait(false);
+            await SleepAsync(start).ConfigureAwait(false);
             listing = await read().ConfigureAwait(false) ?? listing with { Rows = [] };
         }
     }
 
+    // A legacy row whose run left a summary.json: a finished run of an older launcher.
+    private static bool FinishedLegacy(StatusRow r) => r.State is StatusStates.Legacy && r.SummaryStatus is not null;
+
     /// <summary>
     /// The wait itself, over the units fixed now.
     /// </summary>
-    private async Task<int> WaitOnAsync(StatusScope.Listing listing, List<Unit> units, int legacy, DateTimeOffset start, Func<Task<StatusScope.Listing?>> read)
+    private async Task<int> WaitOnAsync(StatusScope.Listing listing, List<Unit> units, int legacy, long start, Func<Task<StatusScope.Listing?>> read)
     {
         if (units.Count is 0)
         {
@@ -130,14 +191,14 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
             return NothingMatched;
         }
 
-        string skipped = legacy > 0 ? string.Create(_ic, $"; {legacy} legacy runs not waited on (no launcher recorded)") : string.Empty;
+        string skipped = legacy > 0 ? string.Create(_ic, $"; {legacy} legacy runs not waited on (finished, no launcher recorded)") : string.Empty;
         await output.WriteLineAsync(string.Create(_ic,
             $"lean-worker status: waiting on {units.Count} {(units.Count is 1 ? "run" : "runs")} matched at {Now:HH:mm:ss}Z; runs launched later are not included{skipped}"))
             .ConfigureAwait(false);
         await output.FlushAsync(host.Cancel).ConfigureAwait(false);
         while (true)
         {
-            DateTimeOffset now = Now;
+            long now = Stamp;
             foreach (Unit u in units)
             {
                 Track(u, now);
@@ -148,14 +209,14 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
                 return await FinishAsync(listing, units, code, Outcome(units, code)).ConfigureAwait(false);
             }
 
-            if (now - start >= settings.Timeout)
+            if (reader.Clock.GetElapsedTime(start) >= settings.Timeout)
             {
                 int open = units.Count(u => !u.Ended);
                 return await FinishAsync(listing, units, TimedOut,
                     string.Create(_ic, $"timed out after {StatusText.Duration(settings.Timeout)} with {open} of {units.Count} runs not ended")).ConfigureAwait(false);
             }
 
-            await host.Sleep(Pause(start), host.Cancel).ConfigureAwait(false);
+            await SleepAsync(start).ConfigureAwait(false);
             listing = await read().ConfigureAwait(false) ?? listing with { Rows = [] };
             Refresh(units, StatusLayout.Chains(listing.Rows, reader, Now));
         }
@@ -165,7 +226,7 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     /// The exit code when the wait is over, null while it is not: with --any as soon as a run ended
     /// (or nothing is left to hold the wait); else when every unit ended or stopped holding it.
     /// </summary>
-    private int? Done(List<Unit> units, DateTimeOffset now)
+    private int? Done(List<Unit> units, long now)
     {
         List<Unit> ended = [.. units.Where(u => u.Ended)];
         bool holding = units.Exists(u => !u.Ended && !GivenUp(u, now));
@@ -174,7 +235,7 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
             return null;
         }
 
-        List<Verdict> verdicts = [.. ended.Select(u => Judge(u.Row))];
+        List<Verdict> verdicts = [.. ended.Select(u => JudgeUnit(u))];
         if (verdicts.Contains(Verdict.Failed))
         {
             return SomeFailed;
@@ -193,10 +254,10 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
         int ended = units.Count(u => u.Ended);
         return code switch
         {
-            SomeFailed => string.Create(_ic, $"{units.Count(u => u.Ended && Judge(u.Row) is Verdict.Failed)} of {units.Count} runs ended not success"),
+            SomeFailed => string.Create(_ic, $"{units.Count(u => u.Ended && JudgeUnit(u) is Verdict.Failed)} of {units.Count} runs ended not success"),
             Unresolved => string.Create(_ic,
                 $"{units.Count - ended} of {units.Count} runs stayed unknown or unreadable past the grace of {StatusText.Duration(settings.Grace)}"),
-            SomeWrappedUp => string.Create(_ic, $"{ended} of {units.Count} runs ended, {units.Count(u => u.Ended && Judge(u.Row) is Verdict.WrappedUp)} wrapped up near the budget"),
+            SomeWrappedUp => string.Create(_ic, $"{ended} of {units.Count} runs ended, {units.Count(u => u.Ended && JudgeUnit(u) is Verdict.WrappedUp)} wrapped up near the budget"),
             _ => string.Create(_ic, $"{ended} of {units.Count} runs ended success"),
         };
     }
@@ -218,28 +279,39 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     }
 
     /// <summary>
-    /// Whether a unit no longer holds the wait: its launcher's state could not be told for --grace.
+    /// What an ended unit counts as: its row's verdict, and a failure when any row joined to it is
+    /// not a success. A joined row can only make the verdict stricter (it adds a condition, never
+    /// lifts one): a forged one can turn a 0 into a 1 here, or, while it does not end, into an 8
+    /// after the grace (<see cref="Track"/>), never a 1 or an 8 into a 0.
     /// </summary>
-    private bool GivenUp(Unit u, DateTimeOffset now) => u.UnsureSince is { } since && now - since >= settings.Grace;
+    private static Verdict JudgeUnit(Unit u) =>
+        u.Joined.Values.Any(r => Judge(r) is not Verdict.Success) ? Verdict.Failed : Judge(u.Row);
 
     /// <summary>
-    /// The unit's state after a read: ended once its launcher is provably gone, for a gate chain
-    /// once every round read has (then it is kept as it is); live while a round runs; else unsure
-    /// since the first read that could not tell.
+    /// Whether a unit no longer holds the wait: its state could not be told for --grace.
     /// </summary>
-    private static void Track(Unit u, DateTimeOffset now)
+    private bool GivenUp(Unit u, long now) => u.UnsureSince is { } since && reader.Clock.GetElapsedTime(since, now) >= settings.Grace;
+
+    /// <summary>
+    /// The unit's state after a read: ended once its own rows (a chain: every round read) and every
+    /// row joined to it have ended (then it is kept as it is); live while one of its own rows runs;
+    /// else unsure since the first read that could not tell. A joined row never holds the wait as
+    /// live: one that has not ended when the unit's own rows have makes the unit unsure, so it ends
+    /// as given up (exit 8) after the grace.
+    /// </summary>
+    private static void Track(Unit u, long now)
     {
         if (u.Ended)
         {
             return;
         }
 
-        if (u.Row.Ended && u.Rounds.TrueForAll(r => r.Ended))
+        if (u.OwnEnded && u.Joined.Values.All(r => r.Ended))
         {
             u.Ended = true;
             u.UnsureSince = null;
         }
-        else if (u.Row.Live || u.Rounds.Exists(r => r.Live))
+        else if (u.OwnLive)
         {
             u.UnsureSince = null;
         }
@@ -269,47 +341,112 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
             }
             else
             {
-                u.Row = u.Row with
-                {
-                    State = StatusStates.Unknown,
-                    Liveness = Liveness.Unknown,
-                    Detail = "no longer listed in the scope",
-                    Attention = true,
-                    Quiet = null,
-                };
+                u.Row = NotListed(u.Row);
                 u.Rounds = [u.Row];
             }
         }
+
+        Join(units, view);
+    }
+
+    /// <summary>
+    /// Joins to every unit not ended the rows of <paramref name="view"/> that are not its own and
+    /// name its first round: the same launcher (pointer, else status file) or the first round's run
+    /// id as their chain id. A row joined before and not listed any more cannot be told (unknown),
+    /// unless it had ended (then it is kept as it was).
+    /// </summary>
+    private static void Join(List<Unit> units, StatusLayout.View view)
+    {
+        List<StatusRow> all = [.. view.Rounds.Values.SelectMany(rounds => rounds)];
+        foreach (Unit u in units.Where(u => !u.Ended))
+        {
+            HashSet<string> own = new(u.Rounds.Append(u.Row).Select(r => StatusListing.RowKey(r)), StringComparer.Ordinal);
+            HashSet<string> seen = new(StringComparer.Ordinal);
+            foreach (StatusRow r in all.Where(r => Names(u, r)))
+            {
+                string key = StatusListing.RowKey(r);
+                if (!own.Contains(key) && seen.Add(key))
+                {
+                    u.Joined[key] = r;
+                }
+            }
+
+            foreach (string key in u.Joined.Keys.Where(k => !seen.Contains(k)).ToList())
+            {
+                if (own.Contains(key))
+                {
+                    _ = u.Joined.Remove(key);
+                }
+                else if (!u.Joined[key].Ended)
+                {
+                    u.Joined[key] = NotListed(u.Joined[key]);
+                }
+            }
+        }
+    }
+
+    // Whether a row names the unit's first round: its launcher, or its run id as the chain id.
+    private static bool Names(Unit u, StatusRow r)
+    {
+        return (u.FirstLauncher is { } launcher && string.Equals(StatusLayout.NamedLauncher(r), launcher, StringComparison.Ordinal))
+               || string.Equals(StatusLayout.ChainId(r), u.FirstRunId, StringComparison.Ordinal);
+    }
+
+    // A row the scope does not list any more: it cannot be told.
+    private static StatusRow NotListed(StatusRow row)
+    {
+        return row with
+        {
+            State = StatusStates.Unknown,
+            Liveness = Liveness.Unknown,
+            Detail = "no longer listed in the scope",
+            Attention = true,
+            Quiet = null,
+        };
     }
 
     private static Unit NewUnit(StatusRow head, StatusLayout.View view) => new(StatusListing.UnitKey(head, view), head, view.Rounds[head]);
 
     /// <summary>
-    /// The pause before the next read: the interval, or what is left of --timeout when that is less.
+    /// The pause before the next read: the interval, or what is left of --timeout when that is
+    /// less; a wait the host's token stopped goes no further.
     /// </summary>
-    private TimeSpan Pause(DateTimeOffset start)
+    private async Task SleepAsync(long start)
     {
-        TimeSpan left = start + settings.Timeout - Now;
+        TimeSpan left = settings.Timeout - reader.Clock.GetElapsedTime(start);
         TimeSpan pause = left < settings.Interval ? left : settings.Interval;
-        return pause > TimeSpan.Zero ? pause : TimeSpan.Zero;
+        await host.Sleep(pause > TimeSpan.Zero ? pause : TimeSpan.Zero, host.Cancel).ConfigureAwait(false);
+        host.Cancel.ThrowIfCancellationRequested();
     }
 
     /// <summary>
-    /// The listing of the units waited on and the last line with the outcome and the exit code.
+    /// The listing of the units waited on (with the rows joined to them that no unit shows) and the
+    /// last line with the outcome and the exit code.
     /// </summary>
     private async Task<int> FinishAsync(StatusScope.Listing listing, List<Unit> units, int code, string outcome)
     {
         DateTimeOffset now = Now;
         Dictionary<string, StatusRow> byRunId = new(StringComparer.Ordinal);
+        HashSet<string> shownKeys = new(StringComparer.Ordinal);
         foreach (Unit u in units)
         {
             foreach (StatusRow round in u.Rounds)
             {
                 _ = byRunId.TryAdd(round.RunId, u.Row);
+                _ = shownKeys.Add(StatusListing.RowKey(round));
             }
+
+            _ = shownKeys.Add(u.Key);
+            _ = shownKeys.Add(StatusListing.RowKey(u.Row));
         }
 
         List<StatusRow> rows = [.. units.Select(u => u.Row)];
+        foreach (StatusRow joined in units.SelectMany(u => u.Joined).Where(j => shownKeys.Add(j.Key)).Select(j => j.Value))
+        {
+            rows.Add(joined);
+            _ = byRunId.TryAdd(joined.RunId, joined);
+        }
+
         List<(StatusRow Row, int Depth)> nested = StatusLayout.Nest(StatusText.Order(rows), byRunId);
         await output.WriteLineAsync(StatusText.Header(listing.Scope, rows, hidden: 0, since: null)).ConfigureAwait(false);
         await StatusListing.PrintLinesAsync(output, [.. nested.Select(n => n.Row with { Depth = n.Depth })], now, listing.OwnerColumn).ConfigureAwait(false);

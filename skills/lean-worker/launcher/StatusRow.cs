@@ -36,6 +36,12 @@ internal sealed record StatusRow(
     public JsonObject? PointerLauncher { get; init; }
 
     /// <summary>
+    /// The creation time of the pointer this row was read through; null for a scan, --run or a
+    /// pointer that records none.
+    /// </summary>
+    public DateTimeOffset? PointerCreatedAt { get; init; }
+
+    /// <summary>
     /// The run's first owner key (status.json, else the pointer), already checked; null when unowned.
     /// </summary>
     public string? OwnerKey { get; init; }

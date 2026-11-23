@@ -231,13 +231,14 @@ internal static class StatusIndexScan
             {
                 Pointer = p.File,
                 PointerLauncher = p.Launcher,
+                PointerCreatedAt = p.CreatedAt,
                 OwnerKey = owner,
                 ParentRun = p.ParentRun ?? ownerRun,
             };
         }
 
         StatusRow row = reader.Read(p.RunDir, budget, p.Launcher);
-        return row with { Pointer = p.File, PointerLauncher = p.Launcher, OwnerKey = owner ?? row.OwnerKey, ParentRun = p.ParentRun ?? row.ParentRun ?? ownerRun };
+        return row with { Pointer = p.File, PointerLauncher = p.Launcher, PointerCreatedAt = p.CreatedAt, OwnerKey = owner ?? row.OwnerKey, ParentRun = p.ParentRun ?? row.ParentRun ?? ownerRun };
     }
 
     private static StatusRow UnreadablePointer(string folder, Entry entry)

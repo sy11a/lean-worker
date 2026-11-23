@@ -152,8 +152,11 @@ internal static class StatusTable
 
     /// <summary>
     /// <paramref name="text"/> in exactly <paramref name="width"/> terminal columns: padded, or cut
-    /// with a trailing <see cref="TerminalText.CutMark"/>. A wide character (CJK, a surrogate pair)
-    /// counts two columns, so a cut never lets a line wrap.
+    /// with a trailing <see cref="TerminalText.CutMark"/>. A wide character (CJK, the symbols and
+    /// emoji of U+2300 to U+2BFF, a surrogate pair) counts two columns, so a cut never lets a line
+    /// wrap; a character a terminal draws in no column of its own (categories Mn, Me and Cf: a
+    /// combining mark, a variation selector, a format character) is drawn as
+    /// <see cref="TerminalText.Replacement"/>, one column, so the columns stay aligned.
     /// </summary>
     internal static string Fit(string text, int width, bool right)
     {
@@ -162,18 +165,32 @@ internal static class StatusTable
         for (int i = 0; i < text.Length; i++)
         {
             bool pair = char.IsHighSurrogate(text[i]) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]);
-            int w = pair || Wide(text[i]) ? 2 : 1;
+            bool zero = Zero(CharUnicodeInfo.GetUnicodeCategory(text, i));
+            int w = !zero && (pair || Wide(text[i])) ? 2 : 1;
             if (used + w > width || (used + w == width && Rest(text, i + (pair ? 2 : 1))))
             {
                 return Pad(sb.Append(TerminalText.CutMark).ToString(), used + 1, width, right: false);
             }
 
-            _ = pair ? sb.Append(text, i++, 2) : sb.Append(text[i]);
+            if (zero)
+            {
+                _ = sb.Append(TerminalText.Replacement);
+            }
+            else
+            {
+                _ = pair ? sb.Append(text, i, 2) : sb.Append(text[i]);
+            }
+
+            i += pair ? 1 : 0;
             used += w;
         }
 
         return Pad(sb.ToString(), used, width, right);
     }
+
+    // The categories a terminal draws in no column of their own.
+    private static bool Zero(UnicodeCategory category) =>
+        category is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.Format;
 
     // Whether anything follows position i (so the last column must hold the cut mark instead).
     private static bool Rest(string text, int i) => i < text.Length;
@@ -184,11 +201,12 @@ internal static class StatusTable
         return right ? pad + text : text + pad;
     }
 
-    // East Asian wide and fullwidth ranges: two columns each.
+    // East Asian wide and fullwidth ranges, and the technical symbols, dingbats, arrows and shapes of
+    // U+2300 to U+2BFF (some drawn as two-column emoji; counting one too wide is safe): two columns each.
     private static bool Wide(char c)
     {
         int code = c;
-        return code is (>= 0x1100 and <= 0x115F) or (>= 0x2E80 and <= 0xA4CF) or (>= 0xAC00 and <= 0xD7A3)
+        return code is (>= 0x1100 and <= 0x115F) or (>= 0x2300 and <= 0x2BFF) or (>= 0x2E80 and <= 0xA4CF) or (>= 0xAC00 and <= 0xD7A3)
             or (>= 0xF900 and <= 0xFAFF) or (>= 0xFE30 and <= 0xFE4F) or (>= 0xFF00 and <= 0xFF60) or (>= 0xFFE0 and <= 0xFFE6);
     }
 

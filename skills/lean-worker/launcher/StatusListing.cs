@@ -18,14 +18,14 @@ internal static class StatusListing
     /// <summary>
     /// The chain rows of <paramref name="listing"/> that are shown: a chain is hidden by --since only
     /// when every one of its rounds would be (never while one is live or needs to be seen), and
-    /// with <paramref name="startedAfter"/> only the chains whose first round started at or after it
-    /// are kept (a run whose start time cannot be told is not).
+    /// with <paramref name="startedAfter"/> the chains whose first round started before it are
+    /// dropped (<see cref="StartedAfter"/>; a run whose start cannot be told at all is kept).
     /// </summary>
     public static Shown Select(StatusScope.Listing listing, StatusReader reader, DateTimeOffset now, DateTimeOffset? startedAfter)
     {
         StatusLayout.View view = StatusLayout.Chains(listing.Rows, reader, now);
         List<StatusRow> inWindow = listing.Since is { } window ? [.. view.Rows.Where(r => view.Rounds[r].Exists(m => InWindow(m, now - window)))] : view.Rows;
-        List<StatusRow> rows = startedAfter is { } t ? [.. inWindow.Where(r => StartedAfter(view.Rounds[r][0], t))] : inWindow;
+        List<StatusRow> rows = startedAfter is { } t ? [.. inWindow.Where(r => StartedAfter(view.Rounds[r][0], t, reader))] : inWindow;
         return new Shown(view, rows, view.Rows.Count - inWindow.Count);
     }
 
@@ -36,13 +36,21 @@ internal static class StatusListing
     public static string UnitKey(StatusRow head, StatusLayout.View view)
     {
         StatusRow first = view.Rounds.TryGetValue(head, out List<StatusRow>? rounds) && rounds.Count > 0 ? rounds[0] : head;
-        return first.Pointer is { } pointer ? "p:" + pointer : "d:" + Path.GetFullPath(first.Dir);
+        return RowKey(first);
     }
 
     /// <summary>
-    /// Whether a run (a chain's first round) started at or after <paramref name="t"/>.
+    /// The key of one row across reads: its index pointer, else its run dir.
     /// </summary>
-    public static bool StartedAfter(StatusRow first, DateTimeOffset t) => first.StartedAt is { } s && s >= t;
+    public static string RowKey(StatusRow row) => row.Pointer is { } pointer ? "p:" + pointer : "d:" + Path.GetFullPath(row.Dir);
+
+    /// <summary>
+    /// Whether a run (a chain's first round) is in a --started-after scope: its start (the status
+    /// file's, else its pointer's creation time, else the stamp of its run id) is at or after
+    /// <paramref name="t"/>; a run with none of them is kept, so it is waited on, never dropped.
+    /// </summary>
+    public static bool StartedAfter(StatusRow first, DateTimeOffset t, StatusReader reader) =>
+        (first.StartedAt ?? first.PointerCreatedAt ?? reader.Stamp(first.RunId)) is not { } s || s >= t;
 
     /// <summary>
     /// The listing: the header and one line per shown row (plain), or the --json document.

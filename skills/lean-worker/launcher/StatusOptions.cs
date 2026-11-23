@@ -188,18 +188,21 @@ internal static class StatusOptions
     }
 
     /// <summary>
-    /// A time for --started-after: a date and time with Z or an offset (a time without one is UTC),
-    /// e.g. what `date -u +%FT%TZ` prints.
+    /// A time for --started-after: a date and time with Z or an offset, e.g. what `date -u +%FT%TZ`
+    /// prints. A time without either is refused: read as UTC it lands hours off west or east of it.
     /// </summary>
     public static DateTimeOffset ParseTime(string text)
     {
-        const DateTimeStyles styles = DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal;
-        if (text.Contains('T', StringComparison.Ordinal) && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, styles, out DateTimeOffset t))
+        // RoundtripKind tells a time with Z (Utc) or an offset (Local) from one without (Unspecified).
+        if (text.Contains('T', StringComparison.Ordinal)
+            && DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime kind)
+            && kind.Kind is not DateTimeKind.Unspecified
+            && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal, out DateTimeOffset t))
         {
             return t;
         }
 
-        throw new LaunchException($"--started-after needs a time such as 2026-11-22T13:02:31Z, not '{text}'");
+        throw new LaunchException($"--started-after needs a date and time with Z or an offset, such as 2026-11-22T13:02:31Z (date -u +%FT%TZ), not '{text}'");
     }
 
     private static TimeSpan Positive(TimeSpan span, string option) =>

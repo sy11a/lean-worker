@@ -183,22 +183,31 @@ writes a status file the `status` command reads; read it instead of the run's fi
 - **Launches from a detached unit** (a `systemd-run` unit or a relay that starts the launcher
   outside this session) are not this session's children. Get your key in this session's shell and
   pass it on the launch: `--owner "$(lw status --whoami --key)"`.
-- **One wake for a batch:** record `t0=$(date -u +%FT%TZ)` before the launches, launch the batch
-  (each with `--owner <key>` when detached), then wait once:
-  `lw status --wait --owner <key> --started-after "$t0" --expect <n> --timeout <dur>`
-  (`--any` returns when the first run ends). Claude Code: run it with `run_in_background` and
-  `--timeout 25m` (background commands have time limits); the completion notification is the
-  wake. opencode: a blocking bash call with `--timeout 120m` and the tool's `timeout` above it
-  (`7500000`). It prints the listing of the runs it waited on, then exits:
+- **One wake for a batch** of launches that have no wake of their own (detached units, relays).
+  One route per launch: a launch you already run with `run_in_background` wakes you itself, so
+  leave it out of the waiter. Record `t0=$(date -u +%FT%TZ)` before the launches (`--started-after`
+  needs the `Z` or an offset), launch the batch (each with `--owner <key>` when detached), then wait once:
+  `lw status --wait --owner <key> --started-after "$t0" --expect <n> --timeout <dur>`.
+  `<n>` is every run that owner key starts after `t0`, not only the ones you care about: a
+  smaller `<n>` fixes the scope before the batch is in it. Claude Code: run it with
+  `run_in_background` and `--timeout 25m` (background commands have time limits); the completion
+  notification is the wake. opencode: a blocking bash call with `--timeout 120m` and the tool's
+  `timeout` above it (`7500000`). It prints the listing of the runs it waited on, then exits:
   - **0**: every run ended `success`. A wake, not verification: read each result and check the
     done-criterion as in section 4.
-  - **1**: a run failed, was orphaned or lost, or a gate chain did not end clean; **3**: none
-    failed, one wrapped up (section 5). Read that run's `report.md`.
-  - **6**: no run matched: a wrong `--owner` key, or the batch never started. Check `lw status --here`.
+  - **1**: a run failed, was orphaned or lost, its run dir is gone, or a gate chain did not end
+    clean; **3**: none failed, one wrapped up (section 5). Read that run's `report.md`.
+  - **2**: a usage error (the message says which option); nothing was waited on.
+  - **6**: no run matched (only without `--expect`): the batch never started. Check `lw status --here`.
   - **7**: `--timeout` passed with runs still live: run the same command again (runs that already
     ended stay in the listing).
   - **8**: a run stayed `unknown` or `unreadable` past `--grace` (10m), or fewer than `<n>`
-    runs appeared; the listing names them. Investigate before you relaunch anything.
+    runs appeared, which is also what a wrong `--owner` key gives with `--expect`; the listing
+    names them. Investigate before you relaunch anything.
+- **`--any`** returns as soon as one run ends. To wait for the rest, re-arm with the same scope
+  but without `--started-after` and `--expect`: the waiter then takes only the runs not yet ended,
+  so the run that woke you does not wake it again (with `--started-after`, runs that already
+  ended count, and the same command returns at once with the same run).
 
 ## 4. Read the result
 

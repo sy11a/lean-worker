@@ -189,12 +189,13 @@ internal sealed class StatusWatch(StatusReader reader, StatusHost host, TextWrit
 
     /// <summary>
     /// Waits for the next refresh, reading keys meanwhile: q quits, a acknowledges every ended row
-    /// (and redraws), a resize redraws at once; the token quits.
+    /// (and redraws), a resize redraws at once; the token quits. The interval is measured on the
+    /// clock's monotonic timestamp, so a step of the wall clock neither stretches nor cuts it.
     /// </summary>
     private async Task<Pause> PauseAsync(CancellationToken stop)
     {
-        DateTimeOffset until = reader.Clock.GetUtcNow() + settings.Interval;
-        while (reader.Clock.GetUtcNow() < until)
+        long start = reader.Clock.GetTimestamp();
+        for (TimeSpan elapsed = TimeSpan.Zero; elapsed < settings.Interval; elapsed = reader.Clock.GetElapsedTime(start))
         {
             if (host.Terminal.ReadKey() is { } key)
             {
@@ -216,7 +217,7 @@ internal sealed class StatusWatch(StatusReader reader, StatusHost host, TextWrit
                 return Pause.Refresh;
             }
 
-            if (!await SleepAsync(Min(_keySlice, until - reader.Clock.GetUtcNow()), stop).ConfigureAwait(false))
+            if (!await SleepAsync(Min(_keySlice, settings.Interval - elapsed), stop).ConfigureAwait(false))
             {
                 return Pause.Quit;
             }

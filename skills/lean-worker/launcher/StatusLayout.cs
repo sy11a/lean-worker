@@ -167,6 +167,13 @@ internal static class StatusLayout
         return r.PointerLauncher is null || string.Equals(Identity(r.PointerLauncher), own, StringComparison.Ordinal) ? own : null;
     }
 
+    /// <summary>
+    /// The launcher a row names, unproven: its pointer's (written once at launch), else its status
+    /// file's; null when it names none in full. Only for making a wait stricter (StatusWait), never
+    /// for grouping.
+    /// </summary>
+    internal static string? NamedLauncher(StatusRow r) => Identity(r.PointerLauncher ?? r.Status?["launcher"] as JsonObject);
+
     private static string? Identity(JsonObject? launcher)
     {
         long? pid = StatusProbe.NumOrNull(launcher?["pid"]);
@@ -202,7 +209,7 @@ internal static class StatusLayout
     private static string ChainKey(StatusRow r, int index) =>
         ChainId(r) is { } id ? "c:" + id : "i:" + index.ToString(CultureInfo.InvariantCulture);
 
-    private static string? ChainId(StatusRow r) => Json.Str(r.Status?["run"] as JsonObject, "chain_id") is { Length: > 0 } id ? id : null;
+    internal static string? ChainId(StatusRow r) => Json.Str(r.Status?["run"] as JsonObject, "chain_id") is { Length: > 0 } id ? id : null;
 
     private static long Round(StatusRow r) => StatusProbe.NumOrNull((r.Status?["run"] as JsonObject)?["round"]) ?? 0;
 
