@@ -92,7 +92,7 @@ internal static class StatusLayout
     /// (attention over live over ended), the latest (the highest round number) among equals; an
     /// earlier round with an end is final, not ending, though its launcher still runs the later
     /// round (<see cref="StatusReader.EarlierRound"/>). A row without a chain id is a chain of its own.
-    /// A round that ended with its gate going on to another round, while the read holds no later
+    /// A round that ended as a success with its gate going on to another round, while the read holds no later
     /// round of it, is not shown as ended (<see cref="AwaitsRound"/>).
     /// </summary>
     public static View Chains(IReadOnlyList<StatusRow> rows, StatusReader reader, DateTimeOffset now)
@@ -287,10 +287,15 @@ internal static class StatusLayout
     /// launcher, or its chain id in its runs folder, with a higher round or no round at all (a row
     /// without a status file). Its end is then not the chain's: the chain may still run, or its next
     /// round failed unseen. A live round (ending) is left as it is: its launcher still holds it.
+    /// Only an end that reads as a success (<see cref="StatusWait.Judge"/>) is marked: the launcher
+    /// writes the field only on a round whose worker succeeded and whose gate went on (its end is
+    /// <c>success</c> with exit code 0), so every other end keeps its own verdict, the field or not.
+    /// The mark can then only take a success away, never a failure or a wrap-up.
     /// </summary>
     internal static bool AwaitsRound(StatusRow r, Names names)
     {
-        if (!r.Ended || r.Status?["end"] is not JsonObject end || !string.Equals(Json.Str(end, "gate"), GateChain.Continue, StringComparison.Ordinal))
+        if (!r.Ended || r.Status?["end"] is not JsonObject end || !string.Equals(Json.Str(end, "gate"), GateChain.Continue, StringComparison.Ordinal)
+            || StatusWait.Judge(r) is not StatusWait.Verdict.Success)
         {
             return false;
         }

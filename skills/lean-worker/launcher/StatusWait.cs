@@ -307,8 +307,9 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     /// to another round that no row of the read is reads unknown (<see cref="StatusLayout.AwaitsRound"/>),
     /// so the unit does not end on it in any scope: it is unsure and gives 8 after the grace (7 when
     /// --timeout passes first), and under --any it neither ends the wait nor counts as a 0. That
-    /// mark only takes an end away (never makes a row live, ended or success), so a forged
-    /// <c>gate</c> can turn a 0 or a 1 into an 8, never anything into a 0.
+    /// mark is set only on an end that reads as a success and only takes that end away (never makes
+    /// a row live, ended or success), so a forged <c>gate</c> can turn a 0 into an 8, never anything
+    /// into a 0; a failed or wrapped-up end keeps its 1 or 3 whatever its <c>gate</c> says.
     /// </summary>
     private static void Track(Unit u, long now)
     {
