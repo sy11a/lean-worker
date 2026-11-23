@@ -372,33 +372,99 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
+    /// Refuses a <c>--worktree</c> name that is not a plain branch name, before git takes the name
+    /// anywhere (issue #166). <c>git worktree add -b &lt;branch&gt;</c> hands the name as it is to
+    /// <c>git branch</c>: a name like <c>--force</c> is read there as an option (git then makes a
+    /// branch named after the base commit), and <c>git branch</c> expands <c>@{-N}</c> to an older
+    /// branch. A name that starts with <c>-</c> is refused here, without asking git. Every other name
+    /// goes to <c>git check-ref-format --branch &lt;name&gt;</c>, in the repository (where git
+    /// resolves <c>@{-N}</c>): that command takes its argument only by position (exactly
+    /// <c>--branch &lt;name&gt;</c>, no option parsing behind it), and the name no longer starts
+    /// with a dash, so it cannot be read as an option. The name passes only when git accepts it and
+    /// prints it back unchanged: a name git refuses, or one it rewrites (<c>@{-1}</c> to the branch
+    /// checked out before), is refused, and so is any name when git cannot be asked.
+    /// </summary>
+    internal static async Task CheckBranchNameAsync(string repoRoot, string branch)
+    {
+        if (branch.StartsWith('-'))
+        {
+            throw new LaunchException($"--worktree '{branch}' cannot name a branch: a branch name cannot start with '-'");
+        }
+
+        Git.Result check = await Git.RunResultAsync(repoRoot, "check-ref-format", "--branch", branch).ConfigureAwait(false)
+            ?? throw new LaunchException($"--worktree '{branch}' cannot be checked: git check-ref-format --branch could not be run");
+        if (check.ExitCode is not 0)
+        {
+            throw new LaunchException($"--worktree '{branch}' cannot name a branch: git check-ref-format --branch refuses it ({GitError(check)})");
+        }
+
+        string printed = check.Stdout.TrimEnd('\n', '\r');
+        if (printed.Equals(branch, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        throw new LaunchException($"--worktree '{branch}' cannot name a branch: git reads it as '{EvidenceBlock.OneLine(printed)}'; the name must be the branch itself");
+    }
+
+    /// <summary>
+    /// Refuses a branch that is taken: a ref at <c>refs/heads/&lt;branch&gt;</c>, or a symbolic ref
+    /// there, dangling or not. Returns whether the branch is known to be absent right now: true only
+    /// when git said so itself; anything else (git not run, timed out, a broken repository) proves
+    /// nothing, and a branch found after a failed add is then never deleted. Every argument that
+    /// carries the branch starts with <c>refs/heads/</c>, so no branch name reaches git as an option.
+    /// </summary>
+    private static async Task<bool> RefuseTakenBranchAsync(string repoRoot, string branch)
+    {
+        string branchRef = "refs/heads/" + branch;
+        Git.Result? branchProbe = await Git.RunResultAsync(repoRoot, "rev-parse", "--verify", "--quiet", branchRef).ConfigureAwait(false);
+        if (branchProbe?.ExitCode is 0)
+        {
+            throw new LaunchException($"the branch is taken: {branch}");
+        }
+
+        // A symbolic ref in the place of the branch is taken as well, dangling or not: the probe
+        // above follows it and finds nothing when its target is missing, and git worktree add would
+        // then write through it and make the target branch (issue #166). symbolic-ref -q reads the
+        // ref itself: exit 0 is a symbolic ref, exit 1 none (absent or a plain ref); anything else
+        // cannot tell, and the launch is refused rather than risk a branch made through a link.
+        Git.Result? linkProbe = await Git.RunResultAsync(repoRoot, "symbolic-ref", "-q", branchRef).ConfigureAwait(false);
+        if (linkProbe?.ExitCode is 0)
+        {
+            throw new LaunchException($"the branch is taken: {branch} (it is a symbolic ref to {EvidenceBlock.OneLine(linkProbe.Stdout.Trim())})");
+        }
+
+        if (linkProbe?.ExitCode is not 1)
+        {
+            throw new LaunchException($"the branch {branch} cannot be checked: git could not tell whether it is a symbolic ref ({GitError(linkProbe)})");
+        }
+
+        // Exit 1 of rev-parse is git's own "no such ref": the branch is known to be absent.
+        return branchProbe?.ExitCode is 1;
+    }
+
+    /// <summary>
     /// Creates the worktree: the branch <paramref name="branch"/> at the path of
     /// <see cref="PathFor"/>, branched from the commit <paramref name="baseRef"/> names. Nothing is
-    /// created when the path or the branch is taken already, or when the base does not resolve: the
-    /// run refuses to start instead of taking over what is there. The setup of the repository the
+    /// created when the name is no plain branch name (<see cref="CheckBranchNameAsync"/>), when the
+    /// path or the branch is taken already (a symbolic ref at the branch's place included), or when
+    /// the base does not resolve: the run refuses to start instead of taking over what is there.
+    /// The setup of the repository the
     /// launcher was called in (<paramref name="setup"/>) is copied into the new worktree, so the
     /// worker finds the same profiles, project notes and system notes there.
     /// </summary>
     public static async Task<WorktreeRun> CreateAsync(string repoRoot, string branch, string baseRef, string name, string setup)
     {
+        // The name is checked before git sees it anywhere and before anything is made (issue #166).
+        await CheckBranchNameAsync(repoRoot, branch).ConfigureAwait(false);
         string path = PathFor(repoRoot, name);
         if (Directory.Exists(path) || File.Exists(path))
         {
             throw new LaunchException($"the worktree path is taken: {path}");
         }
 
-        // Whether the repository already has the branch. The argument starts with refs/heads/, so
-        // no branch name reaches git as an option.
-        Git.Result? branchProbe = await Git.RunResultAsync(repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch).ConfigureAwait(false);
-        if (branchProbe?.ExitCode is 0)
-        {
-            throw new LaunchException($"the branch is taken: {branch}");
-        }
-
-        // Exit 1 is git's own "no such ref": the branch is known to be absent right now. Anything
-        // else (git not run, timed out, a broken repository) proves nothing, and a branch found
-        // after a failed add is then never deleted.
-        bool absentBefore = branchProbe?.ExitCode is 1;
+        // Whether the repository already has the branch (or a symbolic ref in its place).
+        bool absentBefore = await RefuseTakenBranchAsync(repoRoot, branch).ConfigureAwait(false);
 
         // The base is resolved once, in the repository the launcher was called in: the commit it
         // names is what the branch is created from and what the worktree must still point at when
@@ -412,6 +478,10 @@ internal sealed class WorktreeRun
         // The folders the worktree sits in (.worktrees/<repository>) are made here, and refused when
         // one of them is a symlink: git would create the worktree through it.
         MakeLayoutFolders(repoRoot);
+        // The name goes to -b as it is: git has no form that keeps the value of -b from being an
+        // option or from being expanded (worktree add passes it on to git branch as it is, and
+        // --end-of-options would cover only the path and the commit, which are an absolute path and
+        // a hex name). CheckBranchNameAsync above is what keeps such a name away from here.
         Git.Result? added = await Git.RunResultAsync(repoRoot, "worktree", "add", "-b", branch, path, sha).ConfigureAwait(false);
         if (added is not { ExitCode: 0 })
         {
@@ -451,6 +521,9 @@ internal sealed class WorktreeRun
     /// </summary>
     public static async Task<WorktreeRun> ReuseAsync(string repoRoot, string branch, string baseRef, string name, string setup)
     {
+        // The same check as the first round's: a later round with a name the first round would have
+        // refused has no worktree of its own to continue, and its cleanup must not name that ref.
+        await CheckBranchNameAsync(repoRoot, branch).ConfigureAwait(false);
         string path = PathFor(repoRoot, name);
         string? continueNote = null;
         if (Absent(path) && await OldLayoutWorktreeAsync(repoRoot, branch, name).ConfigureAwait(false) is { } old)
