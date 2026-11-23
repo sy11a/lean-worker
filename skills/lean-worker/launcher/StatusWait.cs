@@ -2,7 +2,8 @@
 // in scope has ended, then print the listing of those runs and exit with what they ended as. The
 // scope is fixed when the wait starts (after --expect runs appeared); a gate chain is one unit,
 // ended when its launcher is gone, not when a round is, and judged by every row that names its
-// first round's launcher or chain, also the rounds the layout set apart. It reads only: the first
+// first round's launcher or chain, also the rounds the layout set apart; a round whose end says its
+// gate went on to a round the read does not hold does not end it. It reads only: the first
 // read is the one-shot call's (with its reaping), every later read reaps nothing, and nothing is
 // signalled, killed or written. Every span it waits (--timeout, --grace, --interval) is measured
 // on the clock's monotonic timestamp; the wall clock only gives the times shown and the times
@@ -97,6 +98,11 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
         /// The launcher the first round names (the pointer is written once at launch).
         /// </summary>
         public string? FirstLauncher { get; } = StatusLayout.NamedLauncher(rounds.Count > 0 ? rounds[0] : row);
+
+        /// <summary>
+        /// The runs folder of the first round: its run id names a chain only there.
+        /// </summary>
+        public string FirstFolder { get; } = StatusLayout.RunsFolder(rounds.Count > 0 ? rounds[0] : row);
 
         public Dictionary<string, StatusRow> Joined { get; } = new(StringComparer.Ordinal);
 
@@ -297,7 +303,12 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     /// row joined to it have ended (then it is kept as it is); live while one of its own rows runs;
     /// else unsure since the first read that could not tell. A joined row never holds the wait as
     /// live: one that has not ended when the unit's own rows have makes the unit unsure, so it ends
-    /// as given up (exit 8) after the grace.
+    /// as given up (exit 8) after the grace. A round, own or joined, whose end says its gate went on
+    /// to another round that no row of the read is reads unknown (<see cref="StatusLayout.AwaitsRound"/>),
+    /// so the unit does not end on it in any scope: it is unsure and gives 8 after the grace (7 when
+    /// --timeout passes first), and under --any it neither ends the wait nor counts as a 0. That
+    /// mark only takes an end away (never makes a row live, ended or success), so a forged
+    /// <c>gate</c> can turn a 0 or a 1 into an 8, never anything into a 0.
     /// </summary>
     private static void Track(Unit u, long now)
     {
@@ -352,22 +363,35 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
     /// <summary>
     /// Joins to every unit not ended the rows of <paramref name="view"/> that are not its own and
     /// name its first round: the same launcher (pointer, else status file) or the first round's run
-    /// id as their chain id. A row joined before and not listed any more cannot be told (unknown),
-    /// unless it had ended (then it is kept as it was).
+    /// id as their chain id in the first round's runs folder. A row once joined stays joined while
+    /// the read lists it (by its key), judged by its new state even when it no longer names the
+    /// chain (its run dir was removed: gone, still shown under the name it had). A row joined before
+    /// and not listed any more cannot be
+    /// told (unknown), unless it had ended (then it is kept as it was). The rows are indexed once
+    /// per read, not once per unit.
     /// </summary>
     private static void Join(List<Unit> units, StatusLayout.View view)
     {
         List<StatusRow> all = [.. view.Rounds.Values.SelectMany(rounds => rounds)];
+        StatusLayout.Names names = new(all);
+        Dictionary<string, StatusRow> byKey = new(StringComparer.Ordinal);
+        foreach (StatusRow r in all)
+        {
+            _ = byKey.TryAdd(StatusListing.RowKey(r), r);
+        }
+
         foreach (Unit u in units.Where(u => !u.Ended))
         {
             HashSet<string> own = new(u.Rounds.Append(u.Row).Select(r => StatusListing.RowKey(r)), StringComparer.Ordinal);
             HashSet<string> seen = new(StringComparer.Ordinal);
-            foreach (StatusRow r in all.Where(r => Names(u, r)))
+            List<StatusRow> again = [.. u.Joined.Keys.Select(k => byKey.GetValueOrDefault(k)).OfType<StatusRow>()];
+            foreach (StatusRow r in names.Naming(u.FirstLauncher, u.FirstFolder, u.FirstRunId).Concat(again))
             {
                 string key = StatusListing.RowKey(r);
                 if (!own.Contains(key) && seen.Add(key))
                 {
-                    u.Joined[key] = r;
+                    // A joined row whose status file is gone keeps the name it was shown with.
+                    u.Joined[key] = r.Status is null && u.Joined.TryGetValue(key, out StatusRow? before) ? r with { Name = before.Name } : r;
                 }
             }
 
@@ -383,13 +407,6 @@ internal sealed class StatusWait(StatusReader reader, StatusHost host, TextWrite
                 }
             }
         }
-    }
-
-    // Whether a row names the unit's first round: its launcher, or its run id as the chain id.
-    private static bool Names(Unit u, StatusRow r)
-    {
-        return (u.FirstLauncher is { } launcher && string.Equals(StatusLayout.NamedLauncher(r), launcher, StringComparison.Ordinal))
-               || string.Equals(StatusLayout.ChainId(r), u.FirstRunId, StringComparison.Ordinal);
     }
 
     // A row the scope does not list any more: it cannot be told.

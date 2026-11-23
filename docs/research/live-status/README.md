@@ -213,7 +213,9 @@ The `dir` field holds the absolute path; `<repo>` stands for it here.
   (the launcher caught an exception and is about to print `LEAN-WORKER LAUNCH FAILED`). `wrapped_up`
   is a flag inside `worker`, because the worker keeps running after wrap-up.
 - `end` is null until `done` or `failed`, then for example
-  `{"status": "success", "exit_code": 0, "at": "...", "summary": "summary.json"}`. Its `status`
+  `{"status": "success", "exit_code": 0, "at": "...", "summary": "summary.json"}`. *As built:* a
+  round whose gate decided to go on to another round also has `"gate": "continue"` in that same end
+  record (written before the next round starts; additive, so older readers ignore it). Its `status`
   takes the ledger's vocabulary (`success`, `wrapped-up`, `error`, `crashed`, `no-result`,
   `timed-out`, `budget-exceeded`, `truncated`, `out-of-scope`; `LaunchRun.cs:1991-2044`) plus two
   **new** failure statuses that the ledger does not have: `launch-failed` (the catch block; with
@@ -447,6 +449,11 @@ repository is recorded under that repository and is not listed by `--here`; the 
   does not parse) stops holding the wait after `--grace` (default 10 minutes) of staying that way.
   When every other run in scope has ended and such rows remain, `--wait` returns 8 and the listing
   names them. A `gone` row (run dir removed) counts as ended, not `success`.
+- **A chain round that went on.** *As built:* a round, own or joined, whose end has `"gate":
+  "continue"` while the read holds no later round of it (no row naming its launcher, or its chain id
+  in the same runs root) reads `unknown`, not ended, in every scope; the chain then gives 8 after
+  `--grace` (7 if `--timeout` comes first), and under `--any` it neither ends the wait nor counts as
+  0. The mark only takes an end away, so a forged `gate` can never turn a non-zero into 0.
 
 **Exit codes** (proposal; 0/1/2/3 match the launcher's meanings, `LaunchRun.cs:282-285`,
 `Program.cs:41-42`):
