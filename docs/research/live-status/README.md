@@ -296,7 +296,11 @@ The `dir` field holds the absolute path; `<repo>` stands for it here.
   sibling; the writer then takes the name's claim, an empty `.claim-<name>` made with an exclusive
   create (`O_EXCL`), checks that the name is free, renames the temp onto it and deletes the claim.
   A rename alone cannot be the claim: .NET's move without overwrite checks and then renames, and the
-  rename replaces a file that appeared in between (#159).
+  rename replaces a file that appeared in between (#159). Any entry at the name or its claim (a
+  directory or a link too, a dangling one included) counts as taken, and the next suffix is tried; a
+  claim create that fails while neither exists is tried once more before it fails. A reap
+  (`status`) also deletes `.claim-*` and `.tmp-*` regular files older than the 7-day reap age, the
+  leftovers of killed writers; links and directories of those names stay (#160).
 - File per run, not a shared list: no lock, no append race (the ledger's bare append is already a
   known risk, `LaunchRun.cs:2528`), no whole-table rewrite that could drop another writer's row
   (agent-deck #1550).

@@ -6,7 +6,8 @@
 //
 // A pointer is as untrusted as a status file (any process of the user can write the folder): the
 // reader takes it through StatusFile and checks every field it uses. Deleting (reaping) is limited
-// to regular files directly in the index folder whose name has the pointer form.
+// to regular files directly in the index folder whose name has the pointer form, and to the
+// leftovers of killed writers (".claim-*", ".tmp-*") older than the reap age.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -102,6 +103,11 @@ internal static class StatusIndex
     private const string ClaimPrefix = ".claim-";
 
     /// <summary>
+    /// The prefix of the temp sibling a pointer's bytes are written to before the rename.
+    /// </summary>
+    private const string TempPrefix = ".tmp-";
+
+    /// <summary>
     /// Writes a pointer once: the folder is made with mode 0700 when it is missing, and the bytes go
     /// to a temp sibling made with mode 0600. A name is published only under its claim, an empty
     /// file ".claim-&lt;name&gt;" made with an exclusive create (O_CREAT|O_EXCL, which the kernel makes
@@ -109,9 +115,11 @@ internal static class StatusIndex
     /// renames the temp onto it, then deletes the claim. A reader sees either no file of that name
     /// or the whole pointer. File.Move without overwrite alone is not enough: on Unix it checks the
     /// name and then renames, and rename(2) replaces a file that appeared in between. When the name
-    /// or its claim is taken (one process that launched two runs of one round in the same second),
-    /// the next suffix -2 to -99 is tried; when all are taken, an <see cref="IOException"/> is
-    /// thrown. Returns the name written.
+    /// or its claim is taken (any entry there: a file, a directory or a link, a dangling one too;
+    /// one process that launched two runs of one round in the same second), the next suffix -2 to
+    /// -99 is tried; when all are taken, an <see cref="IOException"/> is thrown. A claim create
+    /// that fails although neither the claim nor the name exists is tried once more, then its
+    /// exception is thrown. Returns the name written.
     /// </summary>
     public static string Write(string folder, string fileName, JsonObject pointer)
     {
@@ -144,7 +152,7 @@ internal static class StatusIndex
     private static string WriteTemp(string folder, JsonObject pointer)
     {
         byte[] bytes = Json.Utf8.GetBytes(pointer.ToJsonString(Json.Indented));
-        string temp = Path.Combine(folder, ".tmp-" + Guid.NewGuid().ToString("N"));
+        string temp = Path.Combine(folder, TempPrefix + Guid.NewGuid().ToString("N"));
         if (OperatingSystem.IsWindows())
         {
             _ = Directory.CreateDirectory(folder);
@@ -169,21 +177,26 @@ internal static class StatusIndex
     }
 
     /// <summary>
+    /// How often <see cref="TakeClaim"/> makes the claim when a create fails although neither the
+    /// claim nor the name exists. That happens once when a holder released the claim without
+    /// publishing (its move failed) between this writer's failed create and its checks; it happening
+    /// again on the same name takes a second failed publish or a create that fails by itself (no
+    /// space, an I/O error), a lasting fault that has to surface.
+    /// </summary>
+    private const int ClaimTries = 2;
+
+    /// <summary>
     /// Publishes <paramref name="temp"/> as <paramref name="name"/> under the name's claim. False
-    /// when the claim is held by another writer or the name exists; the claim is always released.
+    /// when the claim is held by another writer or any entry has the name (a file, a directory or a
+    /// link, a dangling one too: Path.Exists is true for all of them, and nothing is opened, written
+    /// or deleted through such an entry); the claim is always released.
     /// </summary>
     private static bool Publish(string folder, string name, string temp)
     {
         string path = Path.Combine(folder, name);
         string claim = Path.Combine(folder, ClaimPrefix + name);
-        try
+        if (!TakeClaim(claim, path))
         {
-            new FileStream(claim, CreateNewOptions()).Dispose();
-        }
-        catch (IOException) when (File.Exists(claim) || File.Exists(path))
-        {
-            // Held by another writer, or released by it since: a holder lets go only after it
-            // published the name or found it taken.
             return false;
         }
 
@@ -191,7 +204,7 @@ internal static class StatusIndex
         {
             // Under the claim no other writer publishes this name, so the check and the rename that
             // follows it cannot be overtaken.
-            if (File.Exists(path))
+            if (Path.Exists(path))
             {
                 return false;
             }
@@ -199,7 +212,7 @@ internal static class StatusIndex
             File.Move(temp, path, overwrite: false);
             return true;
         }
-        catch (IOException) when (File.Exists(path))
+        catch (IOException) when (Path.Exists(path))
         {
             // Taken after all, by a writer that does not claim (an older launcher).
             return false;
@@ -207,6 +220,35 @@ internal static class StatusIndex
         finally
         {
             Delete(claim);
+        }
+    }
+
+    /// <summary>
+    /// Makes the claim <paramref name="claim"/> with an exclusive create. False when an entry is at
+    /// the claim or at the name <paramref name="path"/> (held by another writer, or released by it
+    /// since: a holder lets go after it published the name, found it taken or failed). A create
+    /// that fails while neither exists is tried again up to <see cref="ClaimTries"/> creates in all,
+    /// then its exception is thrown; any other exception (an UnauthorizedAccessException: no
+    /// permission) is thrown at once.
+    /// </summary>
+    private static bool TakeClaim(string claim, string path)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                new FileStream(claim, CreateNewOptions()).Dispose();
+                return true;
+            }
+            catch (IOException) when (Path.Exists(claim) || Path.Exists(path))
+            {
+                return false;
+            }
+            catch (IOException) when (attempt < ClaimTries)
+            {
+                // Neither exists: a holder that failed let go in between, or the create failed by
+                // itself; the next create tells which.
+            }
         }
     }
 
@@ -234,16 +276,21 @@ internal static class StatusIndex
     /// tell whether its target is a directory), and Complete is false when it did not finish. A
     /// folder that is missing or is itself a symbolic link lists nothing.
     /// </summary>
-    public static (List<string> Names, bool Complete) List(string folder, ReadBudget budget) => budget.List(add => Collect(folder, add));
+    public static (List<string> Names, bool Complete) List(string folder, ReadBudget budget) => budget.List(add => Collect(folder, n => IsPointerName(n), add));
 
-    private static void Collect(string folder, Action<string> add)
+    /// <summary>
+    /// Hands the names of the file entries in <paramref name="folder"/> that pass
+    /// <paramref name="keep"/> to <paramref name="add"/>; a folder that is missing or is itself a
+    /// symbolic link gives none.
+    /// </summary>
+    private static void Collect(string folder, Func<string, bool> keep, Action<string> add)
     {
         if (StatusFile.IsLink(folder) || !Directory.Exists(folder))
         {
             return;
         }
 
-        foreach (string name in Directory.EnumerateFiles(folder).Select(path => Path.GetFileName(path)).Where(name => IsPointerName(name)))
+        foreach (string name in Directory.EnumerateFiles(folder).Select(path => Path.GetFileName(path)).Where(name => keep(name)))
         {
             add(name);
         }
@@ -277,6 +324,58 @@ internal static class StatusIndex
     {
         FileInfo info = new(path);
         if (info.LinkTarget is not null || !info.Exists || info.Attributes.HasFlag(FileAttributes.Directory) || info.Length is 0)
+        {
+            return false;
+        }
+
+        // Checked again right before the delete: a folder swapped for a link since it was listed
+        // would have the delete land in the link's target.
+        if (StatusFile.IsLink(folder))
+        {
+            return false;
+        }
+
+        info.Delete();
+        return true;
+    }
+
+    /// <summary>
+    /// Deletes the leftovers of writers that were killed while publishing: entries directly in
+    /// <paramref name="folder"/> whose name starts with ".claim-" or ".tmp-", that are regular files
+    /// (a link of such a name, even one to a file, and a directory are left alone) and whose own
+    /// last write time is more than <paramref name="olderThan"/> before <paramref name="now"/>. A
+    /// live writer holds its claim and its temp for well under a second, so neither is ever that
+    /// old. The listing and every delete run under <paramref name="budget"/>; a leftover that cannot
+    /// be deleted, or does not answer in time, stays for the next reap. Nothing here throws.
+    /// </summary>
+    public static void ReapLeftovers(string folder, DateTimeOffset now, TimeSpan olderThan, ReadBudget budget)
+    {
+        (List<string> names, bool _) = budget.List(add => Collect(folder, n => IsLeftoverName(n), add));
+        foreach (string name in names)
+        {
+            string path = Path.Combine(folder, name);
+            try
+            {
+                _ = budget.Run(() => DeleteIfLeftover(folder, path, now, olderThan), out bool _);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                // Gone already, or it cannot be deleted: it stays for the next reap.
+            }
+        }
+    }
+
+    private static bool IsLeftoverName(string name)
+    {
+        return (name.StartsWith(ClaimPrefix, StringComparison.Ordinal) || name.StartsWith(TempPrefix, StringComparison.Ordinal))
+               && string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal);
+    }
+
+    private static bool DeleteIfLeftover(string folder, string path, DateTimeOffset now, TimeSpan olderThan)
+    {
+        FileInfo info = new(path);
+        if (info.LinkTarget is not null || !info.Exists || info.Attributes.HasFlag(FileAttributes.Directory)
+            || now - new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero) <= olderThan)
         {
             return false;
         }
