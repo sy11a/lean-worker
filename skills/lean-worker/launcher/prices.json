@@ -1,7 +1,7 @@
 {
   "_comment": "List prices in USD per million tokens. Edit the project's .lean-worker/prices.json (or ~/.config/lean-worker/prices.json) instead of this file; both are merged over it. Model keys are provider/model; a model id matches the longest key it starts with.",
   "asOf": "2026-09-29",
-  "source": "https://models.dev (checked by hand)",
+  "source": "https://models.dev (checked by hand); anthropic/claude-fable-5-2 from https://platform.claude.com/docs/en/about-claude/pricing",
   "unknownModel": "dearest",
   "rates": { "USD": 1 },
   "providers": {
@@ -25,6 +25,7 @@
     }
   },
   "models": {
+    "anthropic/claude-fable-5-2": { "input": 8, "output": 40, "cacheRead": 0.2, "cacheWrite": 10, "asOf": "2026-11-23" },
     "anthropic/claude-fable-5-1": { "input": 10, "output": 50, "cacheRead": 0.25, "cacheWrite": 12.5 },
     "anthropic/claude-opus-5-5": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 },
     "anthropic/claude-sonnet-5-5": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
