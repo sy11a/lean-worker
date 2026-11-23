@@ -127,7 +127,10 @@ internal static class StatusText
         return [StateText(r, live), r.Name, runtime, Json.Str(spec, "model") ?? "-", calls, cost, Duration(Elapsed(r, doc, live, now)), r.Detail];
     }
 
-    private static string StateText(StatusRow r, JsonObject? live)
+    /// <summary>
+    /// The STATE cell: the state, or the gate round (gate r2/3) while a gate runs.
+    /// </summary>
+    internal static string StateText(StatusRow r, JsonObject? live)
     {
         if (r.State is not StatusStates.Gate || StatusProbe.NumOrNull(live?["gate_round"]) is not { } round)
         {
@@ -142,7 +145,7 @@ internal static class StatusText
     /// The run's elapsed time: the writer's monotonic count, plus the time since its last write
     /// while the run is live.
     /// </summary>
-    private static TimeSpan Elapsed(StatusRow r, JsonObject doc, JsonObject? live, DateTimeOffset now)
+    internal static TimeSpan Elapsed(StatusRow r, JsonObject doc, JsonObject? live, DateTimeOffset now)
     {
         // Clamped before any arithmetic: the file's count can be anything (negative, 1e300).
         TimeSpan elapsed = TimeSpan.FromMilliseconds(Math.Clamp(Json.Num(live?["elapsed_ms"]), 0, (long)MaxDuration.TotalMilliseconds));
@@ -324,7 +327,7 @@ internal static class StatusText
         }
     }
 
-    private static string Money(decimal? usd) => usd is { } d ? "$" + d.ToString("0.00", _ic) : "-";
+    internal static string Money(decimal? usd) => usd is { } d ? "$" + d.ToString("0.00", _ic) : "-";
 
     /// <summary>
     /// A duration as the table shows it: 45s, 3m41s, 1h02m.
