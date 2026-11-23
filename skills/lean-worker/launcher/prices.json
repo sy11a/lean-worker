@@ -1,7 +1,7 @@
 {
   "_comment": "List prices in USD per million tokens. Edit the project's .lean-worker/prices.json (or ~/.config/lean-worker/prices.json) instead of this file; both are merged over it. Model keys are provider/model; a model id matches the longest key it starts with.",
   "asOf": "2026-09-29",
-  "source": "https://models.dev (checked by hand); anthropic/claude-fable-5-2 from https://platform.claude.com/docs/en/about-claude/pricing",
+  "source": "https://models.dev (checked by hand); anthropic/claude-fable-5-2, anthropic/claude-sonnet-5-5 and anthropic/claude-haiku-5-5 from https://platform.claude.com/docs/en/about-claude/pricing",
   "unknownModel": "dearest",
   "rates": { "USD": 1 },
   "providers": {
@@ -28,8 +28,10 @@
     "anthropic/claude-fable-5-2": { "input": 8, "output": 40, "cacheRead": 0.2, "cacheWrite": 10, "asOf": "2026-11-23" },
     "anthropic/claude-fable-5-1": { "input": 10, "output": 50, "cacheRead": 0.25, "cacheWrite": 12.5 },
     "anthropic/claude-opus-5-5": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 },
-    "anthropic/claude-sonnet-5-5": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
+    "anthropic/claude-sonnet-5-5": { "input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5, "asOf": "2026-11-23" },
     "anthropic/claude-sonnet-5": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
+    "anthropic/claude-haiku-5-5": { "input": 0.1, "output": 0.5, "cacheRead": 0.01, "cacheWrite": 0.125, "cacheWrite1h": 0.2, "asOf": "2026-11-23",
+                                    "above": { "tokens": 100000, "input": 0.5, "output": 2.5, "cacheRead": 0.05, "cacheWrite": 0.625, "cacheWrite1h": 1 } },
     "anthropic/claude-haiku-4-5": { "input": 1, "output": 5, "cacheRead": 0.1, "cacheWrite": 1.25 },
     "zai/glm-5.3": { "input": 1.4, "output": 4.4, "cacheRead": 0.26, "cacheWrite": 0 },
     "zai/glm-5.3-flash": { "input": 0.15, "output": 0.5, "cacheRead": 0.03, "cacheWrite": 0 },
