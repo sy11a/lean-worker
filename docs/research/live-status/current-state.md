@@ -301,7 +301,7 @@ user of the commands (verified in the private companion note):
 **`--worktree` path.** `PathFor` builds `<parent-of-repo>/<repo>-<safe-name>` (`WorktreeRun.cs:117-122`).
 - **Mismatch with the operator rule of 2026-11-17** (`~/.claude/CLAUDE.md`, worktrees go under
   `<root>/.worktrees/<project>/<name>`, never `../<repo>-<name>`): the launcher still creates sibling
-  worktrees.
+  worktrees. (Resolved since by #139: `PathFor` now builds `<parent-of-repo>/.worktrees/<repo>/<safe-name>`.)
 - Mutual exclusion is only "path or branch already taken: refuse" (`WorktreeRun.cs:147-158`).
 - The run removes its own worktree only when it is untouched (`WorktreeRun.cs:1-10`). A launch that dies is
   handled by `FinishWorktreeOnFailureAsync` (`LaunchRun.cs:287-295`), except on SIGKILL.
@@ -474,7 +474,7 @@ user of the commands (verified in the private companion note):
 - `SKILL.md:157` uses `--profiles` where the subcommand is `profiles`.
 - `WorktreeRun.PathFor` creates `../<repo>-<name>` worktrees, against the operator's 2026-11-17
   worktree-location
-  rule.
+  rule. (Resolved since by #139: `.worktrees/<repo>/<name>`.)
 
 ## Verification log (design session, 2026-11-22)
 

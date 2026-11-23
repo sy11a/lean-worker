@@ -366,6 +366,7 @@ internal sealed class LaunchRun
         _worktree = await Workspace.WorktreeAsync(_o, _invokingRoot, setup, GateContext is not null).ConfigureAwait(false);
         _workspaceRoot = _worktree.WorktreePath;
         _notes.Add(EvidenceBlock.OneLine($"worktree {_worktree.WorktreePath} (branch {_worktree.Branch}, from {_worktree.Base})"));
+        _notes.AddRange(_worktree.ContinueNote is { Length: > 0 } note ? [EvidenceBlock.OneLine(note)] : []);
     }
 
     /// <summary>
