@@ -10,7 +10,7 @@ namespace LeanWorker.Tests;
 /// (never global).
 /// </summary>
 [Collection("launcher-process-state")]
-public sealed class WorktreeRunTests : IAsyncLifetime
+public sealed partial class WorktreeRunTests : IAsyncLifetime
 {
     private const string Branch = "wt-branch";
     private const string RunName = "job";
@@ -20,7 +20,7 @@ public sealed class WorktreeRunTests : IAsyncLifetime
     private string _repo = string.Empty;
     private string _setup = string.Empty;
 
-    private string WorktreePath => Path.Combine(_root, "repo-" + RunName);
+    private string WorktreePath => Path.Combine(_root, ".worktrees", "repo", RunName);
 
     public async ValueTask InitializeAsync()
     {
