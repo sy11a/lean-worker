@@ -7,7 +7,7 @@ namespace LeanWorker.Tests;
 /// A forged <c>end.gate</c> only makes a verdict stricter (docs/research/live-status/README.md, section 5; the follow-up review of #147): on an
 /// honest single run that finished clean, <c>"continue"</c> turns exit 0 into 8 (7 when --timeout is shorter) and any other
 /// value (another string, a number, a boolean, null, an object, an array, a very long string, control characters) is
-/// ignored; on a failed run no value turns the verdict into a 0. What the commands print stays clean whatever the value.
+/// ignored; on a failed run no value changes the verdict (always 1, at once, never a 0 and never an 8). What the commands print stays clean whatever the value.
 /// </summary>
 [Collection("launcher-process-state")]
 public sealed class StatusEndGateForgedTests : IDisposable
@@ -92,33 +92,28 @@ public sealed class StatusEndGateForgedTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Values))]
-    public async Task On_a_failed_run_no_value_gives_exit_0_and_only_continue_may_change_the_1Async(string value)
+    public async Task On_a_failed_run_whatever_end_gate_says_the_wait_gives_exit_1_at_onceAsync(string value)
     {
         StatusLiveRig.Result r = await WaitAfterEndAsync("error", value);
 
         Assert.Null(r.Error);
-        Assert.NotEqual(0, r.Code);
+        // A failed end keeps its own verdict: the field neither turns it into a 0 nor takes it away (no 8).
+        Assert.Equal(1, r.Code);
+        Assert.InRange(_rig.Elapsed, Seconds(10), Seconds(12));
         Assert.Empty(TerminalAssert.PlainProblems(r.Output));
-        if (value is "continue")
-        {
-            // Never a 0: the run's end is taken away, so the wait gives it up (8) rather than call it a failure.
-            Assert.Equal(8, r.Code);
-        }
-        else
-        {
-            Assert.Equal(1, r.Code);
-        }
     }
 
     [Theory]
-    [InlineData("success")]
-    [InlineData("error")]
-    public async Task With_any_a_forged_continue_never_makes_the_wait_end_as_a_0_aloneAsync(string status)
+    [InlineData("success", 8, true)]
+    [InlineData("error", 1, false)]
+    public async Task With_any_a_forged_continue_holds_a_clean_end_and_never_ends_the_wait_as_a_0_aloneAsync(string status, int code, bool held)
     {
         StatusLiveRig.Result r = await WaitAfterEndAsync(status, "continue", "--any");
 
         Assert.NotEqual(0, r.Code);
-        Assert.InRange(_rig.Elapsed, Seconds(10) + _grace, Seconds(12) + _grace);
+        Assert.Equal(code, r.Code);
+        TimeSpan hold = held ? _grace : TimeSpan.Zero;
+        Assert.InRange(_rig.Elapsed, Seconds(10) + hold, Seconds(12) + hold);
     }
 
     [Theory]
