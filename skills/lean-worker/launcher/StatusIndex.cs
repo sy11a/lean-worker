@@ -96,36 +96,55 @@ internal static class StatusIndex
     }
 
     /// <summary>
-    /// Writes a pointer once: the folder is made with mode 0700 when it is missing, the bytes go to a
-    /// temp sibling made with mode 0600, and a rename that never overwrites publishes it. When the
-    /// name is taken (one process that launched two runs of one round in the same second), the
-    /// next suffix -2 to -99 is tried; when all are taken, the <see cref="IOException"/> stays.
-    /// Returns the name written.
+    /// The prefix of the claim file that guards a pointer name while it is published; a claim never
+    /// has the pointer form, so no listing takes it for a pointer.
+    /// </summary>
+    private const string ClaimPrefix = ".claim-";
+
+    /// <summary>
+    /// Writes a pointer once: the folder is made with mode 0700 when it is missing, and the bytes go
+    /// to a temp sibling made with mode 0600. A name is published only under its claim, an empty
+    /// file ".claim-&lt;name&gt;" made with an exclusive create (O_CREAT|O_EXCL, which the kernel makes
+    /// atomic for threads and processes alike): the claim's holder checks that the name is free and
+    /// renames the temp onto it, then deletes the claim. A reader sees either no file of that name
+    /// or the whole pointer. File.Move without overwrite alone is not enough: on Unix it checks the
+    /// name and then renames, and rename(2) replaces a file that appeared in between. When the name
+    /// or its claim is taken (one process that launched two runs of one round in the same second),
+    /// the next suffix -2 to -99 is tried; when all are taken, an <see cref="IOException"/> is
+    /// thrown. Returns the name written.
     /// </summary>
     public static string Write(string folder, string fileName, JsonObject pointer)
     {
         string stem = fileName.EndsWith(".json", StringComparison.Ordinal) ? fileName[..^".json".Length] : fileName;
-        for (int k = 1; ; k++)
+        string temp = WriteTemp(folder, pointer);
+        try
         {
-            string name = k is 1 ? fileName : string.Create(CultureInfo.InvariantCulture, $"{stem}-{k}.json");
-            try
+            for (int k = 1; k <= NameTries; k++)
             {
-                WriteNew(folder, name, pointer);
-                return name;
+                string name = k is 1 ? fileName : string.Create(CultureInfo.InvariantCulture, $"{stem}-{k}.json");
+                if (Publish(folder, name, temp))
+                {
+                    return name;
+                }
             }
-            catch (IOException) when (k < NameTries && File.Exists(Path.Combine(folder, name)))
-            {
-                // Taken: the next suffix.
-            }
+
+            throw new IOException(string.Create(CultureInfo.InvariantCulture,
+                $"The pointer name {fileName} and its suffixes -2 to -{NameTries} are all taken in {folder}."));
+        }
+        finally
+        {
+            Delete(temp);
         }
     }
 
-    private static void WriteNew(string folder, string fileName, JsonObject pointer)
+    /// <summary>
+    /// The pointer's bytes in a new temp sibling (".tmp-" and a random name, mode 0600); the folder
+    /// is made first when it is missing. Returns the temp's path.
+    /// </summary>
+    private static string WriteTemp(string folder, JsonObject pointer)
     {
         byte[] bytes = Json.Utf8.GetBytes(pointer.ToJsonString(Json.Indented));
-        string path = Path.Combine(folder, fileName);
         string temp = Path.Combine(folder, ".tmp-" + Guid.NewGuid().ToString("N"));
-        FileStreamOptions options = new() { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
         if (OperatingSystem.IsWindows())
         {
             _ = Directory.CreateDirectory(folder);
@@ -133,23 +152,79 @@ internal static class StatusIndex
         else
         {
             _ = Directory.CreateDirectory(folder, DirectoryMode);
-            options.UnixCreateMode = FileMode600;
         }
 
         try
         {
-            using (FileStream fs = new(temp, options))
+            using FileStream fs = new(temp, CreateNewOptions());
+            fs.Write(bytes);
+        }
+        catch
+        {
+            Delete(temp);
+            throw;
+        }
+
+        return temp;
+    }
+
+    /// <summary>
+    /// Publishes <paramref name="temp"/> as <paramref name="name"/> under the name's claim. False
+    /// when the claim is held by another writer or the name exists; the claim is always released.
+    /// </summary>
+    private static bool Publish(string folder, string name, string temp)
+    {
+        string path = Path.Combine(folder, name);
+        string claim = Path.Combine(folder, ClaimPrefix + name);
+        try
+        {
+            new FileStream(claim, CreateNewOptions()).Dispose();
+        }
+        catch (IOException) when (File.Exists(claim) || File.Exists(path))
+        {
+            // Held by another writer, or released by it since: a holder lets go only after it
+            // published the name or found it taken.
+            return false;
+        }
+
+        try
+        {
+            // Under the claim no other writer publishes this name, so the check and the rename that
+            // follows it cannot be overtaken.
+            if (File.Exists(path))
             {
-                fs.Write(bytes);
+                return false;
             }
 
             File.Move(temp, path, overwrite: false);
+            return true;
+        }
+        catch (IOException) when (File.Exists(path))
+        {
+            // Taken after all, by a writer that does not claim (an older launcher).
+            return false;
         }
         finally
         {
-            try { File.Delete(temp); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            Delete(claim);
         }
+    }
+
+    private static FileStreamOptions CreateNewOptions()
+    {
+        FileStreamOptions options = new() { Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = FileMode600;
+        }
+
+        return options;
+    }
+
+    private static void Delete(string path)
+    {
+        try { File.Delete(path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     /// <summary>

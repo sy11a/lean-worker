@@ -292,7 +292,11 @@ The `dir` field holds the absolute path; `<repo>` stands for it here.
 ```
 
 - Written once, atomically, right after the first `status.json`; never rewritten. The directory is
-  made with mode 0700 (`XDG_STATE_HOME` defaults to `~/.local/state`).
+  made with mode 0700 (`XDG_STATE_HOME` defaults to `~/.local/state`). The bytes go to a temp
+  sibling; the writer then takes the name's claim, an empty `.claim-<name>` made with an exclusive
+  create (`O_EXCL`), checks that the name is free, renames the temp onto it and deletes the claim.
+  A rename alone cannot be the claim: .NET's move without overwrite checks and then renames, and the
+  rename replaces a file that appeared in between (#159).
 - File per run, not a shared list: no lock, no append race (the ledger's bare append is already a
   known risk, `LaunchRun.cs:2528`), no whole-table rewrite that could drop another writer's row
   (agent-deck #1550).
