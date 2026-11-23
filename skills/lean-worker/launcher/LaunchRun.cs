@@ -289,7 +289,9 @@ internal sealed class LaunchRun
             // operator's go), 1 for every other status — a failed run, and a run the provider's
             // output limit truncated (issue #115) alike.
             int code = _status switch { "success" => 0, "wrapped-up" => 3, _ => 1 };
-            _live?.Finish(_status, Launcher.ChainExitCode(LastGate, code));
+            // A gate that goes on to another round is recorded with the end (status --wait does not
+            // take this round's end as the chain's while no later round is seen).
+            _live?.Finish(_status, Launcher.ChainExitCode(LastGate, code), LastGate is { Decision: GateChain.Continue } ? GateChain.Continue : null);
             await PrintAsync().ConfigureAwait(false);
             return code;
         }

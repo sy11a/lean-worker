@@ -213,7 +213,9 @@ The `dir` field holds the absolute path; `<repo>` stands for it here.
   (the launcher caught an exception and is about to print `LEAN-WORKER LAUNCH FAILED`). `wrapped_up`
   is a flag inside `worker`, because the worker keeps running after wrap-up.
 - `end` is null until `done` or `failed`, then for example
-  `{"status": "success", "exit_code": 0, "at": "...", "summary": "summary.json"}`. Its `status`
+  `{"status": "success", "exit_code": 0, "at": "...", "summary": "summary.json"}`. *As built:* a
+  round whose gate decided to go on to another round also has `"gate": "continue"` in that same end
+  record (written before the next round starts; additive, so older readers ignore it). Its `status`
   takes the ledger's vocabulary (`success`, `wrapped-up`, `error`, `crashed`, `no-result`,
   `timed-out`, `budget-exceeded`, `truncated`, `out-of-scope`; `LaunchRun.cs:1991-2044`) plus two
   **new** failure statuses that the ledger does not have: `launch-failed` (the catch block; with
@@ -438,13 +440,20 @@ repository is recorded under that repository and is not listed by `--here`; the 
   nothing; so a batch recipe records the time before it launches and passes `--started-after <t>
   --expect <n>`: the waiter takes runs started at or after `<t>` as they appear until there are
   `<n>`, then fixes the scope. If fewer than `<n>` appear within the grace, it returns 8 and names
-  the shortfall.
+  the shortfall. *As built:* with `--started-after`, runs in that window that already ended count
+  toward the scope and `<n>` too (a batch run that ends before the waiter reads it is not lost);
+  `<t>` needs `Z` or an offset, and a run whose start cannot be told is kept, not dropped.
 - **A finite default.** `--timeout` defaults to 120 minutes (the launcher's default worker limit is
   60, `Options.cs:102`, plus gate rounds); exit 7 when it passes.
 - **Rows that cannot be resolved.** An `unknown` or `unreadable` row (a failed probe, a pointer that
   does not parse) stops holding the wait after `--grace` (default 10 minutes) of staying that way.
   When every other run in scope has ended and such rows remain, `--wait` returns 8 and the listing
   names them. A `gone` row (run dir removed) counts as ended, not `success`.
+- **A chain round that went on.** *As built:* a round, own or joined, whose end has `"gate":
+  "continue"` while the read holds no later round of it (no row naming its launcher, or its chain id
+  in the same runs root) reads `unknown`, not ended, in every scope; the chain then gives 8 after
+  `--grace` (7 if `--timeout` comes first), and under `--any` it neither ends the wait nor counts as
+  0. The mark only takes an end away, so a forged `gate` can never turn a non-zero into 0.
 
 **Exit codes** (proposal; 0/1/2/3 match the launcher's meanings, `LaunchRun.cs:282-285`,
 `Program.cs:41-42`):
@@ -746,7 +755,7 @@ notifications is what the operator's private dashboard daemon is for; when it ru
 | Terminal phase written early, or a stray `done` | n/a | not final while the recorded launcher is alive (the rule in 4.1) | `ending` for a moment, then the final state |
 | Pid reused after the launcher died | n/a (no pid recorded) | start ticks differ | `lost`, not a false `running` |
 | Reboot | stale run dirs look running | `boot_id` differs | `lost` |
-| Old launcher (no `status.json`) | n/a | no pointer; `--here` finds the dir | a directory-only `legacy` row, liveness `unknown` (counters from the stream only with slice 7) |
+| Old launcher (no `status.json`) | n/a | no pointer; `--here` finds the dir | a directory-only `legacy` row, liveness `unknown` (counters from the stream only with slice 7); *as built*, `--wait` does not wait on a legacy row with a `summary.json` (a finished run), and holds one without it (a run not yet writing its status, or whose writes failed) through `--grace` like `unknown`, then 8 |
 | Stale stream files of long-dead runs | indistinguishable from live ones | not in the index; `--here` shows them as `legacy` only inside `--since` | hidden by default |
 | Status write fails (disk full, permission) | n/a | best effort; one note in the summary | the row ages (`updated` old) but liveness stays right |
 | Torn or foreign `status.json` | n/a | atomic rename; parse retry once; else `unreadable` | `unreadable`, never `lost` |

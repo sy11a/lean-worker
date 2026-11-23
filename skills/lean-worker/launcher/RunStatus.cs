@@ -532,14 +532,17 @@ internal sealed class RunStatus
     /// <summary>
     /// The run is done: summary, report and ledger row are written. <paramref name="status"/> is the
     /// ledger's status, <paramref name="exitCode"/> the launcher's exit code for this round.
+    /// <paramref name="gate"/> is <see cref="GateChain.Continue"/> when this round's gate decided to
+    /// go on to another round (the end then records it as <c>gate</c>, written with the end itself,
+    /// so before the next round starts), else null and the end has no <c>gate</c>.
     /// </summary>
-    public void Finish(string status, int exitCode)
+    public void Finish(string status, int exitCode, string? gate = null)
     {
-        BestEffort(() => RecordFinish(status, exitCode));
+        BestEffort(() => RecordFinish(status, exitCode, gate));
         BestEffort(() => StopSignals());
     }
 
-    private void RecordFinish(string status, int exitCode)
+    private void RecordFinish(string status, int exitCode, string? gate)
     {
         lock (_lock)
         {
@@ -555,6 +558,11 @@ internal sealed class RunStatus
                 ["at"] = Stamp(_clock.GetUtcNow()),
                 ["summary"] = "summary.json",
             };
+            if (gate is not null)
+            {
+                _end["gate"] = gate;
+            }
+
             WriteLocked();
         }
     }

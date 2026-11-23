@@ -26,21 +26,86 @@ internal static class StatusLayout
         Dictionary<string, StatusRow> ByRunId);
 
     /// <summary>
+    /// The detail of a round whose end says its gate went on to another round that the read does
+    /// not hold (<see cref="AwaitsRound"/>).
+    /// </summary>
+    internal const string AwaitingDetail = "its gate went on to another round, which is not seen; the chain's end cannot be told";
+
+    /// <summary>
+    /// The rows of one read by the launcher they name (<see cref="NamedLauncher"/>) and by their
+    /// status file's chain id within their runs folder, built once per read. Unproven: only for
+    /// making a wait stricter, never for grouping.
+    /// </summary>
+    internal sealed class Names
+    {
+        private readonly Dictionary<string, List<StatusRow>> _byLauncher = new(StringComparer.Ordinal);
+        private readonly Dictionary<(string Folder, string Id), List<StatusRow>> _byChain = [];
+
+        public Names(IEnumerable<StatusRow> rows)
+        {
+            foreach (StatusRow r in rows)
+            {
+                if (NamedLauncher(r) is { } launcher)
+                {
+                    Add(_byLauncher, launcher, r);
+                }
+
+                if (ChainId(r) is { } id)
+                {
+                    Add(_byChain, (RunsFolder(r), id), r);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The rows that name <paramref name="launcher"/>, or <paramref name="chainId"/> as their
+        /// chain id in the runs folder <paramref name="folder"/>; a row can come twice.
+        /// </summary>
+        public IEnumerable<StatusRow> Naming(string? launcher, string folder, string? chainId)
+        {
+            IEnumerable<StatusRow> byLauncher = launcher is not null && _byLauncher.TryGetValue(launcher, out List<StatusRow>? l) ? l : [];
+            IEnumerable<StatusRow> byChain = chainId is not null && _byChain.TryGetValue((folder, chainId), out List<StatusRow>? c) ? c : [];
+            return byLauncher.Concat(byChain);
+        }
+
+        private static void Add<TKey>(Dictionary<TKey, List<StatusRow>> map, TKey key, StatusRow r)
+            where TKey : notnull
+        {
+            if (map.TryGetValue(key, out List<StatusRow>? list))
+            {
+                list.Add(r);
+            }
+            else
+            {
+                map[key] = [r];
+            }
+        }
+    }
+
+    /// <summary>
+    /// The folder a row's run dir is in (its runs root's <c>runs</c>): run ids are unique only there.
+    /// </summary>
+    internal static string RunsFolder(StatusRow r) => Path.GetDirectoryName(Path.GetFullPath(Path.TrimEndingDirectorySeparator(r.Dir))) ?? string.Empty;
+
+    /// <summary>
     /// Groups the rows by their status file's chain id: the chain's row is its worst round
     /// (attention over live over ended), the latest (the highest round number) among equals; an
     /// earlier round with an end is final, not ending, though its launcher still runs the later
     /// round (<see cref="StatusReader.EarlierRound"/>). A row without a chain id is a chain of its own.
+    /// A round that ended with its gate going on to another round, while the read holds no later
+    /// round of it, is not shown as ended (<see cref="AwaitsRound"/>).
     /// </summary>
     public static View Chains(IReadOnlyList<StatusRow> rows, StatusReader reader, DateTimeOffset now)
     {
         List<StatusRow> shown = [];
         Dictionary<StatusRow, List<StatusRow>> rounds = new(ReferenceEqualityComparer.Instance);
         Dictionary<string, StatusRow> byRunId = new(StringComparer.Ordinal);
+        Names names = new(rows);
         foreach (List<StatusRow> members in Groups(rows))
         {
             StatusRow latest = members[^1];
             string? chainId = members.Count > 1 ? ChainId(latest) : null;
-            List<StatusRow> derived = [.. members.Select(m => Derive(m, latest, chainId, members.Count, reader, now))];
+            List<StatusRow> derived = [.. members.Select(m => Derive(m, latest, chainId, members.Count, reader, now)).Select(d => AwaitsRound(d, names) ? Awaiting(d) : d)];
             StatusRow head = derived[^1];
             foreach (StatusRow d in derived.Where(d => Rank(d) > Rank(head)))
             {
@@ -167,6 +232,13 @@ internal static class StatusLayout
         return r.PointerLauncher is null || string.Equals(Identity(r.PointerLauncher), own, StringComparison.Ordinal) ? own : null;
     }
 
+    /// <summary>
+    /// The launcher a row names, unproven: its pointer's (written once at launch), else its status
+    /// file's; null when it names none in full. Only for making a wait stricter (StatusWait), never
+    /// for grouping.
+    /// </summary>
+    internal static string? NamedLauncher(StatusRow r) => Identity(r.PointerLauncher ?? r.Status?["launcher"] as JsonObject);
+
     private static string? Identity(JsonObject? launcher)
     {
         long? pid = StatusProbe.NumOrNull(launcher?["pid"]);
@@ -202,9 +274,47 @@ internal static class StatusLayout
     private static string ChainKey(StatusRow r, int index) =>
         ChainId(r) is { } id ? "c:" + id : "i:" + index.ToString(CultureInfo.InvariantCulture);
 
-    private static string? ChainId(StatusRow r) => Json.Str(r.Status?["run"] as JsonObject, "chain_id") is { Length: > 0 } id ? id : null;
+    internal static string? ChainId(StatusRow r) => Json.Str(r.Status?["run"] as JsonObject, "chain_id") is { Length: > 0 } id ? id : null;
 
-    private static long Round(StatusRow r) => StatusProbe.NumOrNull((r.Status?["run"] as JsonObject)?["round"]) ?? 0;
+    private static long Round(StatusRow r) => RoundOrNull(r) ?? 0;
+
+    private static long? RoundOrNull(StatusRow r) => StatusProbe.NumOrNull((r.Status?["run"] as JsonObject)?["round"]);
+
+    /// <summary>
+    /// Whether <paramref name="r"/> ended with an end whose gate went on to another round
+    /// (<c>end.gate</c> is <see cref="GateChain.Continue"/>, written with the end before that round
+    /// starts) while <paramref name="names"/> holds no later round of it: no other row that names its
+    /// launcher, or its chain id in its runs folder, with a higher round or no round at all (a row
+    /// without a status file). Its end is then not the chain's: the chain may still run, or its next
+    /// round failed unseen. A live round (ending) is left as it is: its launcher still holds it.
+    /// </summary>
+    internal static bool AwaitsRound(StatusRow r, Names names)
+    {
+        if (!r.Ended || r.Status?["end"] is not JsonObject end || !string.Equals(Json.Str(end, "gate"), GateChain.Continue, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        long round = RoundOrNull(r) ?? 0;
+        string dir = Path.GetFullPath(Path.TrimEndingDirectorySeparator(r.Dir));
+        return !names.Naming(NamedLauncher(r), RunsFolder(r), ChainId(r))
+            .Any(o => (RoundOrNull(o) is not { } k || k > round) && !string.Equals(Path.GetFullPath(Path.TrimEndingDirectorySeparator(o.Dir)), dir, StringComparison.Ordinal));
+    }
+
+    // A round awaiting its next round: it cannot be told whether the chain ended, so it is unknown
+    // (not ended, not live) and needs attention; it never reads as success.
+    private static StatusRow Awaiting(StatusRow r)
+    {
+        return r with
+        {
+            State = StatusStates.Unknown,
+            Liveness = LeanWorker.Liveness.Unknown,
+            Detail = AwaitingDetail,
+            EndedAt = null,
+            Attention = true,
+            Quiet = null,
+        };
+    }
 
     /// <summary>
     /// The rows in <paramref name="ordered"/>'s order, each run launched inside another listed run

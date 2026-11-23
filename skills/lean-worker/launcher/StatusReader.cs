@@ -244,6 +244,7 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
             {
                 Pointer = r.Pointer,
                 PointerLauncher = r.PointerLauncher,
+                PointerCreatedAt = r.PointerCreatedAt,
                 OwnerKey = r.OwnerKey,
                 ParentRun = r.ParentRun,
                 Chain = r.Chain,
@@ -406,7 +407,7 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// The start stamp of a run dir name (yyyyMMdd-HHmmss, the launcher's local time); null when
     /// the name does not start with one.
     /// </summary>
-    private DateTimeOffset? Stamp(string id)
+    internal DateTimeOffset? Stamp(string id)
     {
         if (id.Length < StampLength
             || !DateTime.TryParseExact(id[..StampLength], "yyyyMMdd-HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime local))
