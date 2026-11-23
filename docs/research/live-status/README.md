@@ -453,11 +453,14 @@ repository is recorded under that repository and is not listed by `--here`; the 
   does not parse) stops holding the wait after `--grace` (default 10 minutes) of staying that way.
   When every other run in scope has ended and such rows remain, `--wait` returns 8 and the listing
   names them. A `gone` row (run dir removed) counts as ended, not `success`.
-- **A chain round that went on.** *As built:* a round, own or joined, whose end has `"gate":
-  "continue"` while the read holds no later round of it (no row naming its launcher, or its chain id
-  in the same runs root) reads `unknown`, not ended, in every scope; the chain then gives 8 after
-  `--grace` (7 if `--timeout` comes first), and under `--any` it neither ends the wait nor counts as
-  0. The mark only takes an end away, so a forged `gate` can never turn a non-zero into 0.
+- **A chain round that went on.** *As built:* a round, own or joined, whose end reads as a success
+  (state `success`, exit code 0 or none) and has `"gate": "continue"` while the read holds no later
+  round of it (no row naming its launcher, or its chain id in the same runs root) reads `unknown`,
+  not ended, in every scope; the chain then gives 8 after `--grace` (7 if `--timeout` comes first),
+  and under `--any` it neither ends the wait nor counts as 0. The launcher writes the field only
+  with a `success` end and exit code 0 (the gate runs only after a successful worker), so any other
+  end keeps its own verdict whatever its `gate` says: a failed end gives 1 at once, a wrap-up 3. The
+  mark only takes a success away, so a forged `gate` can never turn a non-zero into 0.
 
 **Exit codes** (proposal; 0/1/2/3 match the launcher's meanings, `LaunchRun.cs:282-285`,
 `Program.cs:41-42`):
