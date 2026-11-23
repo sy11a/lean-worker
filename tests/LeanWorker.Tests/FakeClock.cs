@@ -30,12 +30,29 @@ internal sealed class FakeClock(DateTimeOffset start) : TimeProvider
         }
     }
 
+    /// <summary>
+    /// Time that passed on the monotonic timestamp since the clock was made (a wall step does not count).
+    /// </summary>
+    public TimeSpan Monotonic => GetElapsedTime(0);
+
     public void Advance(TimeSpan by)
     {
         lock (_lock)
         {
             _now += by;
             _timestamp += by.Ticks;
+        }
+    }
+
+    /// <summary>
+    /// The wall clock steps by <paramref name="by"/> (back with a negative value) and the monotonic timestamp does not
+    /// move: what a clock change by an operator or by time synchronisation does.
+    /// </summary>
+    public void StepWall(TimeSpan by)
+    {
+        lock (_lock)
+        {
+            _now += by;
         }
     }
 }

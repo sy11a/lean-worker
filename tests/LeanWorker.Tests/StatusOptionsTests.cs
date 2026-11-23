@@ -174,13 +174,27 @@ public sealed class StatusOptionsTests
     [InlineData("2026-11-22T13:02:31Z")]
     [InlineData("2026-11-22T15:02:31+02:00")]
     [InlineData("2026-11-22T08:02:31-05:00")]
-    [InlineData("2026-11-22T13:02:31")]
-    public void A_start_time_is_a_date_and_time_with_Z_or_an_offset_and_without_one_it_is_UTC(string value)
+    public void A_start_time_is_a_date_and_time_with_Z_or_an_offset(string value)
     {
         DateTimeOffset expected = new(2026, 11, 22, 13, 2, 31, TimeSpan.Zero);
 
         Assert.Equal(expected, StatusOptions.Parse(["--here", "--started-after", value]).StartedAfter);
         Assert.Equal(expected, StatusOptions.Parse(["--here", "--wait", "--started-after", value]).StartedAfter);
+    }
+
+    // A time without Z or an offset used to be read as UTC; west or east of it that lands hours off (review of #147).
+    [Theory]
+    [InlineData("2026-11-22T13:02:31")]
+    [InlineData("2026-11-22T13:02:31.5")]
+    [InlineData("2026-11-22T13:02")]
+    public void A_start_time_without_Z_or_an_offset_is_a_usage_error_that_says_so(string value)
+    {
+        string message = Refusal(["--here", "--started-after", value]);
+        string waiting = Refusal(["--here", "--wait", "--started-after", value]);
+
+        Assert.Contains("--started-after needs a date and time with Z or an offset", message, StringComparison.Ordinal);
+        Assert.Contains("date -u +%FT%TZ", message, StringComparison.Ordinal);
+        Assert.Equal(message, waiting);
     }
 
     [Fact]

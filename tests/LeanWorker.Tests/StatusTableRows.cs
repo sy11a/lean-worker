@@ -46,7 +46,8 @@ internal static partial class StatusTableRows
     public static string Plain(string line) => Sgr().Replace(line, string.Empty);
 
     /// <summary>
-    /// How many terminal columns a line takes: one per character, two for a wide character (the CJK ranges) and for a surrogate pair.
+    /// How many terminal columns a line takes: one per character, two for a wide character (the CJK ranges and the
+    /// symbols and emoji of U+2300 to U+2BFF) and for a surrogate pair.
     /// </summary>
     public static int Columns(string line)
     {
@@ -76,7 +77,7 @@ internal static partial class StatusTableRows
     private static bool IsWide(char c)
     {
         int code = c;
-        return code is (>= 0x1100 and <= 0x115F) or (>= 0x2E80 and <= 0xA4CF) or (>= 0xAC00 and <= 0xD7A3)
+        return code is (>= 0x1100 and <= 0x115F) or (>= 0x2300 and <= 0x2BFF) or (>= 0x2E80 and <= 0xA4CF) or (>= 0xAC00 and <= 0xD7A3)
             or (>= 0xF900 and <= 0xFAFF) or (>= 0xFE30 and <= 0xFE4F) or (>= 0xFF00 and <= 0xFF60) or (>= 0xFFE0 and <= 0xFFE6);
     }
 

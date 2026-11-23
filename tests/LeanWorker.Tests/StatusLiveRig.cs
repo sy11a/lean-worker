@@ -69,6 +69,12 @@ internal sealed class StatusLiveRig : IDisposable
     public TimeSpan Elapsed => Idx.Clock.GetUtcNow() - StatusDocs.Now;
 
     /// <summary>
+    /// Fake time that passed on the monotonic timestamp: what the sleeps added up to, whatever steps the wall clock took.
+    /// A timed action (<see cref="At"/>) runs by this time.
+    /// </summary>
+    public TimeSpan Passed => Idx.Clock.Monotonic;
+
+    /// <summary>
     /// A live run (its own launcher process, in its worker phase), owned by <paramref name="key"/>. A chain's later
     /// round passes <paramref name="launcher"/>, the first round's pid, as every round of a chain has one launcher.
     /// </summary>
@@ -170,6 +176,11 @@ internal sealed class StatusLiveRig : IDisposable
     public static void Garble(Live run) => File.WriteAllText(Path.Combine(run.Dir, "status.json"), "{ torn");
 
     /// <summary>
+    /// The run's status file is never written (or is deleted): the run dir stays, its pointer stays.
+    /// </summary>
+    public static void Unwrite(Live run) => File.Delete(Path.Combine(run.Dir, "status.json"));
+
+    /// <summary>
     /// The run's phase changes (gate, done, ...), its launcher still alive.
     /// </summary>
     public static void SetPhase(Live run, string phase)
@@ -184,7 +195,7 @@ internal sealed class StatusLiveRig : IDisposable
     public void Unlist(Live run) => File.Delete(Path.Combine(Idx.Folder, run.Run.Pointer));
 
     /// <summary>
-    /// Runs <paramref name="what"/> once the fake clock has passed <paramref name="elapsed"/>, at the end of the sleep
+    /// Runs <paramref name="what"/> once the fake clock's monotonic time has passed <paramref name="elapsed"/>, at the end of the sleep
     /// that took it there: the next read sees what it changed.
     /// </summary>
     public void At(TimeSpan elapsed, Action what) => _timed.Add((elapsed, what));
@@ -251,7 +262,7 @@ internal sealed class StatusLiveRig : IDisposable
         }
 
         Idx.Clock.Advance(delay);
-        foreach ((TimeSpan at, Action action) in _timed.Where(t => t.At <= Elapsed).ToArray())
+        foreach ((TimeSpan at, Action action) in _timed.Where(t => t.At <= Passed).ToArray())
         {
             _ = _timed.Remove((at, action));
             action();

@@ -6,7 +6,7 @@ namespace LeanWorker.Tests;
 /// <summary>
 /// --started-after on the one-shot listing (docs/research/live-status/README.md, section 4.2: "--wait (and the listing) take
 /// only runs started at or after t"): the runs started earlier are left out of the plain listing and of --json, a run
-/// that ended still counts, a gate chain counts by its first round, and a run whose start cannot be told is left out.
+/// that ended still counts, a gate chain counts by its first round, and a run whose start cannot be told at all is kept.
 /// </summary>
 public sealed class StatusStartedAfterTests : IDisposable
 {
@@ -82,14 +82,18 @@ public sealed class StatusStartedAfterTests : IDisposable
     }
 
     [Fact]
-    public async Task A_run_whose_start_time_cannot_be_told_is_left_outAsync()
+    public async Task A_run_whose_start_time_cannot_be_told_at_all_is_keptAsync()
     {
-        _ = _rig.Add("no-start-time", _mine, tweak: d => ((JsonObject)d["spec"]!).Remove("started_at"));
+        // No start in its status file, no creation time in its pointer, no stamp in its run id: nothing to judge it by.
+        StatusIndexRig.Added none = _rig.Add("no-start-time", _mine, id: "no-stamp-in-this-id", tweak: d => ((JsonObject)d["spec"]!).Remove("started_at"));
+        _ = none.PointerDoc.Remove("created_at");
+        _ = _rig.WritePointer(none.Pointer, none.PointerDoc.ToJsonString());
         _ = _rig.Add("started-10m-ago", _mine, startedAgo: TimeSpan.FromMinutes(10));
+        _ = _rig.Add("started-3h-ago", _mine, startedAgo: TimeSpan.FromHours(3));
 
         string[] names = await NamesAsync("--owner", "k:1", "--started-after", After(TimeSpan.FromHours(1)));
 
-        Assert.Equal(["started-10m-ago"], names);
+        Assert.Equal(["no-start-time", "started-10m-ago"], names);
     }
 
     [Fact]

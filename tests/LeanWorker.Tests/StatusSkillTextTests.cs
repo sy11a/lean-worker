@@ -14,6 +14,9 @@ public sealed partial class StatusSkillTextTests
 {
     private const string Section = "### Runs in flight";
 
+    // What StatusCommand returns for an option it refuses.
+    private const int UsageError = 2;
+
     // What the text writes between angle brackets or in a shell variable, and a value the parser takes for it.
     private static readonly Dictionary<string, string> _placeholders = new(StringComparer.Ordinal)
     {
@@ -126,6 +129,9 @@ public sealed partial class StatusSkillTextTests
 
     [GeneratedRegex("\"[^\"]*\"|\\S+", RegexOptions.None, matchTimeoutMilliseconds: 5000)]
     private static partial Regex TokenPattern();
+
+    [GeneratedRegex(@"date\s+(?:-\w+\s+)*\+(?<format>[^\s)]+)", RegexOptions.None, matchTimeoutMilliseconds: 5000)]
+    private static partial Regex DateFormat();
 
     [GeneratedRegex(@"--[a-z][a-z-]*", RegexOptions.None, matchTimeoutMilliseconds: 5000)]
     private static partial Regex FlagPattern();
@@ -242,8 +248,84 @@ public sealed partial class StatusSkillTextTests
 
         string[] named = [.. BoldNumber().Matches(listing).Select(m => m.Groups["n"].Value).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
 
-        int[] returned = [StatusWait.AllSuccess, StatusWait.SomeFailed, StatusWait.SomeWrappedUp, StatusWait.NothingMatched, StatusWait.TimedOut, StatusWait.Unresolved];
+        // 2 is the command's usage error (StatusCommand returns it for a refused option), which the text names too.
+        int[] returned = [StatusWait.AllSuccess, StatusWait.SomeFailed, UsageError, StatusWait.SomeWrappedUp, StatusWait.NothingMatched, StatusWait.TimedOut, StatusWait.Unresolved];
         Assert.Equal([.. returned.Select(c => c.ToString(System.Globalization.CultureInfo.InvariantCulture)).Order(StringComparer.Ordinal)], named);
+    }
+
+    [Fact]
+    public async Task The_exit_code_the_skill_text_names_for_a_usage_error_is_the_one_the_command_returnsAsync()
+    {
+        using StatusIndexRig rig = new();
+
+        (int code, string output) = await rig.CallAsync("--here", "--started-after", "yesterday");
+
+        Assert.Equal(UsageError, code);
+        Assert.Contains("usage:", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void The_any_bullet_tells_how_to_re_arm_and_the_command_it_means_is_one_the_parser_takes()
+    {
+        string skill = File.ReadAllText(Path.Combine(SkillDir(), "SKILL.md"));
+        string section = RunsInFlight(skill);
+        string bullet = section[section.IndexOf("- **`--any`**", StringComparison.Ordinal)..];
+
+        Assert.Contains("re-arm", bullet, StringComparison.Ordinal);
+        Assert.Contains("without `--started-after` and `--expect`", bullet, StringComparison.Ordinal);
+
+        // The batch recipe, then the same scope as the bullet says: with --any, without --started-after and --expect.
+        (string File, string Span, string[] Args) batch = Recipes().First(r => Has(r.Args, "--wait") && Has(r.Args, "--started-after") && Has(r.Args, "--expect"));
+        string[] rearm = [.. WithoutOption(WithoutOption(batch.Args, "--started-after"), "--expect"), "--any"];
+
+        Assert.DoesNotContain("--started-after", rearm, StringComparer.Ordinal);
+        Assert.DoesNotContain("--expect", rearm, StringComparer.Ordinal);
+        Assert.Contains("--owner", rearm, StringComparer.Ordinal);
+        StatusCommand.StatusArgs parsed = StatusOptions.Parse(rearm);
+        Assert.True(parsed.Wait && parsed.Any);
+        Assert.Null(parsed.StartedAfter);
+        Assert.Null(parsed.Expect);
+        Assert.Equal("k:1", parsed.Owner);
+    }
+
+    [Fact]
+    public void The_t0_recipe_prints_a_time_with_Z_and_the_parser_takes_what_it_prints()
+    {
+        string skill = File.ReadAllText(Path.Combine(SkillDir(), "SKILL.md"));
+        string[] spans = [.. Spans(RunsInFlight(skill)).Where(s => s.Contains("date ", StringComparison.Ordinal))];
+
+        string recipe = Assert.Single(spans);
+        Match m = DateFormat().Match(recipe);
+        Assert.True(m.Success, $"`{recipe}` is not a `date` call with a +format");
+        Assert.Contains("-u", recipe, StringComparison.Ordinal);
+
+        // What `date -u +<format>` prints for one instant: %F is the date, %T the time, the rest is copied.
+        DateTimeOffset instant = new(2026, 11, 23, 15, 35, 41, TimeSpan.Zero);
+        string printed = m.Groups["format"].Value
+            .Replace("%F", instant.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal)
+            .Replace("%T", instant.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal);
+
+        Assert.Equal("2026-11-23T15:35:41Z", printed);
+        Assert.Equal(instant, StatusOptions.Parse(["--here", "--wait", "--started-after", printed]).StartedAfter);
+    }
+
+    [Fact]
+    public void Every_wait_recipe_with_started_after_in_the_skill_text_gets_its_time_from_the_t0_variable()
+    {
+        List<(string File, string Span, string[] Args)> recipes = [.. Recipes().Where(r => Has(r.Args, "--started-after"))];
+
+        Assert.NotEmpty(recipes);
+        foreach ((string file, string span, string[] args) in recipes)
+        {
+            Assert.True(span.Contains("\"$t0\"", StringComparison.Ordinal) || span.Contains("<t0>", StringComparison.Ordinal), $"{file}: `{span}` does not take the time from t0");
+            _ = Assert.NotNull(StatusOptions.Parse(args).StartedAfter);
+        }
+    }
+
+    private static string[] WithoutOption(string[] args, string option)
+    {
+        int at = Array.IndexOf(args, option);
+        return at < 0 ? args : [.. args[..at], .. args[(at + 2)..]];
     }
 
     [Fact]

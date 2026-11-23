@@ -287,10 +287,10 @@ public sealed class StatusWaitScopeTests : IDisposable
     }
 
     [Fact]
-    public async Task Legacy_rows_are_not_waited_on_and_the_first_line_says_how_many_were_skippedAsync()
+    public async Task Legacy_rows_with_a_summary_status_are_not_waited_on_and_the_first_line_says_how_many_were_skippedAsync()
     {
         StatusLiveRig.Live live = _rig.Add("live-one", startedAgo: TimeSpan.FromMinutes(5));
-        _ = StatusDocs.WriteRun(_rig.Idx.Root, "20261122-110000-old-one", doc: null);
+        _ = StatusDocs.WriteRun(_rig.Idx.Root, "20261122-110000-old-one", doc: null, summaryStatus: "error");
         _ = StatusDocs.WriteRun(_rig.Idx.Root, "20261122-111000-old-two", doc: null, summaryStatus: "success");
         _rig.At(Seconds(10), () => _rig.End(live));
 
@@ -303,9 +303,9 @@ public sealed class StatusWaitScopeTests : IDisposable
     }
 
     [Fact]
-    public async Task A_scope_with_only_legacy_rows_has_nothing_to_wait_on_and_is_exit_6Async()
+    public async Task A_scope_with_only_finished_legacy_rows_has_nothing_to_wait_on_and_is_exit_6Async()
     {
-        _ = StatusDocs.WriteRun(_rig.Idx.Root, "20261122-110000-old-one", doc: null);
+        _ = StatusDocs.WriteRun(_rig.Idx.Root, "20261122-110000-old-one", doc: null, summaryStatus: "success");
 
         StatusLiveRig.Result r = await _rig.CallAsync("--here", "--runs-root", _rig.Idx.Root, "--wait");
 
