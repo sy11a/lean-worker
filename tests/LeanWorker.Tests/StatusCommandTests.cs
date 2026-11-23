@@ -111,14 +111,14 @@ public sealed class StatusCommandTests : IDisposable
         Assert.Equal("lean-worker status: cannot tell which session you are; pass --owner, --here or --all\n", output.Replace("\r\n", "\n", StringComparison.Ordinal));
     }
 
+    // Train 3: --wait and --watch are modes now (their own tests are StatusWait* and StatusWatch*); what is left here is an
+    // unknown flag and a flag that cannot be combined with --here.
     [Theory]
     [InlineData("--bogus")]
     [InlineData("--owner")]
     [InlineData("--all")]
-    [InlineData("--wait")]
-    [InlineData("--watch")]
     [InlineData("--whoami")]
-    public async Task An_unknown_flag_or_a_later_slices_flag_is_a_usage_error_that_names_run_and_hereAsync(string flag)
+    public async Task An_unknown_flag_or_a_flag_that_cannot_go_with_here_is_a_usage_error_that_names_run_and_hereAsync(string flag)
     {
         (int code, string output) = await RunAsync(_root, "--here", flag);
 
@@ -128,17 +128,19 @@ public sealed class StatusCommandTests : IDisposable
         Assert.Contains(flag, output, StringComparison.Ordinal);
     }
 
-    // Train 2: --owner is a scope now (it lists, exit 0); --wait and --watch are a later train's and stay usage errors.
+    // Train 3: --wait and --watch alone are not a usage error of the flag: a call that gives no host to sleep and draw on is
+    // refused with exit 2 and says so (with a host and no caller identity they are exit 2 with the no-identity text,
+    // StatusWaitScopeTests and StatusWatchTests).
     [Theory]
     [InlineData("--wait")]
     [InlineData("--watch")]
-    public async Task A_later_slices_scope_or_mode_alone_is_a_usage_error_tooAsync(string args)
+    public async Task A_wait_or_watch_alone_without_a_host_is_exit_2_and_says_it_needs_oneAsync(string args)
     {
         (int code, string output) = await RunAsync(_root, Words(args));
 
         Assert.Equal(2, code);
-        Assert.Contains("--run", output, StringComparison.Ordinal);
-        Assert.Contains("--here", output, StringComparison.Ordinal);
+        Assert.Contains(args + " needs a host", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("unknown option", output, StringComparison.Ordinal);
     }
 
     [Fact]
