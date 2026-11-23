@@ -155,7 +155,9 @@ public sealed partial class WorktreeRunTests
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateRunAsync(branch, RunName));
 
-        Assert.StartsWith("git could not create the worktree: ", ex.Message, StringComparison.Ordinal);
+        // Since lean-worker#166 `git check-ref-format --branch` refuses the name before the add: the launcher's own
+        // message, git's answer in the brackets, and still no tail about a branch.
+        Assert.StartsWith(GitRefusalStart(branch), ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("; the branch", ex.Message, StringComparison.Ordinal);
         Assert.Equal(refsBefore, await RefsAsync());
         Assert.Equal(worktreesBefore, await WorktreesAsync());
@@ -239,17 +241,21 @@ public sealed partial class WorktreeRunTests
     }
 
     [Fact]
-    public async Task A_symbolic_ref_in_the_place_of_the_branch_is_kept_and_the_error_says_soAsync()
+    public async Task A_symbolic_ref_in_the_place_of_the_branch_is_refused_before_the_add_and_the_branch_it_points_to_is_not_madeAsync()
     {
-        // A dangling symbolic ref reads as "no such branch" to the probe; git then makes the branch it points to.
+        // A dangling symbolic ref reads as "no such branch" to the rev-parse probe; since lean-worker#166 the
+        // symbolic-ref probe after it refuses the launch, so git never writes through the link (it used to make the
+        // branch the link points to, and the error said so).
         await StalePathAsync();
         _ = await GitAsync(_repo, "symbolic-ref", "refs/heads/" + Branch, "refs/heads/gone");
+        string refsBefore = await RefsAsync();
+
         LaunchException ex = await RefusedAsync();
 
-        // git wrote through the link and made the branch it points to; the link itself is never deleted.
-        Assert.EndsWith(Stays("it is a symbolic ref to refs/heads/gone"), ex.Message, StringComparison.Ordinal);
+        Assert.Equal($"the branch is taken: {Branch} (it is a symbolic ref to refs/heads/gone)", ex.Message);
         Assert.Equal("refs/heads/gone", await GitAsync(_repo, "symbolic-ref", "refs/heads/" + Branch));
-        Assert.Equal(await ShaAsync("HEAD"), await ShaAsync("refs/heads/gone"));
+        Assert.False(await BranchExistsAsync("gone"));
+        Assert.Equal(refsBefore, await RefsAsync());
         AssertLayoutGone();
     }
 
@@ -329,27 +335,25 @@ public sealed partial class WorktreeRunTests
     // ---- names that look like an option or a path ----
 
     [Theory]
-    [InlineData("-x", false)]
-    [InlineData("--force", true)]
-    public async Task A_branch_name_that_looks_like_an_option_is_refused_by_git_and_changes_no_ref_of_the_repositoryAsync(string branch, bool gitMakesAStrayBranch)
+    [InlineData("-x")]
+    [InlineData("--force")]
+    [InlineData("-")]
+    [InlineData("--")]
+    [InlineData("-b")]
+    public async Task A_branch_name_that_looks_like_an_option_is_refused_by_the_launcher_and_changes_no_ref_of_the_repositoryAsync(string branch)
     {
-        string[] refsBefore = (await RefsAsync()).Split('\n');
+        string refsBefore = await RefsAsync();
         string baseSha = await ShaAsync("HEAD");
 
         LaunchException ex = await Assert.ThrowsAsync<LaunchException>(async () => await CreateRunAsync(branch, RunName));
 
-        // The launcher names the branch only behind refs/heads/, so it finds no branch of that name and deletes none.
-        Assert.StartsWith("git could not create the worktree: ", ex.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain("; the branch", ex.Message, StringComparison.Ordinal);
+        // Since lean-worker#166 the launcher refuses the name itself, before git sees it: git no longer reads
+        // "--force" as "git branch --force <base>" and makes no branch named after the base commit (it did, and the
+        // row of "--force" pinned that stray branch).
+        Assert.Equal(DashRefusal(branch), ex.Message);
         Assert.False(await BranchExistsAsync(branch));
-        string[] refsAfter = (await RefsAsync()).Split('\n');
-        Assert.All(refsBefore, line => Assert.Contains(line, refsAfter, StringComparer.Ordinal));
-
-        // What git itself leaves is git's: it reads "git branch --force <base>" for the name "--force" and makes a
-        // branch named after the base commit (the launcher does not know of it, so it stays). Pinned as it is.
-        string[] expectedExtra = gitMakesAStrayBranch ? [$"refs/heads/{baseSha} {baseSha} "] : [];
-        string[] extra = [.. refsAfter.Except(refsBefore, StringComparer.Ordinal)];
-        Assert.Equal(expectedExtra, extra);
+        Assert.False(await BranchExistsAsync(baseSha));
+        Assert.Equal(refsBefore, await RefsAsync());
         AssertLayoutGone();
     }
 
