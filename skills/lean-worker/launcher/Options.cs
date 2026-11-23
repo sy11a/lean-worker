@@ -34,8 +34,8 @@ internal sealed class Options
           --permission-mode <mode>   acceptEdits | dontAsk | plan | manual | auto | bypassPermissions
           --runs-root <dir>          default .lean-worker
           --worktree <branch>        run the worker in a new worktree of this repository, created from
-                                     --worktree-base (needs --name); the worktree is removed again when
-                                     the run leaves it empty
+                                     --worktree-base (needs --name) at <parent>/.worktrees/<repo>/<name>;
+                                     the worktree is removed again when the run leaves it empty
           --worktree-base <ref>      the ref the new worktree is branched from (default: the default
                                      branch of origin, the one the sweep compares the worktrees against)
           --claude-settings <file>   passed to claude as --settings (e.g. an apiKeyHelper for --bare)
@@ -91,7 +91,7 @@ internal sealed class Options
                                      nested, in-use, young, missing); a clean worktree whose branch landed in
                                      origin/<default branch>, that no process works in and that is older than
                                      --older-than-days (default 3) goes; --apply removes it (a dry run otherwise);
-                                     locked or protected worktrees (*-pinned, --protect) stay
+                                     locked or protected worktrees (*-pinned, pinned, --protect) stay
         """;
 
     public string? TaskFile;

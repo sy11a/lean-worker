@@ -8,7 +8,7 @@ namespace LeanWorker.Tests;
 /// the main checkout and linked worktrees beside it. Every repository gets its own user config (never global).
 /// </summary>
 [Collection("launcher-process-state")]
-public sealed class WorktreeSweepTests : IAsyncLifetime
+public sealed partial class WorktreeSweepTests : IAsyncLifetime
 {
     private readonly CommandSandbox _box = new();
     private readonly TempDirs _dirs = new();

@@ -111,14 +111,208 @@ internal sealed class WorktreeRun
     }
 
     /// <summary>
-    /// The path the worktree of a run gets: the repository's own folder name and the run's name side
-    /// by side, in the parent folder of the repository — the place a delegator would put it by hand.
+    /// What a later round tells about the worktree it continued, when that is worth a note: a
+    /// worktree of the old layout continued in place. Null otherwise.
+    /// </summary>
+    public string? ContinueNote { get; private set; }
+
+    /// <summary>
+    /// The folder, in the parent folder of the repository, that holds the worktrees of the runs:
+    /// one folder per repository below it, named after the repository, and one worktree per run
+    /// below that. The worktrees do not sit next to the projects.
+    /// </summary>
+    internal const string WorktreesFolder = ".worktrees";
+
+    /// <summary>
+    /// The path the worktree of a run gets: <c>&lt;parent&gt;/.worktrees/&lt;repo&gt;/&lt;name&gt;</c> in the
+    /// parent folder of the repository, where <c>&lt;repo&gt;</c> is the repository's own folder name
+    /// and <c>&lt;name&gt;</c> the run's safe name. A name that is no folder name of its own (empty,
+    /// "." or "..") would put the worktree somewhere else than below the repository's folder, and is
+    /// refused.
     /// </summary>
     public static string PathFor(string repoRoot, string name)
     {
-        string full = Path.GetFullPath(repoRoot);
-        string parent = Path.GetDirectoryName(full) ?? full;
-        return Path.Combine(parent, Path.GetFileName(full) + "-" + Launcher.SafeName(name));
+        (string parent, string repo) = RepoPlace(repoRoot);
+        string safe = Launcher.SafeName(name);
+        if (safe.Length is 0 || safe is "." or "..")
+        {
+            throw new LaunchException($"--name '{name}' cannot name a worktree folder");
+        }
+
+        return Path.Combine(parent, WorktreesFolder, repo, safe);
+    }
+
+    /// <summary>
+    /// The path the worktree of a run got from a launcher before the <c>.worktrees</c> layout: the
+    /// repository's own folder name and the run's name joined by a dash, next to the repository. A
+    /// later round still continues a worktree an earlier launcher created there.
+    /// </summary>
+    private static string OldLayoutPathFor(string repoRoot, string name)
+    {
+        (string parent, string repo) = RepoPlace(repoRoot);
+        return Path.Combine(parent, repo + "-" + Launcher.SafeName(name));
+    }
+
+    /// <summary>
+    /// The parent folder of the repository and the repository's own folder name.
+    /// </summary>
+    private static (string Parent, string Repo) RepoPlace(string repoRoot)
+    {
+        string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(repoRoot));
+        string repo = Path.GetFileName(full);
+        string? parent = Path.GetDirectoryName(full);
+        if (repo.Length is 0 || parent is null)
+        {
+            throw new LaunchException($"the repository {repoRoot} has no folder name to put its worktrees under");
+        }
+
+        return (parent, repo);
+    }
+
+    /// <summary>
+    /// The folders a worktree path of the <c>.worktrees</c> layout sits in, the outermost first:
+    /// <c>.worktrees</c> and <c>.worktrees/&lt;repository&gt;</c>.
+    /// </summary>
+    private static string[] LayoutFolders(string repoRoot)
+    {
+        (string parent, string repo) = RepoPlace(repoRoot);
+        string worktrees = Path.Combine(parent, WorktreesFolder);
+        return [worktrees, Path.Combine(worktrees, repo)];
+    }
+
+    /// <summary>
+    /// Creates the folders the new worktree sits in when they are missing. A folder that is a
+    /// symlink (or a reparse point, or cannot be examined) or that is a file refuses the run before
+    /// anything is created: git would put the worktree through it, outside the expected place.
+    /// </summary>
+    private static void MakeLayoutFolders(string repoRoot)
+    {
+        foreach (string folder in LayoutFolders(repoRoot))
+        {
+            if (IsLinked(folder))
+            {
+                throw new LaunchException($"the worktree folder {folder} is a symlink; no worktree is created through it");
+            }
+
+            if (File.Exists(folder))
+            {
+                throw new LaunchException($"the worktree folder {folder} is a file");
+            }
+
+            _ = Directory.CreateDirectory(folder);
+        }
+    }
+
+    /// <summary>
+    /// Removes the folders of the <c>.worktrees</c> layout the worktree sat in when they are empty:
+    /// <c>.worktrees/&lt;repository&gt;</c> first, then <c>.worktrees</c>. A folder that holds anything
+    /// stays, and so does every folder above it; a symlink is never followed nor removed. A worktree
+    /// that did not sit in the layout (one of the old layout) leaves every folder alone. Nothing here
+    /// is a reason: a folder that cannot be removed simply stays.
+    /// </summary>
+    private static void RemoveEmptyLayoutFolders(string repoRoot, string worktreePath)
+    {
+        string[] folders = LayoutFolders(repoRoot);
+        string? holder = Path.GetDirectoryName(Path.GetFullPath(worktreePath));
+        if (holder?.Equals(folders[1], StringComparison.Ordinal) is not true)
+        {
+            return;
+        }
+
+        for (int i = folders.Length - 1; i >= 0; i--)
+        {
+            if (!RemoveIfEmpty(folders[i]))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes one folder when it is a plain, empty folder. The removal is not recursive, so a
+    /// folder that filled up since the check is refused by the file system and stays.
+    /// </summary>
+    private static bool RemoveIfEmpty(string folder)
+    {
+        try
+        {
+            if (IsLinked(folder) || !Directory.Exists(folder) || Directory.EnumerateFileSystemEntries(folder).Any())
+            {
+                return false;
+            }
+
+            Directory.Delete(folder, recursive: false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether nothing at all is at the path: no folder, no file and no symlink (a dangling one
+    /// included). A path that cannot be examined is not absent.
+    /// </summary>
+    private static bool Absent(string path)
+    {
+        try
+        {
+            return !Directory.Exists(path) && !File.Exists(path) && new FileInfo(path).LinkTarget is null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The worktree of the old layout a later round continues in place, or null: only when it is a
+    /// plain folder (no symlink on the way to it, its canonical path the expected one) and the
+    /// repository's own worktree list names it with the run's branch checked out. It is never moved.
+    /// </summary>
+    private static async Task<string?> OldLayoutWorktreeAsync(string repoRoot, string branch, string name)
+    {
+        string old = Path.GetFullPath(OldLayoutPathFor(repoRoot, name));
+        if (!Directory.Exists(old)
+            || IsLinked(old)
+            || GateTrust.Canonical(old) is not { Resolved: true } canonical
+            || !canonical.Path.Equals(old, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        Git.Result? list = await Git.RunResultAsync(repoRoot, "worktree", "list", "--porcelain", "-z").ConfigureAwait(false);
+        return list is { ExitCode: 0 } && ListsWorktree(list.Stdout, old, "refs/heads/" + branch) ? old : null;
+    }
+
+    /// <summary>
+    /// Whether <c>git worktree list --porcelain -z</c> names the worktree at <paramref name="path"/>
+    /// (compared canonically) with <paramref name="branchRef"/> checked out.
+    /// </summary>
+    private static bool ListsWorktree(string porcelain, string path, string branchRef)
+    {
+        string? current = null;
+        foreach (string entry in porcelain.Split('\0'))
+        {
+            if (entry.Length is 0)
+            {
+                current = null;
+            }
+            else if (entry.StartsWith("worktree ", StringComparison.Ordinal))
+            {
+                current = entry["worktree ".Length..];
+            }
+            else if (current is not null
+                && entry.Equals("branch " + branchRef, StringComparison.Ordinal)
+                && GateTrust.Canonical(current) is { Resolved: true } listed
+                && listed.Path.Equals(path, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -166,11 +360,17 @@ internal sealed class WorktreeRun
             throw new LaunchException($"the worktree base '{baseRef}' does not resolve to a commit: {EvidenceBlock.OneLine(error)}");
         }
 
-        Git.Result added = await Git.RunResultAsync(repoRoot, "worktree", "add", "-b", branch, path, sha).ConfigureAwait(false)
-            ?? throw new LaunchException("git could not create the worktree: git could not be run");
-        if (added.ExitCode is not 0)
+        // The folders the worktree sits in (.worktrees/<repository>) are made here, and refused when
+        // one of them is a symlink: git would create the worktree through it.
+        MakeLayoutFolders(repoRoot);
+        Git.Result? added = await Git.RunResultAsync(repoRoot, "worktree", "add", "-b", branch, path, sha).ConfigureAwait(false);
+        if (added is not { ExitCode: 0 })
         {
-            throw new LaunchException($"git could not create the worktree: {EvidenceBlock.OneLine(added.Stderr.Trim())}");
+            // Nothing was created: the folders made for it go again while they are empty.
+            RemoveEmptyLayoutFolders(repoRoot, path);
+            throw new LaunchException(added is null
+                ? "git could not create the worktree: git could not be run"
+                : $"git could not create the worktree: {EvidenceBlock.OneLine(added.Stderr.Trim())}");
         }
 
         try
@@ -191,16 +391,36 @@ internal sealed class WorktreeRun
     /// <summary>
     /// The worktree of a later gate round: the same path and the same branch as the first round's —
     /// the run keeps the worktree it started with. A worktree that is gone is a launch error: the
-    /// round has nothing to work in.
+    /// round has nothing to work in. A chain an earlier launcher started may have its worktree in
+    /// the old layout (<c>&lt;repository&gt;-&lt;name&gt;</c> next to the repository): when nothing is at
+    /// the path of <see cref="PathFor"/> and the old path is a worktree of this repository with the
+    /// run's branch checked out, the round continues there, in place, and says so in a note.
     /// </summary>
     public static async Task<WorktreeRun> ReuseAsync(string repoRoot, string branch, string baseRef, string name, string setup)
     {
         string path = PathFor(repoRoot, name);
+        string? continueNote = null;
+        if (Absent(path) && await OldLayoutWorktreeAsync(repoRoot, branch, name).ConfigureAwait(false) is { } old)
+        {
+            continueNote = $"worktree of the old layout continued in place: {old} (not moved; a new run puts its worktree at {path})";
+            path = old;
+        }
+
         if (!Directory.Exists(path))
         {
             throw new LaunchException($"the worktree of the previous round is gone: {path}");
         }
 
+        WorktreeRun run = await ReuseAtAsync(repoRoot, path, branch, baseRef, setup).ConfigureAwait(false);
+        run.ContinueNote = continueNote;
+        return run;
+    }
+
+    /// <summary>
+    /// The worktree of a later gate round at the path it was found at.
+    /// </summary>
+    private static async Task<WorktreeRun> ReuseAtAsync(string repoRoot, string path, string branch, string baseRef, string setup)
+    {
         // The base is resolved again: the commit it names is what the branch must still point at
         // when the worktree is removed. A base that cannot be resolved any more leaves the worktree
         // where it is — it cannot be judged empty.
@@ -439,6 +659,9 @@ internal sealed class WorktreeRun
         {
             Note = $"branch kept: {EvidenceBlock.OneLine(deleted?.Stderr.Trim() ?? "git failed")}";
         }
+
+        // The worktree is gone: .worktrees/<repository> and .worktrees go with it while they are empty.
+        RemoveEmptyLayoutFolders(_repo, WorktreePath);
 
         Action = "removed";
         Reason = ignored > 0

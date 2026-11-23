@@ -29,8 +29,8 @@ internal static class Workspace
     }
 
     /// <summary>
-    /// The worktree a run owns (--worktree): created in the parent folder of the repository, named
-    /// after the repository and the run, with the setup of the repository (<paramref name="setup"/>)
+    /// The worktree a run owns (--worktree): created at <c>.worktrees/&lt;repository&gt;/&lt;run&gt;</c> in
+    /// the parent folder of the repository, with the setup of the repository (<paramref name="setup"/>)
     /// copied into it. The worker, the write scope and the gate work in it, so it is the workspace
     /// root of the run. A later round of the gate chain reuses the worktree the first round created
     /// (<paramref name="reuse"/>).

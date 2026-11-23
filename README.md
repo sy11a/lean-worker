@@ -523,8 +523,9 @@ Other commands (same `dotnet run ... --` prefix): `quota`, `cost`, `stats`, `pri
 `REMOVE|KEEP <reason> <path>`; a dry run without `--apply`), and
 `hook`, which the launcher installs into workers itself.
 
-A run can own its worktree: `--worktree <branch>` creates a worktree of the repository beside it —
-named after the repository and the run, so `--name` is required — branches it from `--worktree-base`
+A run can own its worktree: `--worktree <branch>` creates a worktree of the repository at
+`<parent of the repository>/.worktrees/<repository>/<name>` — named after the run, so `--name` is
+required; the worktrees never sit next to the projects — branches it from `--worktree-base`
 (the default branch of `origin` by default; the base is resolved to a commit once, in the repository
 the launcher was called in) and copies the `.lean-worker` setup into it. The worker, the write scope
 and the gate then work in that worktree, while the run directory and `runs.jsonl` stay in the
@@ -545,7 +546,11 @@ other out-of-scope writes, prefixed `<invoking>/`; the launcher's own run direct
 included) and the ledger are excepted from the watch. Ignored files (the build output of the run)
 are discarded with the worktree; the reason says how many there were — so the worktrees a run leaves
 behind are the ones a human still has to look at, and `sweep-worktrees` has nothing of the run's own
-to sweep.
+to sweep. With the worktree, `.worktrees/<repository>` and then `.worktrees` go too while they are
+empty; a symlink at either of them refuses the launch before anything is created. A gate chain an
+earlier launcher started with its worktree at the old place (`<repository>-<name>` next to the
+repository) continues there, in place, with a note naming it. `sweep-worktrees` protects the pinned
+launcher in both layouts (`*-pinned` and `pinned`).
 
 Exit codes:
 - `0`: success. With a gate, the gate is clean.

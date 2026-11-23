@@ -15,10 +15,12 @@ namespace LeanWorker;
 internal static class WorktreeSweep
 {
     /// <summary>
-    /// The worktrees that are kept whatever they hold: the pinned launcher only. The release and task
-    /// checkouts are protected by the caller, with <c>--protect &lt;glob&gt;</c>.
+    /// The worktrees that are kept whatever they hold: the pinned launcher only — <c>&lt;repo&gt;-pinned</c>
+    /// next to the repository (the old layout) and <c>.worktrees/&lt;repo&gt;/pinned</c> (the layout of
+    /// <c>--worktree</c>). The release and task checkouts are protected by the caller, with
+    /// <c>--protect &lt;glob&gt;</c>.
     /// </summary>
-    private static readonly string[] _builtInProtect = ["*-pinned"];
+    private static readonly string[] _builtInProtect = ["*-pinned", "pinned"];
 
     /// <summary>
     /// The files git leaves behind while a rebase, a merge, a cherry-pick, a revert or a bisect runs: the
@@ -70,7 +72,7 @@ internal static class WorktreeSweep
           --repo <path>          repository to sweep (repeatable); the default is every repository under --root
           --root <dir>           folder whose repositories are swept (default: the parent of this repository)
           --older-than-days <n>  how old a worktree must be before it may go (default 3)
-          --protect <glob>       glob of worktrees that stay (repeatable); built in: *-pinned
+          --protect <glob>       glob of worktrees that stay (repeatable); built in: *-pinned, pinned
           --apply                remove the worktrees that may go (the default is a dry run)
           --help, -h             print this text
         One line per linked worktree: REMOVE|KEEP <reason> <path>.
@@ -715,7 +717,8 @@ internal static class WorktreeSweep
 
     /// <summary>
     /// Whether the path matches a protect glob. The glob is matched against the whole path and against the
-    /// folder's own name, so <c>*-pinned</c> covers the pinned worktree wherever it lives.
+    /// folder's own name, so <c>*-pinned</c> covers the pinned worktree next to the repository and
+    /// <c>pinned</c> the one in <c>.worktrees/&lt;repo&gt;/</c>, wherever they live.
     /// </summary>
     private static bool IsProtected(string path, List<string> protects)
     {
