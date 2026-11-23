@@ -105,16 +105,18 @@ internal sealed class StatusLiveRig : IDisposable
     /// The run's launcher ends: its status file records the end (<paramref name="status"/>, with
     /// <paramref name="exitCode"/> or the usual one) and its process is gone.
     /// </summary>
-    public void End(Live run, string status = "success", int? exitCode = null, bool omitExitCode = false, string? error = null)
+    public void End(Live run, string status = "success", int? exitCode = null, bool omitExitCode = false, string? error = null, string? gateJson = null)
     {
-        Record(run, status, exitCode, omitExitCode, error);
+        Record(run, status, exitCode, omitExitCode, error, gateJson);
         Idx.Proc.Remove(run.Pid);
     }
 
     /// <summary>
     /// The run's status file records an end and its launcher lives on (a gate chain's launcher runs the next round).
+    /// <paramref name="gateJson"/> is the JSON text of an <c>end.gate</c> to record with it (<c>"continue"</c> is what a
+    /// round whose gate went on writes); null writes none.
     /// </summary>
-    public void Record(Live run, string status = "success", int? exitCode = null, bool omitExitCode = false, string? error = null)
+    public void Record(Live run, string status = "success", int? exitCode = null, bool omitExitCode = false, string? error = null, string? gateJson = null)
     {
         JsonObject end = new()
         {
@@ -131,6 +133,11 @@ internal sealed class StatusLiveRig : IDisposable
         if (omitExitCode)
         {
             _ = end.Remove("exit_code");
+        }
+
+        if (gateJson is not null)
+        {
+            end["gate"] = JsonNode.Parse(gateJson);
         }
 
         run.Run.Status["phase"] = "done";
