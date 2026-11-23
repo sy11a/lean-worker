@@ -6,6 +6,8 @@
 #   --claude-only  skip the cases that need opencode or a z.ai GLM Coding Plan
 #   --keep         keep the scratch directory for inspection
 # LW_OPENCODE_MODEL=<provider/model> runs the opencode permission case on that model, even with --claude-only.
+# The caller's run index ($XDG_STATE_HOME/lean-worker/runs) is not written: the launches get their own index
+# (LEAN_WORKER_STATE_DIR) inside the scratch directory, which stays with it under --keep or after a failure.
 set -uo pipefail
 
 claude_only=0 keep=0
@@ -19,6 +21,7 @@ L="$launcher_dir/bin/Release/net8.0/LeanWorker"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/lean-worker acceptance XXXXXX")"   # a space on purpose (R7 case 10)
 cwd="$scratch/cwd" rr="$scratch/runs root"
+export LEAN_WORKER_STATE_DIR="$scratch/state"   # the launcher's run index is $LEAN_WORKER_STATE_DIR/runs, not the caller's
 mkdir -p "$cwd" "$rr/inbox/glob12" "$rr/inbox/count"
 for x in a b c d e f g h i j k l; do touch "$cwd/${x}1.txt"; done
 printf 'Call the Glob tool 12 times, one call per turn, with the patterns a* b* c* d* e* f* g* h* i* j* k* l* in that order. Then reply DONE and the number of Glob calls you made.\n' > "$rr/inbox/glob12/task.md"
@@ -177,6 +180,9 @@ check "rows carry schema_version 1 and stats --json has groups" '[ "$(tail -1 "$
 echo "== 5. cost of a manual session"
 cmd cost --claude "$run1/stream.jsonl"
 check "cost reads a Claude stream/transcript" 'grep -q "at list price" "$scratch/out.txt"'
+
+echo "== run index isolation"
+check "the scratch index holds at least one pointer (the caller's index is not written)" 'ls "$LEAN_WORKER_STATE_DIR"/runs/*-r*.json >/dev/null 2>&1'
 
 echo
 echo "passed $pass, failed $fail  (runs: $rr)"

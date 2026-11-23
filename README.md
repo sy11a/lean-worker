@@ -708,7 +708,7 @@ Checked on 2026-09-29 with Claude Code 2.1.284, opencode 1.18.32 and .NET SDK 10
 - the launcher builds with no warnings; 48 unit tests (`dotnet test --project tests/LeanWorker.Tests`): pricing,
   stream parsing for Anthropic, z.ai and opencode (including permission denials and cut-off sessions), the
   meter, quota parsing, the key-routing guard, the write scope, the profile templates and `stats`;
-- `tests/acceptance.sh`, 24 checks with real workers (about $0.65 list price in total, most of it one
+- `tests/acceptance.sh`, 25 checks with real workers (about $0.65 list price in total, most of it one
   deliberately overpriced case), all passing:
   - wrap-up, continuation and continuation of a continuation on Claude Haiku (subscription login);
   - the meter matching Claude Code's own cost within 5% (to the cent in practice);
