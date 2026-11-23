@@ -10,10 +10,12 @@ namespace LeanWorker.Tests;
 /// Issue #146 fix round 1, point 1: a signal the launcher inherited as ignored gets no handler (the SigIgn line of
 /// self/status, read through ProcFs, so a fake /proc can give it), nothing is registered when that line cannot be read,
 /// and a recorded signal end never sits next to a live phase written afterwards: the next write of any kind drops it
-/// and puts the replaced phase back, and Finish writes the normal end. What registration does to a real ignored signal
+/// and puts the replaced phase back (round 3: once the hold's timer fires), and Finish writes the normal end. What registration does to a real ignored signal
 /// is in LauncherIgnoredSignalProcessTests. Which signals are registered is not observable in process (a
 /// PosixSignalRegistration does not say its signal; raising a signal here would end the test host), so the count of
 /// registrations is pinned with the pure mapping of the mask (<see cref="StatusSignals.Ignored"/>) next to it.
+/// (Fix round 3: a recorded signal is held, not dropped by the next write: a stream line, a phase and a worker start are
+/// held back, and the hold's timer, fired by hand here, shows the live state again; RunStatusSignalHoldTests has the rest.)
 /// </summary>
 [Collection("launcher-process-state")]
 public sealed class RunStatusIgnoredSignalTests : IDisposable
@@ -24,6 +26,9 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
     private readonly FakeProcRoot _proc = new();
     private readonly List<RunStatus> _opened = [];
     private readonly StatusRig _rig = new(new OpencodeRuntime());
+    private readonly FakeHoldTimer _timers = new();
+
+    public RunStatusIgnoredSignalTests() => _ = _timers.Attach(_rig.Status);
 
     public void Dispose()
     {
@@ -162,7 +167,7 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
     }
 
     [Fact]
-    public void A_stream_line_after_a_recorded_signal_drops_the_end_and_puts_the_replaced_phase_back()
+    public void A_stream_line_after_a_recorded_signal_is_held_back_and_the_timer_puts_the_replaced_phase_back_with_it()
     {
         _rig.Status.GateStarted(2, 3);
         Assert.True(_rig.Status.Signalled(PosixSignal.SIGTERM));
@@ -170,6 +175,8 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
 
         _rig.Feed(StepFinish);
 
+        Assert.Equal("launcher-signalled", _rig.Disk()["end"]!["status"]!.GetValue<string>());
+        _timers.Last.Fire();
         JsonObject doc = _rig.Disk();
         Assert.Null(doc["end"]);
         Assert.Equal("gate", doc["phase"]!.GetValue<string>());
@@ -178,12 +185,14 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
     }
 
     [Fact]
-    public void A_phase_write_after_a_recorded_signal_drops_the_end_and_sets_its_own_phase()
+    public void A_phase_write_after_a_recorded_signal_is_held_back_and_the_timer_writes_its_phase()
     {
         Assert.True(_rig.Status.Signalled(PosixSignal.SIGHUP));
 
         _rig.Status.GateStarted(2, 3);
 
+        Assert.Equal("launcher-signalled", _rig.Disk()["end"]!["status"]!.GetValue<string>());
+        _timers.Last.Fire();
         JsonObject doc = _rig.Disk();
         Assert.Null(doc["end"]);
         Assert.Equal("gate", doc["phase"]!.GetValue<string>());
@@ -194,12 +203,14 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
     }
 
     [Fact]
-    public void A_worker_start_after_a_recorded_signal_drops_the_end()
+    public void A_worker_start_after_a_recorded_signal_is_held_back_and_the_timer_writes_it()
     {
         Assert.True(_rig.Status.Signalled(PosixSignal.SIGINT));
 
         _rig.Status.WorkerStarted(4001, 4001);
 
+        Assert.Equal("launcher-signalled", _rig.Disk()["end"]!["status"]!.GetValue<string>());
+        _timers.Last.Fire();
         JsonObject doc = _rig.Disk();
         Assert.Null(doc["end"]);
         Assert.Equal("worker", doc["phase"]!.GetValue<string>());
@@ -224,16 +235,19 @@ public sealed class RunStatusIgnoredSignalTests : IDisposable
     }
 
     [Fact]
-    public void A_signal_after_a_dropped_one_is_recorded_again_and_a_second_signal_in_a_row_is_not()
+    public void A_signal_after_the_hold_ended_is_recorded_again_and_a_second_signal_during_a_hold_replaces_the_record()
     {
         Assert.True(_rig.Status.Signalled(PosixSignal.SIGTERM));
-        Assert.False(_rig.Status.Signalled(PosixSignal.SIGHUP));
-        _rig.Feed(StepFinish);
-
         Assert.True(_rig.Status.Signalled(PosixSignal.SIGHUP));
+        Assert.Equal("SIGHUP", _rig.Disk()["end"]!["signal"]!.GetValue<string>());
+        _rig.Feed(StepFinish);
+        _timers.Last.Fire();
+        Assert.Null(_rig.Disk()["end"]);
+
+        Assert.True(_rig.Status.Signalled(PosixSignal.SIGINT));
 
         JsonObject end = _rig.Disk()["end"]!.AsObject();
-        Assert.Equal("SIGHUP", end["signal"]!.GetValue<string>());
+        Assert.Equal("SIGINT", end["signal"]!.GetValue<string>());
         Assert.Equal("failed", _rig.Disk()["phase"]!.GetValue<string>());
     }
 }

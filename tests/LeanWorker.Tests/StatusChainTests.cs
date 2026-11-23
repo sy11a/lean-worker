@@ -104,7 +104,7 @@ public sealed class StatusChainTests : IDisposable
     {
         // One launcher (900, ended) ran all three rounds, as a real chain's launcher does.
         StatusIndexRig.Added first = _rig.Add("chain", _mine, endedAgo: TimeSpan.FromMinutes(25), startedAgo: TimeSpan.FromMinutes(30));
-        _ = _rig.Add("chain-gate2", _mine, endedAgo: TimeSpan.FromMinutes(2), startedAgo: TimeSpan.FromMinutes(20), status: "wrapped-up", chain: first.Id, round: 2);
+        _ = _rig.Add("chain-gate2", _mine, endedAgo: TimeSpan.FromMinutes(2), startedAgo: TimeSpan.FromMinutes(20), status: "success", chain: first.Id, round: 2);
         _ = _rig.Add("chain-gate3", _mine, endedAgo: TimeSpan.FromMinutes(1), startedAgo: TimeSpan.FromMinutes(10), status: "error", chain: first.Id, round: 3);
 
         (_, string plain) = await _rig.CallAsync(Caller());
@@ -114,7 +114,7 @@ public sealed class StatusChainTests : IDisposable
         Assert.Equal("lean-worker status: owner cc:sess-A, 0 live, 1 ended, 1 needs attention", StatusIndexRig.Lines(plain)[0]);
         List<JsonObject> rows = StatusIndexRig.JsonRows(json);
         Assert.Equal(3, rows.Count);
-        Assert.Equal(["success", "wrapped-up", "error"], [.. rows.Select(r => r["state"]!.GetValue<string>())]);
+        Assert.Equal(["success", "success", "error"], [.. rows.Select(r => r["state"]!.GetValue<string>())]);
         Assert.All(rows, r => Assert.Equal(3, r["chain"]!["rounds"]!.GetValue<int>()));
     }
 

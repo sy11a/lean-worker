@@ -71,16 +71,18 @@ public sealed class RunStatusSignalTests : IDisposable
     }
 
     [Fact]
-    public void Nothing_is_written_over_a_launch_failure_and_a_second_signal_does_not_replace_the_first()
+    public void Nothing_is_written_over_a_launch_failure_and_a_second_signal_during_the_hold_replaces_the_first_record()
     {
         _rig.Status.Fail("it broke", summaryStatus: null);
         Assert.False(_rig.Status.Signalled(PosixSignal.SIGTERM));
         Assert.Equal("launch-failed", _rig.Disk()["end"]!["status"]!.GetValue<string>());
 
         using StatusRig second = new(new OpencodeRuntime());
+        FakeHoldTimer timers = new FakeHoldTimer().Attach(second.Status);
         Assert.True(second.Status.Signalled(PosixSignal.SIGTERM));
-        Assert.False(second.Status.Signalled(PosixSignal.SIGHUP));
-        Assert.Equal("SIGTERM", second.Disk()["end"]!["signal"]!.GetValue<string>());
+        Assert.True(second.Status.Signalled(PosixSignal.SIGHUP));
+        Assert.Equal("SIGHUP", second.Disk()["end"]!["signal"]!.GetValue<string>());
+        Assert.Equal(2, timers.All.Count);
     }
 
     [Fact]

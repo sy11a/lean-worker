@@ -91,6 +91,13 @@ public sealed class StatusChainProofTests : IDisposable
         return (plain, StatusIndexRig.JsonRows(json));
     }
 
+    // A row of the plain listing: it starts with the state and names the run (its name, then a space or the line's end).
+    private static bool IsRow(string row, string state, string name)
+    {
+        return row.StartsWith(state, StringComparison.Ordinal)
+            && (row.Contains(" " + name + " ", StringComparison.Ordinal) || row.EndsWith(" " + name, StringComparison.Ordinal));
+    }
+
     private static string[] JsonNames(List<JsonObject> rows) => [.. rows.Select(r => (r["run"]?["name"] ?? r["name"])!.GetValue<string>()).Order(StringComparer.Ordinal)];
 
     // Every named run is its own row, plain and --json, and none belongs to a chain.
@@ -200,46 +207,56 @@ public sealed class StatusChainProofTests : IDisposable
     }
 
     [Fact]
-    public async Task The_row_of_a_chain_is_its_worst_round_attention_over_live_and_ended_with_every_round_in_jsonAsync()
+    public async Task The_row_of_a_chain_is_its_live_round_over_its_ended_rounds_with_every_round_in_jsonAsync()
     {
+        // Round 2 was `error` here before fix round 3: an earlier round that failed is no honest chain (StatusChainShapeTests).
         StatusIndexRig.Added first = Opening("chain", Min(60), Min(55));
-        _ = Closed("chain-gate2", first, 2, Min(50), Min(45), status: "error");
+        _ = Closed("chain-gate2", first, 2, Min(50), Min(45));
         _ = InGate("chain-gate3", first, 3, Min(30));
 
         (string plain, List<JsonObject> json) = await ListAsync(Caller());
 
-        Assert.Matches(@"^error\s+chain-gate2\s", Assert.Single(StatusIndexRig.Rows(plain)));
-        Assert.Contains("1 needs attention", StatusIndexRig.Lines(plain)[0], StringComparison.Ordinal);
-        Assert.Equal(["success", "error", "gate"], [.. json.Select(r => r["state"]!.GetValue<string>())]);
+        Assert.Matches(@"^gate\s+chain-gate3\s", Assert.Single(StatusIndexRig.Rows(plain)));
+        Assert.DoesNotContain("needs attention", StatusIndexRig.Lines(plain)[0], StringComparison.Ordinal);
+        Assert.Equal(["success", "success", "gate"], [.. json.Select(r => r["state"]!.GetValue<string>())]);
         Assert.Equal([false, false, true], [.. json.Select(r => r["chain"]!["latest"]!.GetValue<bool>())]);
     }
 
+    // A round of launcher 900 (gone) that never wrote an end; its worker is not alive either, so it reads lost.
+    private StatusIndexRig.Added DeadWithoutEnd(string name, TimeSpan started, StatusIndexRig.Added? first = null, int round = 1) =>
+        _rig.Add(name, _mine, startedAgo: started, chain: first?.Id, round: round, tweak: d => d["launcher"]!["pid"] = 900);
+
     [Fact]
-    public async Task An_earlier_failed_round_outranks_a_later_successful_oneAsync()
+    public async Task An_earlier_round_that_lost_its_end_outranks_a_later_successful_oneAsync()
     {
-        StatusIndexRig.Added first = DeadOpening("chain", Min(60), Min(55), status: "error");
+        // Round 1 was `error` here before fix round 3; an earlier round without an end is what an honest chain can have.
+        StatusIndexRig.Added first = DeadWithoutEnd("chain", Min(60));
         _ = DeadRound("chain-gate2", first, 2, Min(50), Min(45));
 
-        (string plain, _) = await ListAsync(Caller());
+        (string plain, List<JsonObject> json) = await ListAsync(Caller());
 
-        Assert.Matches(@"^error\s+chain\s", Assert.Single(StatusIndexRig.Rows(plain)));
-        Assert.Contains("1 needs attention", StatusIndexRig.Lines(plain)[0], StringComparison.Ordinal);
+        Assert.Matches(@"^lost\s+chain\s", Assert.Single(StatusIndexRig.Rows(plain)));
+        Assert.Contains("needs attention", StatusIndexRig.Lines(plain)[0], StringComparison.Ordinal);
+        Assert.Equal(2, json.Count);
+        Assert.All(json, r => Assert.Equal(first.Id, r["chain"]!["id"]!.GetValue<string>()));
     }
 
     [Fact]
     public async Task On_a_tie_the_latest_round_is_the_row_among_attention_rounds_and_among_ended_roundsAsync()
     {
-        StatusIndexRig.Added failed = DeadOpening("failing", Min(60), Min(55), status: "error");
-        _ = DeadRound("failing-gate2", failed, 2, Min(50), Min(45), status: "timeout");
+        // The earlier rounds were `error`/`timeout`/`wrapped-up` here before fix round 3; now attention rounds that tie are
+        // rounds that lost their end, and ended rounds that tie are `success`.
+        StatusIndexRig.Added failed = DeadWithoutEnd("failing", Min(60));
+        _ = DeadWithoutEnd("failing-gate2", Min(50), failed, 2);
         StatusIndexRig.Added fine = DeadOpening("fine", Min(60), Min(55));
-        _ = DeadRound("fine-gate2", fine, 2, Min(50), Min(45), status: "wrapped-up");
+        _ = DeadRound("fine-gate2", fine, 2, Min(50), Min(45));
 
         (string plain, _) = await ListAsync(Caller());
 
         string[] rows = StatusIndexRig.Rows(plain);
         Assert.Equal(2, rows.Length);
-        Assert.Contains(rows, r => r.StartsWith("timeout", StringComparison.Ordinal) && r.Contains("failing-gate2 ", StringComparison.Ordinal));
-        Assert.Contains(rows, r => r.StartsWith("wrapped-up", StringComparison.Ordinal) && r.Contains("fine-gate2 ", StringComparison.Ordinal));
+        Assert.Contains(rows, r => r.StartsWith("lost", StringComparison.Ordinal) && r.Contains("failing-gate2 ", StringComparison.Ordinal));
+        Assert.Contains(rows, r => r.StartsWith("success", StringComparison.Ordinal) && r.Contains("fine-gate2 ", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -257,8 +274,9 @@ public sealed class StatusChainProofTests : IDisposable
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task An_old_failed_earlier_round_that_is_the_chains_row_does_not_hide_the_live_round_in_either_listingAsync(bool allScope)
+    public async Task An_old_failed_earlier_round_is_its_own_row_since_fix_round_3_and_never_hides_the_live_round_in_either_listingAsync(bool allScope)
     {
+        // An earlier round that failed is no honest chain (the gate continues only after success): two rows, not one.
         StatusIndexRig.Added first = Opening("chain", Days(3) + Min(60), Days(3), status: "error");
         _ = InGate("chain-gate2", first, 2, Min(10));
 
@@ -266,13 +284,20 @@ public sealed class StatusChainProofTests : IDisposable
             ? await ListAsync(StatusIndexRig.NoCaller, "--all")
             : await ListAsync(Caller(), "--since", "1h");
 
-        _ = Assert.Single(StatusIndexRig.Rows(plain));
-        Assert.Equal(["error", "gate"], [.. json.Select(r => r["state"]!.GetValue<string>())]);
-        Assert.Equal(["alive"], [.. json.Select(r => r["liveness"]!.GetValue<string>()).Where(l => l is "alive")]);
+        // Both runs are shown in both listings (the old one's launcher still runs, so it is live and age hides nothing), each
+        // alone: the old round reads `ending` (it wrote its end while its launcher runs) and the live round reads `gate`.
+        string[] rows = StatusIndexRig.Rows(plain);
+        Assert.Equal(2, rows.Length);
+        Assert.Contains(rows, r => r.StartsWith("gate", StringComparison.Ordinal) && r.Contains(" chain-gate2", StringComparison.Ordinal));
+        Assert.Contains(rows, r => IsRow(r, "ending", "chain"));
+        Assert.Equal(2, json.Count);
+        Assert.All(json, r => Assert.Null(r["chain"]));
+        Assert.Contains(json, r => r["state"]!.GetValue<string>() is "gate" && r["liveness"]!.GetValue<string>() is "alive");
+        Assert.Contains(json, r => r["state"]!.GetValue<string>() is "ending");
     }
 
     [Fact]
-    public async Task A_forged_old_failed_round_that_shares_the_first_runs_launcher_cannot_hide_the_live_first_runAsync()
+    public async Task A_forged_old_failed_round_that_shares_the_first_runs_launcher_cannot_hide_or_replace_the_live_first_runAsync()
     {
         StatusIndexRig.Added first = OpeningInGate("chain", Min(30));
         // The forger copies the launcher identity (status file and pointer) and claims round 0 of the chain.
@@ -280,9 +305,16 @@ public sealed class StatusChainProofTests : IDisposable
 
         (string plain, List<JsonObject> json) = await ListAsync(Caller(), "--since", "1h");
 
-        _ = Assert.Single(StatusIndexRig.Rows(plain));
+        // The victim's live gate round is the row shown for it (its own state, no chain); the forgery stands alone beside it
+        // (its launcher, the victim's, runs, so it reads `ending` and age hides nothing).
+        string[] rows = StatusIndexRig.Rows(plain);
+        Assert.Equal(2, rows.Length);
+        Assert.Contains(rows, r => IsRow(r, "gate", "chain"));
+        Assert.Contains(rows, r => IsRow(r, "ending", "forger"));
         Assert.Equal(2, json.Count);
-        Assert.Contains(json, r => r["state"]!.GetValue<string>() is "gate" && r["liveness"]!.GetValue<string>() is "alive");
+        Assert.All(json, r => Assert.Null(r["chain"]));
+        JsonObject row = json.Single(r => r["state"]!.GetValue<string>() is "gate");
+        Assert.Equal("alive", row["liveness"]!.GetValue<string>());
     }
 
     [Fact]
