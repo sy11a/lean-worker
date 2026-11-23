@@ -65,7 +65,13 @@ internal sealed class ClaudeRuntime : IRuntime
 
     private static Dictionary<string, string?> BaseEnv(RunSpec s)
     {
-        Dictionary<string, string?> env = new(StringComparer.Ordinal);
+        Dictionary<string, string?> env = new(StringComparer.Ordinal)
+        {
+            // The run dir and id for the worker's shell: a launcher started inside the worker records
+            // this run as its parent (status's nesting), as an opencode worker's does.
+            ["LEAN_WORKER_RUN_DIR"] = Path.GetFullPath(s.RunDir),
+            [OwnerKeys.RunIdVariable] = Runtimes.RunId(s.RunDir),
+        };
         if (s.CacheTtl is not "default")
         {
             env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = s.CacheTtl;

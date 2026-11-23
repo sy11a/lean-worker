@@ -9,6 +9,7 @@ namespace LeanWorker.Tests;
 /// prices.json no longer pre-approves `sed -n` for MiniMax-M3 now that the floor denies its diff/log-escape
 /// flags regardless of profile.
 /// </summary>
+[Collection("launcher-process-state")]
 public class DenyFloorTests
 {
     private static RunSpec Spec(List<string> tools, List<string> allowed, List<string> denied)

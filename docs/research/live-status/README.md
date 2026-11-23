@@ -413,8 +413,9 @@ lean-worker status [scope] [mode] [options]
     --bell               --watch rings the terminal bell when a run ends
 ```
 
-**How "the calling session" is found** (section 4.4): the same resolution the launcher uses at
-launch. If nothing identifies the caller (a terminal pane, a cron job), `status` without a scope
+**How "the calling session" is found** (section 4.4): the launcher's resolution at launch without
+`--owner` (steps 2 to 5): inside a lean-worker run the caller is that run, else its session keys,
+and `LEAN_WORKER_OWNER` is one more key in either case. If nothing identifies the caller (a terminal pane, a cron job), `status` without a scope
 exits 2 with "cannot tell which session you are; pass --owner, --here or --all". `status --whoami`
 prints the keys that resolution finds, one per line; `status --whoami --key` prints the single key
 to put on a launch's `--owner` (the session id when there is one, else the `pid:<pid>@<ticks>` key),
@@ -609,9 +610,11 @@ are recorded):
    change on restart and can collide.
 7. Nothing found: the run is unowned, visible with `--here`, `--all` and `--run`.
 
-**At read time** the caller computes its own keys the same way (steps 4 to 6) and matches any run
-whose `owner_keys` intersect them, plus, transitively, runs whose `parent_run` is one of those
-runs. The relay name is re-resolved for the header (a session restarted under a new name shows its
+**At read time** the caller computes its own keys the same way, without step 1: the run key of
+`LEAN_WORKER_RUN_ID` when it is set (step 3; the session keys are then not matched), else the
+session keys of steps 4 and 5, plus the `LEAN_WORKER_OWNER` key of step 2 in either case; it matches
+any run whose `owner_keys` intersect them, plus, transitively, runs whose `parent_run`, or a
+`run:<id>` owner key, names one of those runs (such a run is listed under it). The relay name is re-resolved for the header (a session restarted under a new name shows its
 new name).
 
 **What this does not solve.** A Claude Code session restarted from a handoff is a new session with a
@@ -798,6 +801,10 @@ needs today's exact file set.
 ## 7. Open questions for the operator
 
 Each with this design's recommendation.
+
+*Ruled 2026-11-22:* the operator took the recommendations for questions 1, 3, 4, 5, 6, 10 and 11,
+declined a rendering package (2) and changes in other repositories (7), and declined slice 7
+(legacy counters) as not needed.
 
 1. **Status files always on, or behind a flag?** Recommendation: always on, with the
    `LEAN_WORKER_STATUS=off` kill switch (section 6). It touches "today's launcher behaviour unchanged

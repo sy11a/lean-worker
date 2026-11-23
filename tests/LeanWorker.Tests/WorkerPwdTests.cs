@@ -102,6 +102,7 @@ public class WorkerPwdTests
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
         string? oldPwd = Environment.GetEnvironmentVariable("PWD");
         string oldCwd = Directory.GetCurrentDirectory();
+        using StateDirScope state = new();
         await using StringWriter outWriter = new();
         TextWriter oldOut = Console.Out;
         try

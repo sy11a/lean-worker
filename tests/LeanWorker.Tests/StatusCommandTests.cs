@@ -87,18 +87,28 @@ public sealed class StatusCommandTests : IDisposable
 
     private static string[] Words(string line) => line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-    [Theory]
-    [InlineData("")]
-    [InlineData("--json")]
-    [InlineData("--runs-root x")]
-    [InlineData("--since 1h")]
-    public async Task Status_without_a_scope_is_a_usage_error_that_names_run_and_hereAsync(string args)
+    [Fact]
+    public async Task Status_with_runs_root_but_without_a_scope_is_a_usage_error_that_names_run_and_hereAsync()
     {
-        (int code, string output) = await RunAsync(_root, Words(args));
+        (int code, string output) = await RunAsync(_root, "--runs-root", "x");
 
         Assert.Equal(2, code);
         Assert.Contains("--run", output, StringComparison.Ordinal);
         Assert.Contains("--here", output, StringComparison.Ordinal);
+    }
+
+    // Train 2: no scope means the caller's own runs; with no caller identity (no environment here) that is
+    // exit 2 with the no-identity message, not a usage error that names --run and --here.
+    [Theory]
+    [InlineData("")]
+    [InlineData("--json")]
+    [InlineData("--since 1h")]
+    public async Task Status_without_a_scope_and_without_a_caller_identity_is_exit_2_with_the_no_identity_messageAsync(string args)
+    {
+        (int code, string output) = await RunAsync(_root, Words(args));
+
+        Assert.Equal(2, code);
+        Assert.Equal("lean-worker status: cannot tell which session you are; pass --owner, --here or --all\n", output.Replace("\r\n", "\n", StringComparison.Ordinal));
     }
 
     [Theory]
@@ -118,9 +128,10 @@ public sealed class StatusCommandTests : IDisposable
         Assert.Contains(flag, output, StringComparison.Ordinal);
     }
 
+    // Train 2: --owner is a scope now (it lists, exit 0); --wait and --watch are a later train's and stay usage errors.
     [Theory]
-    [InlineData("--owner claude-session:abc")]
     [InlineData("--wait")]
+    [InlineData("--watch")]
     public async Task A_later_slices_scope_or_mode_alone_is_a_usage_error_tooAsync(string args)
     {
         (int code, string output) = await RunAsync(_root, Words(args));
@@ -319,7 +330,8 @@ public sealed class StatusCommandTests : IDisposable
         (int code, string output) = await HereAsync();
 
         Assert.Equal(0, code);
-        Assert.Matches(@"(?m)^running\s+fix-save-w1\s+oc\s+MiniMax-M3\s+12 calls\s+\$0\.41/\$3\.00\s+3m41s\s+last bash 4s ago$", output);
+        // Train 2: --here adds the OWNER column after the name; an unowned run shows "-" there.
+        Assert.Matches(@"(?m)^running\s+fix-save-w1\s+-\s+oc\s+MiniMax-M3\s+12 calls\s+\$0\.41/\$3\.00\s+3m41s\s+last bash 4s ago$", output);
     }
 
     [Fact]

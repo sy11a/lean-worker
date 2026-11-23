@@ -199,6 +199,42 @@ internal static class Launcher
     internal static string SafeName(string name) =>
         new([.. name.Select(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '-')]);
 
+    /// <summary>
+    /// Makes the run dir &lt;runs&gt;/&lt;baseName&gt; (the stamp and the safe name) and returns its
+    /// path; when an entry of that name is already there (another run of the same name in the same
+    /// second, or anything else), &lt;baseName&gt;-&lt;launcherPid&gt; instead, and when that is there
+    /// too, a launch error. The claim is the exclusive creation of the dir's task.md, so two
+    /// launchers that make the same dir at the same moment never share it: the one that loses
+    /// takes the next name. The stamp stays the first 15 characters of the name.
+    /// </summary>
+    internal static string ClaimRunDir(string runs, string baseName, int launcherPid)
+    {
+        _ = Directory.CreateDirectory(runs);
+        string[] candidates = [Path.Combine(runs, baseName), Path.Combine(runs, baseName + "-" + launcherPid.ToString(System.Globalization.CultureInfo.InvariantCulture))];
+        foreach (string dir in candidates)
+        {
+            if (EntryExists(dir))
+            {
+                continue;
+            }
+
+            _ = Directory.CreateDirectory(dir);
+            try
+            {
+                using FileStream claim = new(Path.Combine(dir, "task.md"), FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                return dir;
+            }
+            catch (IOException) when (File.Exists(Path.Combine(dir, "task.md")))
+            {
+                // Another launcher made the same dir a moment earlier: the next name.
+            }
+        }
+
+        throw new LaunchException($"run dir {candidates[0]} and {candidates[1]} already exist");
+    }
+
+    private static bool EntryExists(string path) => Directory.Exists(path) || File.Exists(path) || new FileInfo(path).LinkTarget is not null;
+
     internal static async Task<int> CountLinesAsync(string path)
     {
         int n = 0;
@@ -256,13 +292,26 @@ internal static class Launcher
     /// The synchronous twin of <see cref="WritePlainAsync"/> (temp sibling plus rename), for the
     /// stream thread's status writes.
     /// </summary>
-    internal static void WritePlain(string path, string content)
+    internal static void WritePlain(string path, string content) => _ = WritePlain(path, content, static () => true);
+
+    /// <summary>
+    /// <see cref="WritePlain(string, string)"/>, but <paramref name="publish"/> is asked after the temp
+    /// file is written, immediately before the rename: when it says no, the temp file is removed and
+    /// <paramref name="path"/> stays as it was. True when the file was replaced.
+    /// </summary>
+    internal static bool WritePlain(string path, string content, Func<bool> publish)
     {
         string temp = TempSibling(path);
         try
         {
             File.WriteAllText(temp, content, Json.Utf8);
+            if (!publish())
+            {
+                return false;
+            }
+
             File.Move(temp, path, overwrite: true);
+            return true;
         }
         finally
         {

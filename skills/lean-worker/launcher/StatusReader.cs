@@ -1,7 +1,7 @@
 // The status reader: one run dir into one row (docs/research/live-status/README.md, section 4.1,
 // "What a reader does" and the ended rule). It never writes or deletes anything. The /proc root,
-// the clock (with its local time zone, for the stamps in legacy dir names) and the current boot id
-// are its inputs, so a test drives it without a real /proc.
+// the clock (with its local time zone, for the stamps in legacy dir names), the current boot id and
+// the scan budget (ScanBudget, ReadFloor) are its inputs, so a test drives it without a real /proc.
 
 using System.Globalization;
 using System.Text.Json.Nodes;
@@ -22,6 +22,11 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     public TimeProvider Clock { get; } = clock;
 
     /// <summary>
+    /// The /proc the reader probes (also for the caller's pid keys).
+    /// </summary>
+    public ProcFs Proc { get; } = proc;
+
+    /// <summary>
     /// The reader of this machine: the real /proc, the system clock and the current boot id.
     /// </summary>
     public static StatusReader Host() => new(ProcFs.Host, TimeProvider.System, ProcFs.Host.BootId());
@@ -32,17 +37,66 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     internal const string UnusableDetail = "the run's files hold content the reader cannot use";
 
     /// <summary>
+    /// The detail of a run whose files did not answer within the scan's budget.
+    /// </summary>
+    internal const string BlockedDetail = "a file of the run did not answer in time; not read";
+
+    /// <summary>
+    /// The scan budget a reader starts with (<see cref="ReadBudget.DefaultTotal"/>; a test sets less).
+    /// </summary>
+    public TimeSpan ScanBudget { get; init; } = ReadBudget.DefaultTotal;
+
+    /// <summary>
+    /// What each read still gets once the scan budget is used up (<see cref="ReadBudget.DefaultFloor"/>).
+    /// </summary>
+    public TimeSpan ReadFloor { get; init; } = ReadBudget.DefaultFloor;
+
+    /// <summary>
+    /// A fresh budget for one scan, with this reader's limits.
+    /// </summary>
+    public ReadBudget NewBudget() => new(ScanBudget, ReadFloor);
+
+    /// <summary>
+    /// One run dir, with a budget of its own.
+    /// </summary>
+    public StatusRow Read(string runDir) => Read(runDir, NewBudget());
+
+    /// <summary>
     /// One run dir: a legacy row without status.json, an unreadable row when the run dir or one of
     /// its files is not a plain directory or regular file, when status.json does not parse (after
-    /// one retry), or when anything about the run fails while it is read; else the state the ended
-    /// rule gives. Nothing about one run dir throws out of here.
+    /// one retry), when the files do not answer within <paramref name="budget"/>, or when anything
+    /// about the run fails while it is read; else the state the ended rule gives. Nothing about one
+    /// run dir throws out of here. A run read through a pointer (<paramref name="launcher"/> is the
+    /// pointer's launcher identity, which then decides the ended rule) is <c>gone</c> when its run
+    /// dir or its status.json is provably not there and its launcher is not alive.
     /// </summary>
-    public StatusRow Read(string runDir)
+    public StatusRow Read(string runDir, ReadBudget budget, JsonObject? launcher = null)
     {
         string id = Path.GetFileName(Path.TrimEndingDirectorySeparator(runDir));
+        bool pointed = launcher is not null;
         try
         {
-            return ReadChecked(runDir, id);
+            // Every lstat, stat, open and read of the run dir runs on the thread with the deadline.
+            return budget.Run(() => ReadGuarded(runDir, id, launcher, pointed), out StatusRow? row) && row is not null
+                ? row
+                : Unreadable(runDir, id, BlockedDetail);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            return Unreadable(runDir, id, UnusableDetail);
+        }
+    }
+
+    private StatusRow ReadGuarded(string runDir, string id, JsonObject? launcher, bool pointed)
+    {
+        try
+        {
+            (StatusRow row, bool read) = ReadChecked(runDir, id, launcher, pointed);
+            // Checked again after the reads: a run dir swapped for a link while it was read would
+            // have had its files read from the link's target (StatusFile's header).
+            return read && StatusFile.IsLink(runDir)
+                ? Unreadable(runDir, id, "the run dir became a symbolic link while it was read; not used")
+                : row;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
         {
@@ -51,18 +105,42 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         }
     }
 
-    private StatusRow ReadChecked(string runDir, string id)
+    /// <summary>
+    /// The row of a run dir, and whether files of it were read (so the run dir is checked again).
+    /// A run read through a pointer has the pointer's launcher probed first: while it is alive the
+    /// run is live whatever its files say; else a run dir or status file that cannot be reached is
+    /// gone only when it provably is not there (<see cref="StatusFile.Exists"/>), unknown otherwise.
+    /// </summary>
+    private (StatusRow Row, bool Read) ReadChecked(string runDir, string id, JsonObject? launcher, bool pointed)
     {
         if (StatusFile.IsLink(runDir))
         {
-            return Unreadable(runDir, id, "the run dir is a symbolic link; not followed");
+            return (Unreadable(runDir, id, "the run dir is a symbolic link; not followed"), false);
         }
 
+        if (!pointed)
+        {
+            return ReadStatus(runDir, id, verdict: null);
+        }
+
+        LauncherVerdict verdict = _probe.Launcher(launcher);
+        bool? dir = StatusFile.Exists(runDir);
+        return dir is true
+            ? ReadStatus(runDir, id, verdict)
+            : (Unreached(runDir, id, verdict, dir is false, dir is false ? "run dir removed" : "the run dir cannot be reached"), false);
+    }
+
+    /// <summary>
+    /// The row of the status file in a run dir that is there; <paramref name="verdict"/> is the
+    /// pointer's launcher verdict for a pointed run, null otherwise (a missing file is a legacy row then).
+    /// </summary>
+    private (StatusRow Row, bool Read) ReadStatus(string runDir, string id, LauncherVerdict? verdict)
+    {
         string path = Path.Combine(runDir, RunStatus.FileName);
         (JsonObject? doc, string? problem, bool retry) = Load(path);
         if (doc is null && problem is null)
         {
-            return Legacy(runDir, id);
+            return verdict is { } pointed ? (Missing(runDir, id, pointed, path), false) : (Legacy(runDir, id), true);
         }
 
         if (doc is null && retry)
@@ -71,19 +149,66 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         }
 
         return doc is null
-            ? Unreadable(runDir, id, $"{RunStatus.FileName}: {problem ?? "is gone"}")
-            : FromStatus(runDir, id, doc);
+            ? (Unreadable(runDir, id, $"{RunStatus.FileName}: {problem ?? "is gone"}"), true)
+            : (Annotated(FromStatus(runDir, id, doc, verdict ?? _probe.Launcher(doc["launcher"] as JsonObject)), doc), true);
     }
 
-    private StatusRow Unreadable(string runDir, string id, string detail)
+    // A pointed run whose status file was not found: gone only when it provably is not there.
+    private StatusRow Missing(string runDir, string id, LauncherVerdict launcher, string path)
     {
-        return new StatusRow(runDir, StampName(id), StatusStates.Unreadable, Liveness.Unknown, Status: null, detail, Stamp(id),
-            EndedAt: null, Attention: true, Quiet: null);
+        bool missing = StatusFile.Exists(path) is false;
+        return Unreached(runDir, id, launcher, missing,
+            missing ? $"run dir has no {RunStatus.FileName} any more" : $"{RunStatus.FileName} cannot be reached");
     }
 
-    private StatusRow FromStatus(string runDir, string id, JsonObject doc)
+    /// <summary>
+    /// A pointed run whose run dir or status file was not reached: live with an unreadable-status
+    /// note while its launcher is alive; gone when <paramref name="missing"/> (provably not there);
+    /// else unknown, never ended.
+    /// </summary>
+    private StatusRow Unreached(string runDir, string id, LauncherVerdict launcher, bool missing, string detail)
     {
-        LauncherVerdict launcher = _probe.Launcher(doc["launcher"] as JsonObject);
+        if (launcher.Liveness is Liveness.Alive)
+        {
+            return Fileless(runDir, id, StatusStates.Unknown, Liveness.Alive, "unreadable status: " + detail);
+        }
+
+        return missing ? Gone(runDir, id, detail) : Fileless(runDir, id, StatusStates.Unknown, Liveness.Unknown, detail);
+    }
+
+    private StatusRow Unreadable(string runDir, string id, string detail) => Fileless(runDir, id, StatusStates.Unreadable, Liveness.Unknown, detail);
+
+    private StatusRow Gone(string runDir, string id, string detail) => Fileless(runDir, id, StatusStates.Gone, Liveness.Gone, detail);
+
+    /// <summary>
+    /// A row without a status file's content, named and dated by its run id; it needs attention
+    /// unless it is gone.
+    /// </summary>
+    private StatusRow Fileless(string runDir, string id, string state, string liveness, string detail)
+    {
+        return new StatusRow(runDir, StampName(id), state, liveness, Status: null, detail, Stamp(id),
+            EndedAt: null, Attention: state is not StatusStates.Gone, Quiet: null);
+    }
+
+    /// <summary>
+    /// The row with the owner and the parent run its status file records, each one only when it
+    /// passes the key and run id checks.
+    /// </summary>
+    private static StatusRow Annotated(StatusRow row, JsonObject doc)
+    {
+        string? owner = (doc["owner"] as JsonObject)?["keys"] is JsonArray { Count: > 0 } keys && keys[0] is JsonValue v
+                        && v.TryGetValue(out string? first) && OwnerKeys.Valid(first) ? first : null;
+        string? parent = OwnerKeys.RunId(Json.Str(doc["run"] as JsonObject, "parent_run"));
+        return row with { OwnerKey = owner, ParentRun = parent };
+    }
+
+    /// <summary>
+    /// The row of a status file, by <paramref name="launcher"/>'s verdict: a pointer's launcher
+    /// identity decides when the run is read through the index (the pointer is written once at
+    /// launch, the status file again and again), else the status file's.
+    /// </summary>
+    private StatusRow FromStatus(string runDir, string id, JsonObject doc, LauncherVerdict launcher)
+    {
         string name = Json.Str(doc["run"] as JsonObject, "name") ?? StampName(id);
         DateTimeOffset? started = Time(Json.Str(doc["spec"] as JsonObject, "started_at"));
         if (launcher.Liveness is Liveness.Alive)
@@ -98,6 +223,37 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         }
 
         return EndedRow(runDir, name, doc, started, launcher.OtherBoot);
+    }
+
+    /// <summary>
+    /// An earlier round of a gate chain: a round with an end and a later round in the same chain is
+    /// final, even while their one launcher still runs the later round (ending only applies to the
+    /// latest). Any other row is returned as it is; nothing here throws.
+    /// </summary>
+    public StatusRow EarlierRound(StatusRow r)
+    {
+        if (r.State is not StatusStates.Ending || r.Status is not { } doc || doc["end"] is not JsonObject)
+        {
+            return r;
+        }
+
+        try
+        {
+            StatusRow ended = EndedRow(r.Dir, r.Name, doc, r.StartedAt, otherBoot: false);
+            return ended with
+            {
+                Pointer = r.Pointer,
+                PointerLauncher = r.PointerLauncher,
+                OwnerKey = r.OwnerKey,
+                ParentRun = r.ParentRun,
+                Chain = r.Chain,
+                Depth = r.Depth,
+            };
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not AccessViolationException and not StackOverflowException)
+        {
+            return r;
+        }
     }
 
     /// <summary>
@@ -131,7 +287,12 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         if (doc["end"] is JsonObject end)
         {
             string status = Json.Str(end, "status") ?? StatusStates.Unknown;
-            string state = status is RunStatus.LaunchFailed or "launcher-signalled" ? StatusStates.Failed : status;
+            if (status is RunStatus.LauncherSignalled && SignalledGroup(runDir, name, doc, started, end, otherBoot) is { } held)
+            {
+                return held;
+            }
+
+            string state = status is RunStatus.LaunchFailed or RunStatus.LauncherSignalled ? StatusStates.Failed : status;
             return new StatusRow(runDir, name, state, Liveness.Gone, doc, StatusText.EndDetail(runDir, doc, end), started,
                 Time(Json.Str(end, "at")), IsFailure(state), Quiet: null);
         }
@@ -153,6 +314,26 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
         // An unknown group verdict means the run cannot be called ended: it may still have a live worker.
         string liveness = group.State is StatusStates.Unknown ? Liveness.Unknown : Liveness.Gone;
         return new StatusRow(runDir, name, group.State, liveness, doc, group.Detail, started, updated, Attention: true, Quiet: null);
+    }
+
+    /// <summary>
+    /// A signalled launcher left its worker running (the handler records the signal and lets the
+    /// default action end the launcher only): while the worker's group lives the run is orphaned,
+    /// and while the group check cannot tell it is unknown, as for a run that ended without a word
+    /// (section 5). Null when the group is gone: the run is failed (signalled).
+    /// </summary>
+    private StatusRow? SignalledGroup(string runDir, string name, JsonObject doc, DateTimeOffset? started, JsonObject end, bool otherBoot)
+    {
+        GroupVerdict group = _probe.Group(doc["worker"] as JsonObject, otherBoot);
+        string signal = Json.Str(end, "signal") is { } s ? " (" + s + ")" : string.Empty;
+        return group.State switch
+        {
+            StatusStates.Orphaned => new StatusRow(runDir, name, StatusStates.Orphaned, Liveness.Gone, doc,
+                $"launcher signalled{signal}; {group.Detail}", started, Time(Json.Str(end, "at")), Attention: true, Quiet: null),
+            StatusStates.Unknown => new StatusRow(runDir, name, StatusStates.Unknown, Liveness.Unknown, doc,
+                $"launcher signalled{signal}; {group.Detail}", started, EndedAt: null, Attention: true, Quiet: null),
+            _ => null,
+        };
     }
 
     /// <summary>
@@ -186,7 +367,7 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// </summary>
     private static (JsonObject? Doc, string? Problem, bool Retry) Load(string path)
     {
-        StatusFile.Content content = StatusFile.Read(path);
+        StatusFile.Content content = StatusFile.ReadHere(path);
         if (content.Bytes is not { } bytes)
         {
             return (null, content.Problem, false);
@@ -206,7 +387,7 @@ internal sealed class StatusReader(ProcFs proc, TimeProvider clock, string? boot
     /// </summary>
     private static (string? Status, string? Problem) SummaryStatus(string runDir)
     {
-        StatusFile.Content content = StatusFile.Read(Path.Combine(runDir, "summary.json"));
+        StatusFile.Content content = StatusFile.ReadHere(Path.Combine(runDir, "summary.json"));
         if (content.Bytes is not { } bytes)
         {
             return (null, content.Problem is { } problem ? "summary.json: " + problem : null);

@@ -52,6 +52,7 @@ public class SystemPathAndFirstCallCacheTests
         string? oldKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
         string oldCwd = Directory.GetCurrentDirectory();
         string cleanCwd = Directory.CreateTempSubdirectory("lw-cwd").FullName;
+        using StateDirScope state = new();
         await using StringWriter outWriter = new();
         TextWriter oldOut = Console.Out;
         try

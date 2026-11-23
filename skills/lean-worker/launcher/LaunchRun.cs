@@ -1029,13 +1029,13 @@ internal sealed class LaunchRun
         }
         string safeName = Launcher.SafeName(name);
         _started = DateTimeOffset.Now;
-        RunDir = Path.Combine(_runsRoot, "runs", string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"));
+        // A run dir of the same name (same name, same second) gets the launcher's pid as a suffix.
+        RunDir = Launcher.ClaimRunDir(Path.Combine(_runsRoot, "runs"), string.Create(CultureInfo.InvariantCulture, $"{_started:yyyyMMdd-HHmmss}-{safeName}"), Environment.ProcessId);
         if (GateContext is null)
         {
             // Round 1 anchors the chain; later rounds inherit round 1's run-dir name as their chain id.
             ChainId = Path.GetFileName(RunDir);
         }
-        _ = Directory.CreateDirectory(RunDir);
         await File.WriteAllTextAsync(Path.Combine(RunDir, "task.md"), taskText, Json.Utf8, CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -1046,7 +1046,7 @@ internal sealed class LaunchRun
     private void OpenStatus()
     {
         _live = RunStatus.Open(RunDir, _name, ChainId, Round, _profileName, _runtimeName, _provider, _model,
-            _budget, _wrapUp ? _budget * _wrapUpAt : null, _o.TimeoutMinutes, _started, _worktree?.WorktreePath);
+            _budget, _wrapUp ? _budget * _wrapUpAt : null, _o.TimeoutMinutes, _started, _worktree?.WorktreePath, _o.Owner);
     }
 
     /// <summary>
@@ -2072,7 +2072,7 @@ internal sealed class LaunchRun
             return;
         }
 
-        _live?.GateStarted(Round);
+        _live?.GateStarted(Round, ChainGate.MaxRounds);
 
         // One round: every command in profile order, each between its own two trust checks. A
         // finding never stops the round (the worker should see every tool's findings at once); the

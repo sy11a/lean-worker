@@ -263,6 +263,7 @@ public class RepoTokenTests
             Environment.SetEnvironmentVariable("PATH", stubDir + Path.PathSeparator + oldPath);
             Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "dummy-test-key");
             Directory.SetCurrentDirectory(workingDirectory);
+            using StateDirScope state = new();
             await using StringWriter outWriter = new();
             TextWriter oldOut = Console.Out;
             Console.SetOut(outWriter);
