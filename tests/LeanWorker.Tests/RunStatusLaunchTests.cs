@@ -19,10 +19,15 @@ public sealed class RunStatusLaunchTests : IDisposable
         printf '%s\n' '{"type":"result","subtype":"success","terminal_reason":"completed","is_error":false,"result":"DONE","session_id":"s1","total_cost_usd":0.01,"num_turns":2,"permission_denials":[],"usage":{"output_tokens_details":{"thinking_tokens":7}}}'
         """;
 
-    private const string SlowStream = """
+    private const string FirstCallLine = """
         printf '%s\n' '{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1","model":"claude-haiku-4-5","usage":{"input_tokens":1000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
-        sleep 3
         """;
+
+    /// <summary>
+    /// A worker that reports its first call and then blocks opening the FIFO until the test opens the other end,
+    /// so the worker phase stays on screen exactly as long as the test wants it, not for a number of seconds.
+    /// </summary>
+    private static string HeldStream(string fifo) => FirstCallLine + "\nread _ < '" + fifo + "' || true\n";
 
     private static readonly string[] _withoutStatus = ["command.txt", "report.md", "stderr.txt", "stream.jsonl", "summary.json", "system.md", "task.md"];
 
@@ -94,22 +99,37 @@ public sealed class RunStatusLaunchTests : IDisposable
     {
         Environment.SetEnvironmentVariable(RunStatus.KillSwitch, value: null);
         string root = _dirs.NewRoot();
-        Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(root, SlowStream);
-
-        JsonObject? seen = null;
-        for (int i = 0; i < 600 && seen is null; i++)
+        string fifo = Path.Combine(_dirs.Create("lw-hold"), "release");
+        await Fifo.MakeAsync(fifo);
+        Task<(int Code, string Stdout)> run = RunAsyncGolden.RunAsync(root, HeldStream(fifo));
+        try
         {
-            seen = ReadWhenFirstCallIsIn(root);
-            await Task.Delay(50, TestContext.Current.CancellationToken);
+            // The worker cannot end before the FIFO is opened for writing, which only the finally below does.
+            JsonObject? seen = null;
+            for (int i = 0; i < 600 && seen is null && !run.IsCompleted; i++)
+            {
+                seen = ReadWhenFirstCallIsIn(root);
+                if (seen is null)
+                {
+                    _ = await Task.WhenAny(run, Task.Delay(50, TestContext.Current.CancellationToken));
+                }
+            }
+
+            Assert.NotNull(seen);
+            Assert.Equal("worker", seen["phase"]!.GetValue<string>());
+            Assert.Null(seen["end"]);
+            Assert.True(seen["worker"]!["pid"]!.GetValue<int>() > 0);
+            Assert.Equal(Environment.ProcessId, seen["launcher"]!["pid"]!.GetValue<int>());
+            Assert.True(seen["live"]!["cost_usd"]!.GetValue<decimal>() > 0m);
+        }
+        finally
+        {
+            // Releases the held worker whether the assertions passed or not: the write end opens (the worker is
+            // waiting on the read end) and closes at once.
+            await using FileStream? release = await Fifo.WaitForReaderAsync(fifo, TimeSpan.FromSeconds(30));
         }
 
-        Assert.NotNull(seen);
-        Assert.Equal("worker", seen["phase"]!.GetValue<string>());
-        Assert.Null(seen["end"]);
-        Assert.True(seen["worker"]!["pid"]!.GetValue<int>() > 0);
-        Assert.Equal(Environment.ProcessId, seen["launcher"]!["pid"]!.GetValue<int>());
-        Assert.True(seen["live"]!["cost_usd"]!.GetValue<decimal>() > 0m);
-        (_, string stdout) = await run;
+        (_, string stdout) = await run.WaitAsync(TimeSpan.FromSeconds(60), TimeProvider.System, TestContext.Current.CancellationToken);
         Assert.Equal("done", StatusFileAssert.Read(RunAsyncGolden.RunDirFrom(stdout))["phase"]!.GetValue<string>());
     }
 

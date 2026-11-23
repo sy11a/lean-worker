@@ -347,6 +347,7 @@ public sealed class RunStatusWriterTests : IDisposable
         using CancellationTokenSource stop = new();
         long lastSeen = 0;
         long reads = 0;
+        TaskCompletionSource firstRead = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Task reader = Task.Run(() =>
         {
             while (!stop.IsCancellationRequested)
@@ -355,18 +356,33 @@ public sealed class RunStatusWriterTests : IDisposable
                 Assert.True(seq >= lastSeen, string.Create(CultureInfo.InvariantCulture, $"seq went from {lastSeen} to {seq}"));
                 lastSeen = seq;
                 reads++;
+                _ = firstRead.TrySetResult();
             }
         }, TestContext.Current.CancellationToken);
 
-        List<Task> writers = [];
-        for (int w = 0; w < Writers; w++)
+        // The writers start only once the reader has parsed the file once, so at least one read is
+        // made before any concurrent write and the reader keeps reading while they run. A reader that
+        // fails before its first read ends the wait; its exception is rethrown by the await below.
+        try
         {
-            int writer = w;
-            writers.Add(Task.Run(() => Hammer(status, writer, PerWriter), TestContext.Current.CancellationToken));
+            Task first = await Task.WhenAny(firstRead.Task, reader).WaitAsync(TimeSpan.FromSeconds(30), TimeProvider.System, TestContext.Current.CancellationToken);
+            await first;
+
+            List<Task> writers = [];
+            for (int w = 0; w < Writers; w++)
+            {
+                int writer = w;
+                writers.Add(Task.Run(() => Hammer(status, writer, PerWriter), TestContext.Current.CancellationToken));
+            }
+
+            await Task.WhenAll(writers);
+        }
+        finally
+        {
+            // The reader never outlives the test, whichever step above failed.
+            await stop.CancelAsync();
         }
 
-        await Task.WhenAll(writers);
-        await stop.CancelAsync();
         await reader;
 
         JsonObject last = Disk();
