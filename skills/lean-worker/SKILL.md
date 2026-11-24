@@ -54,7 +54,14 @@ their edits.
    effort, tools, pre-approved commands, budget, `wrapUpAt`). Start from `<skill-dir>/templates/profiles.json`. Replace
    the `{build command}` and `{test command}` placeholders with the project's real commands,
    and add a profile for any task class the project needs, such as a slow integration-test suite
-   or a code generator. The base template runs on Claude only. When the user also has other model
+   or a code generator. The worker can run only what `allowedTools` names, so the test command must be
+   the one the project really uses: for a .NET project on Microsoft.Testing.Platform that is
+   `dotnet test --project <test project>`, and `dotnet build` does not cover it. Checks that judge the
+   worker's result (a linter, an architecture check, a test gate such as `sy11a-lint check`, `sy11a-arch check`,
+   `sy11a-test check`) belong in the profile's `gate` (see "Gate" below), where the launcher runs them itself,
+   and not in `allowedTools`. A worker that needs a command the profile does not allow reports the denial and
+   stops; it must not reach the command another way, for example through a build step it adds to a project
+   file (an MSBuild `Exec` or `PostBuildEvent` target). The base template runs on Claude only. When the user also has other model
    plans (MiniMax Token Plan, z.ai GLM Coding Plan, ...), start instead from
    `<skill-dir>/templates/profiles-chains.json`. Its roles carry model chains across plans, in the user's
    priority order and with Claude last. Delete the models of plans the user does not have. What a
