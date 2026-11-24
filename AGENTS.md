@@ -34,6 +34,8 @@ Never commit to `master` directly and never force-push it.
   user NuGet config as `NuGetPackageSourceCredentials_github="Username=<you>;Password=<token>"`,
   never in the repository. A policy finding fails the build: fix it, never suppress it.
 - Acceptance (while GLM is not in use): `LW_OPENCODE_MODEL=minimax-coding-plan/MiniMax-M3 tests/acceptance.sh --claude-only`.
+  `tests/acceptance.sh` points the run index at its scratch directory (`LEAN_WORKER_STATE_DIR`); the caller's index
+  is not written.
 
 ## Evidence, handoffs, worktrees
 
