@@ -133,12 +133,14 @@ public sealed partial class WorktreeRunTests
     [Fact]
     public async Task A_branch_name_with_a_control_character_or_a_line_break_is_refused_by_git_and_nothing_is_madeAsync()
     {
-        string[] names = ["a\u0001b", "a\u007fb", "x\n", "x\r", "a\tb"];
-        foreach (string branch in names)
+        // The message shows the name on one line (issue #170): each of these characters is written as the two characters \n.
+        (string Name, string Shown)[] names = [("a\u0001b", "a\\nb"), ("a\u007fb", "a\\nb"), ("x\n", "x\\n"), ("x\r", "x\\n"), ("a\tb", "a\\nb")];
+        foreach ((string name, string shown) in names)
         {
-            LaunchException ex = await RefusedNameAsync(branch);
+            LaunchException ex = await RefusedNameAsync(name);
 
-            Assert.StartsWith(GitRefusalStart(branch), ex.Message, StringComparison.Ordinal);
+            Assert.StartsWith(GitRefusalStart(shown), ex.Message, StringComparison.Ordinal);
+            AssertOneLine(ex.Message);
         }
     }
 

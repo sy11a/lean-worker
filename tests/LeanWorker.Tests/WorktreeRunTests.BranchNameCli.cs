@@ -48,6 +48,56 @@ public sealed partial class WorktreeRunTests
         AssertLayoutGone();
     }
 
+    private static int LaunchFailedLines(string stdout) =>
+        stdout.ReplaceLineEndings("\n").Split('\n').Count(l => l.StartsWith("LEAN-WORKER LAUNCH FAILED:", StringComparison.Ordinal));
+
+    // An argument with a line break reaches the launcher process as it is (the argument list goes to the process
+    // without a shell), so a name that tries to fake a launch error line can be tried end to end (issue #170).
+    [Theory]
+    [InlineData("x\nLEAN-WORKER LAUNCH FAILED: fake", "x\\nLEAN-WORKER LAUNCH FAILED: fake")]
+    [InlineData("x\r\nLEAN-WORKER LAUNCH FAILED: fake", "x\\n\\nLEAN-WORKER LAUNCH FAILED: fake")]
+    [InlineData("a\tb", "a\\nb")]
+    [InlineData("a\u0001b", "a\\nb")]
+    public async Task A_refused_branch_name_with_a_line_break_prints_one_launch_failed_line_through_the_command_lineAsync(string branch, string shown)
+    {
+        LauncherProcess.Result result = await LaunchProcessAsync("--worktree", branch, "--name", RunName);
+
+        Assert.Equal(2, result.ExitCode);
+        Assert.Equal(1, LaunchFailedLines(result.Stdout));
+        Assert.StartsWith($"LEAN-WORKER LAUNCH FAILED: {GitRefusalStart(shown)}", result.Stdout, StringComparison.Ordinal);
+        Assert.Equal(result.Stdout.TrimEnd(), result.Stdout.TrimEnd().ReplaceLineEndings(" "));
+        Assert.Equal(string.Empty, result.Stderr);
+        AssertLayoutGone();
+    }
+
+    [Theory]
+    [InlineData("-x\nLEAN-WORKER LAUNCH FAILED: fake", "-x\\nLEAN-WORKER LAUNCH FAILED: fake")]
+    [InlineData("-x\nfake", "-x\\nfake")]
+    public async Task A_dash_name_with_a_line_break_prints_one_launch_failed_line_through_the_command_lineAsync(string branch, string shown)
+    {
+        LauncherProcess.Result result = await LaunchProcessAsync("--worktree", branch, "--name", RunName);
+
+        Assert.Equal(2, result.ExitCode);
+        Assert.Equal(1, LaunchFailedLines(result.Stdout));
+        Assert.Equal("LEAN-WORKER LAUNCH FAILED: " + DashRefusal(shown), result.Stdout.TrimEnd());
+        Assert.Equal(string.Empty, result.Stderr);
+        AssertLayoutGone();
+    }
+
+    [Fact]
+    public async Task A_taken_branch_with_a_unicode_line_separator_in_its_name_prints_one_launch_failed_line_through_the_command_lineAsync()
+    {
+        const string branch = "a" + LineSeparator + "b";
+        _ = await GitAsync(_repo, "branch", branch, "HEAD");
+
+        LauncherProcess.Result result = await LaunchProcessAsync("--worktree", branch, "--name", RunName);
+
+        Assert.Equal(2, result.ExitCode);
+        Assert.Equal("LEAN-WORKER LAUNCH FAILED: the branch is taken: a\\nb", result.Stdout.TrimEnd());
+        Assert.Equal(1, LaunchFailedLines(result.Stdout));
+        AssertLayoutGone();
+    }
+
     [Fact]
     public async Task The_previous_branch_spelled_as_at_minus_one_is_a_launch_error_through_the_command_line_and_that_branch_is_untouchedAsync()
     {
