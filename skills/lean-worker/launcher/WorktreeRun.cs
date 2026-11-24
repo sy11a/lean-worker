@@ -386,16 +386,19 @@ internal sealed class WorktreeRun
     /// </summary>
     internal static async Task CheckBranchNameAsync(string repoRoot, string branch)
     {
+        // The name as the messages show it: on one line, so a name with a line break (git refuses
+        // it) cannot add lines of its own to the launch error (issue #170).
+        string shown = EvidenceBlock.OneLine(branch);
         if (branch.StartsWith('-'))
         {
-            throw new LaunchException($"--worktree '{branch}' cannot name a branch: a branch name cannot start with '-'");
+            throw new LaunchException($"--worktree '{shown}' cannot name a branch: a branch name cannot start with '-'");
         }
 
         Git.Result check = await Git.RunResultAsync(repoRoot, "check-ref-format", "--branch", branch).ConfigureAwait(false)
-            ?? throw new LaunchException($"--worktree '{branch}' cannot be checked: git check-ref-format --branch could not be run");
+            ?? throw new LaunchException($"--worktree '{shown}' cannot be checked: git check-ref-format --branch could not be run");
         if (check.ExitCode is not 0)
         {
-            throw new LaunchException($"--worktree '{branch}' cannot name a branch: git check-ref-format --branch refuses it ({GitError(check)})");
+            throw new LaunchException($"--worktree '{shown}' cannot name a branch: git check-ref-format --branch refuses it ({GitError(check)})");
         }
 
         string printed = check.Stdout.TrimEnd('\n', '\r');
@@ -404,7 +407,7 @@ internal sealed class WorktreeRun
             return;
         }
 
-        throw new LaunchException($"--worktree '{branch}' cannot name a branch: git reads it as '{EvidenceBlock.OneLine(printed)}'; the name must be the branch itself");
+        throw new LaunchException($"--worktree '{shown}' cannot name a branch: git reads it as '{EvidenceBlock.OneLine(printed)}'; the name must be the branch itself");
     }
 
     /// <summary>
@@ -417,10 +420,15 @@ internal sealed class WorktreeRun
     private static async Task<bool> RefuseTakenBranchAsync(string repoRoot, string branch)
     {
         string branchRef = "refs/heads/" + branch;
+
+        // The name passed CheckBranchNameAsync, so git refused every ASCII control character in it,
+        // but git takes any byte above 0x7F: U+0085 (NEL) and U+2028/U+2029 can still be in it, and
+        // they can end a line in a reader of the report. OneLine leaves an ASCII name as it is.
+        string shown = EvidenceBlock.OneLine(branch);
         Git.Result? branchProbe = await Git.RunResultAsync(repoRoot, "rev-parse", "--verify", "--quiet", branchRef).ConfigureAwait(false);
         if (branchProbe?.ExitCode is 0)
         {
-            throw new LaunchException($"the branch is taken: {branch}");
+            throw new LaunchException($"the branch is taken: {shown}");
         }
 
         // A symbolic ref in the place of the branch is taken as well, dangling or not: the probe
@@ -431,12 +439,12 @@ internal sealed class WorktreeRun
         Git.Result? linkProbe = await Git.RunResultAsync(repoRoot, "symbolic-ref", "-q", branchRef).ConfigureAwait(false);
         if (linkProbe?.ExitCode is 0)
         {
-            throw new LaunchException($"the branch is taken: {branch} (it is a symbolic ref to {EvidenceBlock.OneLine(linkProbe.Stdout.Trim())})");
+            throw new LaunchException($"the branch is taken: {shown} (it is a symbolic ref to {EvidenceBlock.OneLine(linkProbe.Stdout.Trim())})");
         }
 
         if (linkProbe?.ExitCode is not 1)
         {
-            throw new LaunchException($"the branch {branch} cannot be checked: git could not tell whether it is a symbolic ref ({GitError(linkProbe)})");
+            throw new LaunchException($"the branch {shown} cannot be checked: git could not tell whether it is a symbolic ref ({GitError(linkProbe)})");
         }
 
         // Exit 1 of rev-parse is git's own "no such ref": the branch is known to be absent.
